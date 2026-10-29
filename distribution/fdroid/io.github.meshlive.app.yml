@@ -55,9 +55,9 @@ AllowedAPKSigningKeys: 2eefc05a444522529d9f75d7ebcefd08864707f21a79041db51ebff83
 # is the code of the variant's main output, which is the universal APK (70) when it is built and armeabi-v7a (71)
 # otherwise, so classes.dex differs unless the gradleprops equal tools/make_release.py's (measured 2026-10-28).
 Builds:
-  - versionName: '0.4.3-beta'
-    versionCode: 91
-    commit: v0.4.3-beta
+  - versionName: '0.4.4-beta'
+    versionCode: 101
+    commit: v0.4.4-beta
     subdir: app
     sudo:
       - apt-get update
@@ -86,9 +86,9 @@ Builds:
       - universalApk=true
     ndk: r28c
 
-  - versionName: '0.4.3-beta'
-    versionCode: 92
-    commit: v0.4.3-beta
+  - versionName: '0.4.4-beta'
+    versionCode: 102
+    commit: v0.4.4-beta
     subdir: app
     sudo:
       - apt-get update
@@ -122,8 +122,8 @@ UpdateCheckData: 'app/build.gradle.kts|versionCode\s*=\s*(\d+)|.|versionName\s*=
 VercodeOperation:
   - '%c * 10 + 1'
   - '%c * 10 + 2'
-CurrentVersion: '0.4.3-beta'
-CurrentVersionCode: 92
+CurrentVersion: '0.4.4-beta'
+CurrentVersionCode: 102
 
 # libaom pin (srclibs/libaom.yml): commit 0006e96cdb595ff88950a2c664115335ca5517bf, a main-branch commit after
 # the v3.14.1 tag (tag commit 03087864cf4bea6abb0d28f95cf7843511413d8f). tools/fetch_native_sources.py verifies

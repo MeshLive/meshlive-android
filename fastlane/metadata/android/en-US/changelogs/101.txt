@@ -1,0 +1,1 @@
+Builds can now be verified byte-for-byte by F-Droid; no change to how the app works.

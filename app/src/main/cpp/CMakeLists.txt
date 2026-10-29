@@ -199,3 +199,15 @@ target_link_options(bluetooth_video_native PRIVATE
     "-Wl,-z,max-page-size=16384"
     "-Wl,-z,common-page-size=16384"
 )
+
+# Reproducible builds: the release library is linked without any non-loaded section. lld computes the build ID
+# (.note.gnu.build-id, which stays in the APK) over its whole output, and AGP strips .debug_*, .symtab and .strtab
+# only afterwards, when it packages the APK. Those sections still differed between the Windows and the Linux NDK
+# (measured 2026-10-29: F-Droid's Linux build of 0.4.3-beta matched ours in every byte of the library except the
+# 20-byte build ID), and part of the debug information comes from the NDK's prebuilt libc++, which no compile
+# flag reaches. --strip-all drops them at link time, so the build ID hashes only what the APK keeps. Compilation
+# is unchanged (compiling with -g0 instead was measured to change 96 bytes of code). Debug builds keep debug
+# information and symbols for native debugging.
+if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    target_link_options(bluetooth_video_native PRIVATE "-Wl,--strip-all")
+endif()
