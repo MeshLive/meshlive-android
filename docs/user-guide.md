@@ -11,6 +11,8 @@ For people who use MeshLive: how to install, update and verify it, what it can d
 
 ### Install
 
+On Google Play: tap **[Get it on Google Play](https://play.google.com/store/apps/details?id=io.github.meshlive.app)**. Google Play installs and updates it for you. Or install the file from the releases page:
+
 1. On your phone, tap **[Download MeshLive](https://github.com/MeshLive/meshlive-android/releases/latest/download/MeshLive.apk)**.
 2. Open the file. If Android asks, allow your browser to **install unknown apps**, then tap **Install**.
 3. Open MeshLive and allow **Nearby devices**, **Camera** and **Microphone**.
@@ -27,7 +29,7 @@ Obtainium checks the releases page for new versions and updates MeshLive for you
 
 #### Updates inside the app (release-page builds)
 
-MeshLive can check for a newer version itself, but only after you say yes: the first time you open it, it asks "Check for updates when online?". Until you answer yes it makes no internet request at all. With yes it asks GitHub's release API (`api.github.com`) at most once a day while you are online; GitHub sees your phone's internet address and that you asked about MeshLive, and nothing else is sent (no account, no cookie, no device or version information, no tracker). It downloads nothing until you tap, and it installs a file only if all of these hold: it is signed with the MeshLive release key that is built into the app (the fingerprint under "Verifying a release" below), it is newer than your copy, it is for your phone type, and its SHA-256 equals the one the release publishes. Android then asks you to confirm; nothing is ever installed silently or downgraded. Settings > Check for updates changes your answer (a "yes" restored from a backup onto another phone is dropped and asked again: the answer has a marker in the no-backup folder). While it is off, nothing on the Updates screen can contact GitHub. F-Droid builds contain none of this (F-Droid updates them) and do not ask for the install permission.
+MeshLive can check for a newer version itself, but only after you say yes: the first time you open it, it asks "Check for updates when online?". Until you answer yes it makes no internet request at all. With yes it asks GitHub's release API (`api.github.com`) at most once a day while you are online; GitHub sees your phone's internet address and that you asked about MeshLive, and nothing else is sent (no account, no cookie, no device or version information, no tracker). It downloads nothing until you tap, and it installs a file only if all of these hold: it is signed with the MeshLive release key that is built into the app (the fingerprint under "Verifying a release" below), it is newer than your copy, it is for your phone type, and its SHA-256 equals the one the release publishes. Android then asks you to confirm; nothing is ever installed silently or downgraded. Settings > Check for updates changes your answer (a "yes" restored from a backup onto another phone is dropped and asked again: the answer has a marker in the no-backup folder). While it is off, nothing on the Updates screen can contact GitHub. Google Play and F-Droid builds contain none of this (the store updates them) and do not ask for the install permission.
 
 #### A friend has a newer version
 
@@ -40,7 +42,7 @@ A friend who already has MeshLive can send it to you: in MeshLive's **Help**, th
 #### Other files
 
 On the [releases page](https://github.com/MeshLive/meshlive-android/releases): MeshLive is an
-unofficial open-source build (GPL-3.0-or-later), signed with the project's own key, and not on Google Play. Each
+unofficial open-source build (GPL-3.0-or-later), signed with the project's own key (Google Play delivers MeshLive with the same key). Each
 release has one APK per CPU type (`MeshLive-<version>-<abi>.apk`); `MeshLive.apk` is the same file as the
 arm64-v8a one.
 

@@ -18,6 +18,8 @@ No internet, no SIM, no account.
   <a href="https://scorecard.dev/viewer/?uri=github.com/MeshLive/meshlive-android"><img alt="OpenSSF Scorecard" src="https://api.scorecard.dev/projects/github.com/MeshLive/meshlive-android/badge" /></a>
 </p>
 
+<a href="https://play.google.com/store/apps/details?id=io.github.meshlive.app"><img alt="Get it on Google Play" src="https://play.google.com/intl/en_us/badges/static/images/badges/en_badge_web_generic.png" height="60" /></a>
+&nbsp;
 <a href="https://github.com/MeshLive/meshlive-android/releases/latest"><img alt="Get it on GitHub" src="https://raw.githubusercontent.com/Kunzisoft/Github-badge/main/get-it-on-github.png" height="60" /></a>
 &nbsp;
 <a href="https://apps.obtainium.imranr.dev/redirect?r=obtainium://add/https://github.com/MeshLive/meshlive-android"><img alt="Get it on Obtainium" src="https://raw.githubusercontent.com/ImranR98/Obtainium/main/assets/graphics/badge_obtainium.png" height="60" /></a>
@@ -85,9 +87,11 @@ Bluetooth on its own reaches about 10 to 30 metres. MeshLive turns every phone r
 
 | Platform | Status |
 | --- | --- |
-| Android 10+ | Available: [GitHub releases](https://github.com/MeshLive/meshlive-android/releases/latest), [Obtainium](https://apps.obtainium.imranr.dev/redirect?r=obtainium://add/https://github.com/MeshLive/meshlive-android) |
+| Android 10+ | Available: [Google Play](https://play.google.com/store/apps/details?id=io.github.meshlive.app), [GitHub releases](https://github.com/MeshLive/meshlive-android/releases/latest), [Obtainium](https://apps.obtainium.imranr.dev/redirect?r=obtainium://add/https://github.com/MeshLive/meshlive-android) |
 | Windows | Beta: [GitHub releases](https://github.com/MeshLive/meshlive-windows/releases/latest) (unsigned zip) |
 | iPhone and Mac | Source build: [meshlive-apple](https://github.com/MeshLive/meshlive-apple) (Mac app experimental; iPhone not yet tested on hardware) |
+
+<sub>Google Play and the Google Play logo are trademarks of Google LLC.</sub>
 
 ## Privacy
 
