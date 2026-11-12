@@ -4,7 +4,8 @@
   "devices": {
     "asus": {
       "serial": "<adb-serial-of-asus>",
-      "node_prefix": "a1b2c3d4e5f6"
+      "node_prefix": "a1b2c3d4e5f6",
+      "secure_lock": true
     },
     "xiaomi": {
       "serial": "<adb-serial-of-xiaomi>",
@@ -20,7 +21,8 @@
     },
     "s24": {
       "serial": "<adb-serial-of-s24>",
-      "node_prefix": "f0e1d2c3b4a5"
+      "node_prefix": "f0e1d2c3b4a5",
+      "secure_lock": true
     },
     "a55": {
       "serial": "<adb-serial-of-a55>",
@@ -28,7 +30,12 @@
     },
     "a15s": {
       "serial": "<adb-serial-of-a15s>",
-      "node_prefix": "8a1b2c3d4e5f"
+      "node_prefix": "8a1b2c3d4e5f",
+      "slow_start": true
+    },
+    "realme": {
+      "serial": "<adb-serial-of-realme>",
+      "node_prefix": "7ea100000001"
     }
   }
 }
