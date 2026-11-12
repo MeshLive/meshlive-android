@@ -44,6 +44,7 @@ class BlockedPeopleActivity : AppCompatActivity() {
             people.getOrNull(position)?.let(::confirmUnblock)
         }
         findViewById<View>(R.id.blockedStoreProblem).setOnClickListener { confirmReset() }
+        findViewById<View>(R.id.blockedResetButton).setOnClickListener { confirmReset() }
     }
 
     override fun onResume() {
@@ -81,9 +82,11 @@ class BlockedPeopleActivity : AppCompatActivity() {
                         )
                     },
                 )
-                findViewById<View>(R.id.blockedEmptyView).visibility =
-                    if (loaded.isEmpty() && !unreadable) View.VISIBLE else View.GONE
-                findViewById<View>(R.id.blockedStoreProblem).visibility = if (unreadable) View.VISIBLE else View.GONE
+                val view = BlockListView.of(loaded, unreadable)
+                findViewById<View>(R.id.blockedEmptyView).visibility = if (view.showEmptyState) View.VISIBLE else View.GONE
+                val note = if (view.showUnreadableNote) View.VISIBLE else View.GONE
+                findViewById<View>(R.id.blockedStoreProblem).visibility = note
+                findViewById<View>(R.id.blockedResetButton).visibility = note
             }
         }
     }
@@ -108,19 +111,8 @@ class BlockedPeopleActivity : AppCompatActivity() {
             .show()
     }
 
+    /** The one Reset, shared with Settings: "Reset the block list?", then everyone is unblocked. */
     private fun confirmReset() {
-        MaterialAlertDialogBuilder(this)
-            .setIcon(R.drawable.ic_warning)
-            .setTitle(R.string.blocked_people_reset_title)
-            .setMessage(R.string.blocked_people_reset_message)
-            .setPositiveButton(R.string.blocked_people_reset_action) { _, _ ->
-                val context = applicationContext
-                worker.execute {
-                    BlockedPeople.reset(context)
-                    runOnUiThread { if (!isDestroyed) refresh() }
-                }
-            }
-            .setNegativeButton(R.string.action_cancel, null)
-            .show()
+        CallBlockingUi.confirmResetBlockList(this) { if (!isDestroyed) refresh() }
     }
 }

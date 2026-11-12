@@ -7,6 +7,7 @@ import java.io.PipedOutputStream
 import java.security.GeneralSecurityException
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
@@ -365,6 +366,78 @@ class SecureBluetoothLinkTest {
             assertEquals("packet-2", String(opener.open(records[2]).payload))
             assertThrows(IllegalArgumentException::class.java) { opener.open(records[1]) }
         }
+    }
+
+    @Test
+    fun aWifiRecordIsAnUnknownTypeUntilTheReaderOptsIn() {
+        val key = ByteArray(MeshAead.KEY_BYTES) { (it + 5).toByte() }
+        val bytes = ByteArrayOutputStream().also { output ->
+            SecureRecordWriter(output, key).apply {
+                write(SecureRecordType.BWF1, byteArrayOf(1, 2, 3))
+                flush()
+            }
+        }.toByteArray()
+        val failure = assertThrows(IllegalStateException::class.java) {
+            SecureRecordReader(ByteArrayInputStream(bytes), key).read()
+        }
+        assertEquals("Unknown secure record type 16", failure.message)
+        val reader = SecureRecordReader(ByteArrayInputStream(bytes), key)
+        reader.acceptWifi = true
+        val record = reader.read()
+        assertEquals(SecureRecordType.BWF1, record.type)
+        assertArrayEquals(byteArrayOf(1, 2, 3), record.payload)
+    }
+
+    @Test
+    fun theWifiOptInDoesNotChangeAnyOtherType() {
+        val key = ByteArray(MeshAead.KEY_BYTES) { (it + 6).toByte() }
+        fun encoded(type: SecureRecordType): ByteArray = ByteArrayOutputStream().also { output ->
+            SecureRecordWriter(output, key).apply {
+                write(type, byteArrayOf(7))
+                flush()
+            }
+        }.toByteArray()
+        for (type in listOf(SecureRecordType.STORE_FORWARD, SecureRecordType.RELAY_SETUP, SecureRecordType.DISCOVERY_OPENING)) {
+            val reader = SecureRecordReader(ByteArrayInputStream(encoded(type)), key)
+            reader.acceptWifi = true
+            assertThrows(IllegalStateException::class.java) { reader.read() }
+        }
+        for (type in listOf(SecureRecordType.END_TO_END_CONTENT, SecureRecordType.LINK_HEARTBEAT)) {
+            for (acceptWifi in listOf(false, true)) {
+                val reader = SecureRecordReader(ByteArrayInputStream(encoded(type)), key)
+                reader.acceptWifi = acceptWifi
+                assertEquals(type, reader.read().type)
+            }
+        }
+    }
+
+    @Test
+    fun aWifiRecordKeepsTheExactNextSequenceRule() {
+        val key = ByteArray(MeshAead.KEY_BYTES) { (it + 7).toByte() }
+        fun firstRecord(): ByteArray = ByteArrayOutputStream().also { output ->
+            SecureRecordWriter(output, key).apply {
+                write(SecureRecordType.LINK_HEARTBEAT, byteArrayOf(1))
+                flush()
+            }
+        }.toByteArray()
+        val bytes = ByteArrayOutputStream().also { output ->
+            SecureRecordWriter(output, key).apply {
+                write(SecureRecordType.LINK_HEARTBEAT, byteArrayOf(1))
+                write(SecureRecordType.BWF1, byteArrayOf(2))
+                write(SecureRecordType.LINK_HEARTBEAT, byteArrayOf(3))
+                flush()
+            }
+        }.toByteArray()
+        val reader = SecureRecordReader(ByteArrayInputStream(bytes), key)
+        reader.acceptWifi = true
+        assertEquals(
+            listOf(SecureRecordType.LINK_HEARTBEAT, SecureRecordType.BWF1, SecureRecordType.LINK_HEARTBEAT),
+            List(3) { reader.read().type },
+        )
+        val skipped = SecureRecordReader(ByteArrayInputStream(bytes.copyOfRange(firstRecord().size, bytes.size)), key)
+        skipped.acceptWifi = true
+        val failure = assertThrows(IllegalArgumentException::class.java) { skipped.read() }
+        assertEquals("Unexpected secure record sequence", failure.message)
     }
 
     private fun forwardMeshRecords(

@@ -512,11 +512,10 @@ class RotatingDiscoveryTest {
         assertTrue(FeatureCatalog.resolve(RotatingDiscoveryFeature.spec, true, { it == "test_rotating_ids" }) { false })
         assertFalse(FeatureCatalog.resolve(RotatingDiscoveryFeature.spec, true, { false }) { true })
         assertFalse(FeatureCatalog.resolve(RotatingDiscoveryFeature.spec, true, { false }) { null })
-        // A user launch: the stored choice, else the shipped default (on since 0.2.0-beta); extras are ignored.
+        // A user launch: always the shipped default (no switch since 2026-11-04; an old stored choice is ignored).
         assertTrue(RotatingDiscoveryFeature.DEFAULT_ENABLED)
         assertTrue(FeatureCatalog.resolve(RotatingDiscoveryFeature.spec, false, { false }) { null })
-        assertFalse(FeatureCatalog.resolve(RotatingDiscoveryFeature.spec, false, { false }) { if (it == RotatingDiscoveryFeature.PREF) false else null })
-        assertTrue(FeatureCatalog.resolve(RotatingDiscoveryFeature.spec, false, { false }) { if (it == RotatingDiscoveryFeature.PREF) true else null })
+        assertTrue(FeatureCatalog.resolve(RotatingDiscoveryFeature.spec, false, { false }) { if (it == "experimental_rotating_ids") false else null })
         assertTrue(FeatureCatalog.resolve(RotatingDiscoveryFeature.spec, false, { false }) { null })
         assertTrue(FeatureCatalog.resolve(RotatingDiscoveryFeature.spec, false, { false }, { null }))
     }

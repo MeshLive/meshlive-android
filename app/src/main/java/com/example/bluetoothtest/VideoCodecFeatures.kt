@@ -119,6 +119,8 @@ internal object VideoCodecSwitches {
     fun current(
         preferHwAv1: Boolean = DebugTunables.preferHardwareAv1,
         power: CodecPowerState = CodecPowerState.NORMAL,
+        /** `test_sw_shortfall_avc`: the software encoders remembered short for the starting session (empty elsewhere). */
+        slowSoftware: Set<String> = emptySet(),
     ): CodecChoiceSwitches = CodecChoiceSwitches(
         hevc = hevc,
         h264 = h264,
@@ -129,5 +131,7 @@ internal object VideoCodecSwitches {
         bit7AllowsHwHevc = bit7HwHevc,
         powerAware = CodecPowerAware.enabled,
         power = power,
+        swShortfall = DebugTunables.swShortfallAvc,
+        slowSoftware = slowSoftware,
     )
 }

@@ -6,6 +6,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 
 /** Experimental relay_establish_keep_2m: which failed relay child setups pin the child to 1M. */
@@ -69,6 +70,11 @@ class RelayEstablishKeep2MTest {
         // Off: the exception is passed through untouched, so the old log text and types are unchanged.
         assertSame(failure, carryLinkReached(failure, reached = true))
         DebugTunables.relayEstablishKeep2M = true
+        if (!BuildConfig.DEBUG) {
+            // A release build ignores the launch extra: the exception is never marked.
+            assertSame(failure, carryLinkReached(failure, reached = true))
+            return
+        }
         assertSame(failure, carryLinkReached(failure, reached = false))
         val marked = carryLinkReached(failure, reached = true)
         assertTrue(marked is LinkReachedSetupFailure)
@@ -82,6 +88,8 @@ class RelayEstablishKeep2MTest {
 
     @Test
     fun markLinkReachedWrapsOnlyAFailureThatHappenedAfterTheLinkExisted() {
+        // The keep-2M switch is an Experimental DEBUG arm; a release build never marks a failure (the test above).
+        assumeTrue("DEBUG arm", BuildConfig.DEBUG)
         DebugTunables.relayEstablishKeep2M = true
         val before = runCatching { markLinkReached({ false }) { throw IOException("connect failed") } }.exceptionOrNull()
         assertFalse(before is LinkReachedSetupFailure)

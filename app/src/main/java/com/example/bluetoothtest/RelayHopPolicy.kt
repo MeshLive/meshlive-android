@@ -29,6 +29,13 @@ internal object RelayHopPolicy {
     /** The first next-hop attempt runs on 2M and the per-link 1M retry is on. */
     fun phyRetryEligible(enabled: Boolean, firstOnTwoM: Boolean): Boolean = enabled && firstOnTwoM
 
+    /**
+     * AP7 F3 (`test_relay_start_hop_guard`, Experimental, off): the DEBUG static relay's child hop gets the on-demand
+     * hop's single 1M retry. True only for the first attempt on 2M while the switch is on and no retry has run.
+     */
+    fun startHopRetry(enabled: Boolean, firstOnTwoM: Boolean, retried: Boolean): Boolean =
+        !retried && phyRetryEligible(enabled, firstOnTwoM)
+
     fun rescanBudgetMs(leftMs: Long): Long = (leftMs - RETRY_MIN_LEFT_MS).coerceIn(0L, RESCAN_MAX_MS)
 
     fun phyRetryLine(node: String, stalled: Boolean, leftMs: Long, error: Throwable, debug: Boolean): String =

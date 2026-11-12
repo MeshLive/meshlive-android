@@ -89,6 +89,11 @@ class ThermalBatteryFallbackTest {
         assertFalse(MemoryThermalPolicy.headroomSamplerNeeded(true))
         ThermalSwitches.batteryFallback = true
         try {
+            if (!BuildConfig.DEBUG) {
+                // A release build ignores the switch: no sampler.
+                assertFalse(MemoryThermalPolicy.headroomSamplerNeeded(true))
+                return
+            }
             assertTrue(MemoryThermalPolicy.headroomSamplerNeeded(true))
             // Benchmark profiles run with automatic cooling off: the sampler is never needed there.
             assertFalse(MemoryThermalPolicy.headroomSamplerNeeded(false))

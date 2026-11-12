@@ -27,7 +27,7 @@
         android:layout_height="wrap_content"
         android:layout_marginStart="8dp"
         android:ellipsize="end"
-        android:maxLines="2"
+        android:maxLines="1"
         android:maxWidth="180dp"
         android:text="@string/status_ready"
         android:textAppearance="@style/TextAppearance.App.Label"

@@ -69,20 +69,68 @@ class SealedTextFileTest {
         assertEquals(1, ClassicAddressBookState.decode(requireNotNull(bookFile.read())).size())
     }
 
+    private fun marks(path: File, cipher: AtRestCipher = key, legacy: LegacyPlain? = null) = AdaptivePhyMarks(
+        SealedRecords(SealedTextFile(path, { cipher }), 1024, null, legacy, retryBaseMs = 60_000, log = {}).also { it.start() },
+    )
+
+    /**
+     * PRIV1 re-review S4: the bad-2M marks moved from the 2026-10-27 sealed `key=value` file (and the plain preferences
+     * before it) into a sealed-records store on the sealed-memory worker; an updated phone keeps its marks and loses both
+     * old copies.
+     */
     @Test
-    fun theBad2mMemoryMovesFromPlainPreferencesIntoTheSealedFileAndSurvivesARestart() {
-        val path = File(dir, "adaptive-phy-memory.bin")
-        val node = "a1b2c3d4e5f6"
-        val markKey = AdaptivePhyMemory.key(BluetoothTransportOption.BLE_GATT, node)
-        val marks = AdaptivePhyMarks(SealedTextFile(path, { key }), writeAsync = false)
-        marks.importLegacy(mapOf(markKey to 1_700_000_000_000L, AdaptivePhyMemory.GATT_FANOUT_PURGED to true, "junk" to "x"))
-        assertFalse("no peer label is readable", String(path.readBytes(), Charsets.ISO_8859_1).contains(node))
-        val restarted = AdaptivePhyMarks(SealedTextFile(path, { key }), writeAsync = false)
-        assertEquals(1_700_000_000_000L, restarted.get(markKey))
-        assertTrue(restarted.flag(AdaptivePhyMemory.GATT_FANOUT_PURGED))
-        assertNull(restarted.get("junk"))
-        restarted.remove(listOf(markKey))
-        assertNull(AdaptivePhyMarks(SealedTextFile(path, { key }), writeAsync = false).get(markKey))
+    fun theBad2mMemoryMovesFromItsOldFilesIntoTheSealedStoreAndSurvivesARestart() {
+        val phone = FakePhone(File(dir, "phone"))
+        SealedRecordsWorker.resetForTest()
+        try {
+            val context = phone.start()
+            val node = "a1b2c3d4e5f6"
+            val markKey = AdaptivePhyMemory.key(BluetoothTransportOption.BLE_GATT, node)
+            val oldKey = AdaptivePhyMemory.key(BluetoothTransportOption.BLE_L2CAP, "0badc0ffee00")
+            val oldFile = File(phone.noBackupDir, "adaptive-phy-memory.bin")
+            SealedTextFile(oldFile, { phone.atRestCipher }).write("$markKey=1700000000000")
+            phone.preferences("adaptive_phy_memory").edit().putLong(oldKey, 1_700_000_000_001L)
+                .putBoolean(AdaptivePhyMemory.GATT_FANOUT_PURGED, true).putString("junk", "x").commit()
+            val path = File(phone.noBackupDir, AdaptivePhyMemory.MARKS_FILE)
+            marks(path, phone.atRestCipher, AdaptivePhyMemory.legacyMarks(context))
+            SealedRecordsWorker.awaitIdleForTest()
+            assertFalse("the old sealed file is gone", oldFile.exists())
+            assertTrue("the plain preferences are gone", phone.preferences("adaptive_phy_memory").all.isEmpty())
+            assertFalse("no peer label is readable", String(path.readBytes(), Charsets.ISO_8859_1).contains(node))
+            val restarted = marks(path, phone.atRestCipher)
+            SealedRecordsWorker.awaitIdleForTest()
+            assertEquals(1_700_000_000_000L, restarted.get(markKey))
+            assertEquals(1_700_000_000_001L, restarted.get(oldKey))
+            assertTrue(restarted.flag(AdaptivePhyMemory.GATT_FANOUT_PURGED))
+            assertNull(restarted.get("junk"))
+            restarted.remove(listOf(markKey))
+            SealedRecordsWorker.awaitIdleForTest()
+            val again = marks(path, phone.atRestCipher)
+            SealedRecordsWorker.awaitIdleForTest()
+            assertNull(again.get(markKey))
+        } finally {
+            SealedRecordsWorker.resetForTest()
+        }
+    }
+
+    /** S4: a wipe that has begun waits for the marks' running write, and none is written after it. */
+    @Test
+    fun theBad2mMarksAreNotWrittenOnceTheWipeStopsTheirWorker() {
+        SealedRecordsWorker.resetForTest()
+        try {
+            val path = File(dir, AdaptivePhyMemory.MARKS_FILE)
+            val marks = marks(path)
+            SealedRecordsWorker.awaitIdleForTest()
+            WipeGuard.begin()
+            assertTrue(SealedRecordsWorker.drainForWipe(5_000))
+            assertTrue(WipeGuard.awaitWriters(1_000))
+            marks.put(AdaptivePhyMemory.key(BluetoothTransportOption.BLE_GATT, "a1b2c3d4e5f6"), 5L)
+            Thread.sleep(100)
+            assertFalse(path.exists())
+        } finally {
+            WipeGuard.resetForTest()
+            SealedRecordsWorker.resetForTest()
+        }
     }
 
     @Test
@@ -130,17 +178,34 @@ class SealedTextFileTest {
         flaky.failing = false
         assertTrue("loaded once the Keystore works", pins.isPinned(stored))
         // The bad-2M memory waits the same way and keeps what it learned meanwhile.
-        val marksPath = File(dir, "adaptive-phy-memory.bin")
-        AdaptivePhyMarks(SealedTextFile(marksPath, { key }), writeAsync = false).put("bad2m2.BLE_GATT.aaaaaaaaaaaa", 5L)
-        val flakyMarks = FlakyCipher(key)
-        val marks = AdaptivePhyMarks(SealedTextFile(marksPath, { flakyMarks }), writeAsync = false)
-        marks.put("bad2m2.BLE_GATT.bbbbbbbbbbbb", 6L)
-        flakyMarks.failing = false
-        marks.put("bad2m2.BLE_GATT.cccccccccccc", 7L)
-        val reopened = AdaptivePhyMarks(SealedTextFile(marksPath, { key }), writeAsync = false)
-        assertEquals(5L, reopened.get("bad2m2.BLE_GATT.aaaaaaaaaaaa"))
-        assertEquals(6L, reopened.get("bad2m2.BLE_GATT.bbbbbbbbbbbb"))
-        assertEquals(7L, reopened.get("bad2m2.BLE_GATT.cccccccccccc"))
+        SealedRecordsWorker.resetForTest()
+        try {
+            val marksPath = File(dir, AdaptivePhyMemory.MARKS_FILE)
+            marks(marksPath).put("bad2m2.BLE_GATT.aaaaaaaaaaaa", 5L)
+            SealedRecordsWorker.awaitIdleForTest()
+            val flakyMarks = FlakyCipher(key)
+            val records = SealedRecords(SealedTextFile(marksPath, { flakyMarks }), 1024, null, retryBaseMs = 60_000, log = {})
+            records.start()
+            val marks = AdaptivePhyMarks(records)
+            marks.put("bad2m2.BLE_GATT.bbbbbbbbbbbb", 6L)
+            SealedRecordsWorker.awaitIdleForTest()
+            assertTrue("the stored marks were not written over", marks(marksPath).let {
+                SealedRecordsWorker.awaitIdleForTest()
+                it.get("bad2m2.BLE_GATT.aaaaaaaaaaaa") == 5L && it.get("bad2m2.BLE_GATT.bbbbbbbbbbbb") == null
+            })
+            flakyMarks.failing = false
+            records.kickForTest()
+            SealedRecordsWorker.awaitIdleForTest()
+            marks.put("bad2m2.BLE_GATT.cccccccccccc", 7L)
+            SealedRecordsWorker.awaitIdleForTest()
+            val reopened = marks(marksPath)
+            SealedRecordsWorker.awaitIdleForTest()
+            assertEquals(5L, reopened.get("bad2m2.BLE_GATT.aaaaaaaaaaaa"))
+            assertEquals(6L, reopened.get("bad2m2.BLE_GATT.bbbbbbbbbbbb"))
+            assertEquals(7L, reopened.get("bad2m2.BLE_GATT.cccccccccccc"))
+        } finally {
+            SealedRecordsWorker.resetForTest()
+        }
     }
 
     @Test

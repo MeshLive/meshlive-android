@@ -130,6 +130,11 @@ class GattLinkSupportTest {
             { key, d -> when (key) { "test_gatt_byte_window" -> 16_384; "test_gatt_window_kbps" -> 240; else -> d } },
             { null },
         )
+        if (!BuildConfig.DEBUG) {
+            // A release build ignores the launch extras: no byte window.
+            assertNull(GattByteWindow.fromSwitches())
+            return
+        }
         val window = GattByteWindow.fromSwitches()!!
         assertTrue(window.line("gatt-video"), "maxBytes=16384 | drainKbps=240" in window.line("gatt-video"))
     }
@@ -228,6 +233,12 @@ class GattLinkSupportTest {
         assertEquals("", BluetoothAudioCoexistence.capacityKeySuffix(earbuds))
         assertEquals(1.0, BluetoothAudioCoexistence.loadFactor(earbuds), 0.0)
         GattSwitches.applyExtras({ key, d -> if (key == "test_bt_audio_capacity_key" || key == "test_bt_audio_load_cut") true else d }, { _, d -> d }, { null })
+        if (!BuildConfig.DEBUG) {
+            // A release build ignores the launch extras: both experiments stay off.
+            assertEquals("", BluetoothAudioCoexistence.capacityKeySuffix(earbuds))
+            assertEquals(1.0, BluetoothAudioCoexistence.loadFactor(earbuds), 0.0)
+            return
+        }
         assertEquals(".btaudio", BluetoothAudioCoexistence.capacityKeySuffix(earbuds))
         assertEquals(BluetoothAudioCoexistence.LOAD_CUT_FACTOR, BluetoothAudioCoexistence.loadFactor(earbuds), 0.0)
         val none = BluetoothAudioCoexistence.stateFor(emptyList(), scoOn = false)
@@ -270,6 +281,12 @@ class GattLinkSupportTest {
             intExtra = { key, default -> when (key) { "test_gatt_settle_ms" -> 5_000; "test_gatt_byte_window" -> 8_192; else -> default } },
             stringExtra = { key -> when (key) { "test_gatt_busy_wedge" -> "recover"; "test_gatt_payload" -> "244"; else -> null } },
         )
+        if (!BuildConfig.DEBUG) {
+            // A release build ignores every launch extra: each arm keeps its shipped default.
+            assertEquals("none", GattSwitches.describeNonDefaults())
+            assertTrue(GattSwitches.closeDeferral)
+            return
+        }
         assertTrue(GattSwitches.busyWedgeRecovery)
         assertFalse(GattSwitches.closeDeferral)
         assertTrue(GattSwitches.linkBudgetAdmission && GattSwitches.serverHold && GattSwitches.connectOnMain)

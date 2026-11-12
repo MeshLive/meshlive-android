@@ -94,6 +94,10 @@ internal object RingbackPolicy {
      */
     fun stream(callType: CallType?): Int =
         if (callType == CallType.VOICE) AudioManager.STREAM_VOICE_CALL else AudioManager.STREAM_MUSIC
+
+    /** AB3/AP3 D2: no ringback while a blocked call waits for its ordinary end (the callee's phone still rings). */
+    fun plays(enabled: Boolean, phase: PrivateCallPhase?, blockedEndScheduled: Boolean): Boolean =
+        enabled && phase == PrivateCallPhase.OUTGOING_RINGING && !blockedEndScheduled
 }
 
 /**

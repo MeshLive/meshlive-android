@@ -5,6 +5,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 import kotlin.random.Random
 
@@ -285,6 +286,8 @@ class RelayChildRecoveryPolicyEquivalenceTest {
 
     @Test
     fun withTheNewSwitchesAbsentTheWatchFollowsRelayChildReanchorAndThePreferenceIsOff() {
+        // These set DEBUG control arms; theDefaultsAreTheShippedConfiguration... covers a release build.
+        assumeTrue("DEBUG arm", BuildConfig.DEBUG)
         val prefix = byteArrayOf(1, 2, 3, 4, 5, 6)
         for (reanchor in listOf(true, false)) for (trickle in listOf(true, false)) for (grace in listOf(true, false)) {
             DebugTunables.relayChildReanchor = reanchor
@@ -317,6 +320,8 @@ class RelayChildRecoveryPolicyEquivalenceTest {
 
     @Test
     fun theChildSideWatchAndPreferenceCanNowBeTestedApartFromTheRelaySideClose() {
+        // These set DEBUG control arms; theDefaultsAreTheShippedConfiguration... covers a release build.
+        assumeTrue("DEBUG arm", BuildConfig.DEBUG)
         DebugTunables.relayChildReanchor = false
         DebugTunables.relayParentWatch = true
         DebugTunables.relayPreferParent = true

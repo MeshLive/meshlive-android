@@ -28,6 +28,7 @@ internal object GattLinkPolicy {
     private const val A14 = "$BT/refs/heads/android14-release"
     private const val A13 = "$BT/refs/heads/android13-release"
     private const val A15 = "$BT/refs/heads/android15-release"
+    private const val A16 = "$BT/refs/heads/android16-release"
     private const val A10_BT = "https://android.googlesource.com/platform/system/bt/+/refs/heads/android10-release"
     private const val NORDIC_BLE = "https://github.com/NordicSemiconductor/Android-BLE-Library"
 
@@ -556,6 +557,72 @@ internal object GattLinkPolicy {
         fallback = "The phone offers helper duty over GATT as on every other family (and its GATT relays fail as measured).",
     )
 
+    /**
+     * Realme RMX5256 lane (2026-11-06): the MediaTek Android 16 stack stops opening central connections ("No resources to
+     * open a new connection", status 128) with no client registered; only a Bluetooth restart clears it.
+     */
+    val MEDIATEK_COLOROS_NATIVE_CLIENT_WEDGE = DevicePolicyEntry(
+        id = "mediatek-coloros-native-gatt-client-wedge",
+        title = "MediaTek with ColorOS or Realme UI, Android 16+: a native GATT client wedge needs a Bluetooth restart " +
+            "(on by default since 2026-11-10; DEBUG control arm test_gatt_native_wedge_guard=false)",
+        matcher = DeviceMatcher(
+            sdkMin = 36,
+            socFamilies = setOf(SocFamily.MEDIATEK),
+            skins = setOf(OemSkin.COLOROS, OemSkin.REALME_UI),
+        ),
+        effects = listOf(
+            GattNativeClientWedgeGuard(
+                threshold = GattNativeClientWedgeGuard.THRESHOLD,
+                windowMs = GattNativeClientWedgeGuard.WINDOW_MS,
+                immediateMs = GattNativeClientWedgeGuard.IMMEDIATE_MS,
+            ),
+        ),
+        behaviour = "On a MediaTek phone with ColorOS or Realme UI on Android 16 or newer, central GATT and LE CoC connects " +
+            "that fail with status 128 (GATT_NO_RESOURCES) within 500 ms of the dial, ${GattNativeClientWedgeGuard.THRESHOLD} " +
+            "in a row inside 60 s, while MeshLive holds no GATT client, are read as a native client wedge: the reliability " +
+            "card shows the Bluetooth off/on guidance at once (the generic path needs three back-off steps 1-4 s apart) " +
+            "and one BENCHMARK gatt_native_client_wedge line is logged. A successful central connect clears it. Nothing " +
+            "is toggled (apps cannot restart Bluetooth on Android 13+); the peripheral role is untouched.",
+        sources = listOf(
+            PolicySource(AOSP_SOURCE, "$A16/system/bta/gatt/bta_gattc_act.cc",
+                "bta_gattc_process_api_open logs \"No resources to open a new connection.\" and reports GATT_NO_RESOURCES " +
+                    "(128) to the app when bta_gattc_find_alloc_clcb returns null"),
+            PolicySource(AOSP_SOURCE, "$A16/system/bta/gatt/bta_gattc_utils.cc",
+                "bta_gattc_clcb_alloc fails when the client registration lookup (cl_rcb_map) or the server-cache " +
+                    "allocation fails; bta_gattc_srcb_alloc is bounded by the controller's LE filter accept list size and " +
+                    "recycles only an entry that is not connected, so a leaked entry blocks every new open"),
+            PolicySource(PLATFORM_DOC, "https://source.android.com/docs/core/ota/modular-system/bluetooth",
+                "the Bluetooth stack is a Mainline module, updatable from Android 16: a fix can arrive without an SDK change"),
+            PolicySource(API_REFERENCE, "https://developer.android.com/reference/android/bluetooth/BluetoothAdapter#disable()",
+                "deprecated in API 33: an app targeting Android 13+ cannot turn Bluetooth off, so it can only ask the user"),
+        ),
+        sourceStatus = PARTIAL,
+        evidence = listOf(
+            "benchmarks/runs/p2b-20261106 cases 0005, 0006, 0010-0012 (Realme RMX5256, Bluetooth process up about 5.3 h, " +
+                "about 150 central opens): first wedge; status 128 12-61 ms after the dial, clients=0",
+            "benchmarks/runs/p3g-20261106 cases 0001-0006, benchmarks/runs/rm03g-20261106 cases 0005-0008, " +
+                "benchmarks/runs/rm03m2-20261106 cases 0009-0016: every Realme central connect status 128; the generic " +
+                "guidance appeared in 4 of 23 app sessions",
+            "benchmarks/runs/rm3xa-20261106, rm3xb-20261106, rm3y-20261106, p3g2-20261106, p4a-20261106, p4b-20261106: " +
+                "after Bluetooth off/on no status 128",
+            "benchmarks/runs/rm3s-20261106, rm3t1..4-20261106, rm3uoff1..15-20261106, rm3voff1..3-20261106 (120 cases on a " +
+                "fresh stack): no status 128; the trigger is unknown",
+        ),
+        confidence = LOW,
+        confidenceNote = "One phone (Realme RMX5256, MT6835, Android 16, patch 2026-08-01); the leak reproduced once after " +
+            "hours of use and never in 120 soak cases, so the trigger is unknown. The AOSP code shows how status 128 " +
+            "arises; no MediaTek or OPPO document names this defect. The family scope (every MediaTek phone with ColorOS or " +
+            "Realme UI on Android 16+) is an assumption; Android 16 phones of other makers are unmeasured.",
+        reviewed = "2026-11-06",
+        origin = "Realme RMX5256 lane 2026-11-06 (ab-lanes s24-realme-REPORT Updates 6, 9-11): a stuck native stack refused " +
+            "every central connect and the generic guidance rarely showed.",
+        area = PolicyArea.BLUETOOTH_TRANSPORT,
+        validation = PolicyValidation.LOCALLY_REPRODUCED,
+        fallback = "The generic pool back-off and guidance only: the card shows after three back-off steps of client " +
+            "failures, which one failed call never reaches.",
+        arm = PolicyArm("test_gatt_native_wedge_guard=true") { GattSwitches.nativeClientWedgeGuard },
+    )
+
     val entries: List<DevicePolicyEntry> = listOf(
         LINK_SLOT_LIMIT,
         REGISTRATION_POOL_EXHAUSTION,
@@ -573,9 +640,18 @@ internal object GattLinkPolicy {
         GATT_CACHE_REFRESH,
         SERVER_CONNECTION_UNTRACKED,
         MEDIATEK_GATT_RELAY_HELPER,
+        MEDIATEK_COLOROS_NATIVE_CLIENT_WEDGE,
     )
 
     private fun policy(): ResolvedDevicePolicy = DeviceFamilyPolicy.current()
+
+    /**
+     * Whether the call relay opens its downstream GATT hop with acknowledged writes: the matched family entry and its
+     * Experimental arm (`test_relay_gatt_acknowledged_writes=true`, DEBUG only); a release build never does. The entry
+     * stays resolvable while the arm is off (it is reported under `armOff`), so the arm is checked here.
+     */
+    fun relayAcknowledgedWrites(resolved: ResolvedDevicePolicy = policy()): Boolean =
+        GattSwitches.relayAcknowledgedWrites && resolved.has<CallRelayAcknowledgedGattWrites>()
 
     fun wedgeRecovery(resolved: ResolvedDevicePolicy = policy()): GattClientWedgeRecovery? =
         resolved.effects<GattClientWedgeRecovery>().firstOrNull()

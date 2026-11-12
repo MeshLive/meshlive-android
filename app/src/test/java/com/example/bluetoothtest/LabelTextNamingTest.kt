@@ -53,6 +53,19 @@ class LabelTextNamingTest {
         assertEquals(NameTextRules.REASON, name("Rahul,seen"))
     }
 
+    /**
+     * Design decision 2026-11-06 (P12F/P14-P16 (a); AB3 R7): the middle-dot separator the screens use ("Mum \u00B7 seen nearby \u00B7
+     * unconfirmed") cannot be part of a name either, with or without spaces, in any case, nor with a look-alike dot.
+     */
+    @Test
+    fun theMiddleDotSeenSeparatorCannotBePartOfAName() {
+        listOf(
+            "Asha \u00B7 seen nearby", "Asha\u00B7seen", "Asha \u00B7 SEEN", "Asha \u30FB seen", "Asha \u22C5 seen",
+            "Asha \u2027 seen", "Asha \u2219 seen", "Asha \uFF65 seen", "Asha \u0387 seen",
+        ).forEach { text -> assertEquals(text, NameTextRules.REASON, name(text)) }
+        listOf("Asha \u00B7 Ravi", "Seen Asha", "Asha seen").forEach { text -> assertNull(text, name(text)) }
+    }
+
     @Test
     fun aNameThatReducesToAGeneratedNameIsRefused() {
         // "Blue Otter" is a valid pair only if both words are in the lists; take the real first pair.
@@ -91,7 +104,6 @@ class LabelTextNamingTest {
     @Test
     fun theRulesApplyToPersonNamesOnly() {
         assertNull(LabelText.rejection(LabelKind.STREAM_TITLE, "~Concert - tent 4~"))
-        assertNull(LabelText.rejection(LabelKind.CALL_SUBJECT, "need help ~ tent 4, seen"))
     }
 
     @Test

@@ -65,7 +65,12 @@ internal object SwitchInert {
                 it.bool("test_bounded_media_age", false)
             } +
             masks(mapOf("test_relay_one_pdu_move" to false), "relay_phy_guard=false") { !it.bool("test_relay_phy_guard", true) } +
-            masks(mapOf("test_relay_one_pdu_move" to false), "adaptive_phy=false") { !it.bool("test_adaptive_phy", true) } +
+            masks(mapOf("test_relay_one_pdu_move" to false, "test_phy_direction_split" to false), "adaptive_phy=false") {
+                !it.bool("test_adaptive_phy", true)
+            } +
+            masks(mapOf("test_adaptive_phy_split" to false), "phy_direction_split=true") {
+                it.bool("test_phy_direction_split", false)
+            } +
             masks(mapOf("test_relay_stall_separate" to true), "relay_child_stall_guard=false") {
                 !it.bool("test_relay_child_stall_guard", true)
             } +
@@ -116,7 +121,16 @@ internal object SwitchInert {
             ) { !it.bool(NativeOpusSettings.EXTRA_ENABLED, false) } +
             masks(mapOf("test_adv_inplace_boost" to true, "test_adv_inplace_keep_set" to true), "stable_adv_address=false") {
                 !it.bool("test_stable_adv_address", true)
-            }
+            } +
+            masks(
+                mapOf(
+                    "test_wifi_wider_reach" to false, "test_wifi_direct" to false, "test_wifi_icm" to false,
+                    "test_wifi_ble_standby_low_power" to false, "test_wifi_allow_24ghz" to false,
+                    "test_wifi_share_attach" to false, "test_wifi_force_carrier" to "auto",
+                    "test_wifi_aware_derived_port" to true, "test_wifi_aware_require_channel" to false,
+                ),
+                "wifi_carrier=false",
+            ) { !it.bool("test_wifi_carrier", false) }
 
     /** The arms [extras] asked for that a parent masks; the first masking parent per arm. */
     fun inert(extras: Extras): List<Inert> = RULES

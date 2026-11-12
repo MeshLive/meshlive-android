@@ -5,7 +5,7 @@
     <string name="feat_check_for_updates">Check for updates</string>
     <string name="feat_check_for_updates_description">Checks GitHub once a day when you\'re online. GitHub receives your IP address and the update request. Updates download only when you choose.</string>
     <string name="feat_newer_versions_nearby">Tell me about newer versions nearby</string>
-    <string name="feat_newer_versions_nearby_description">When two phones connect, each tells the other which MeshLive release it runs, in the signed greeting they already exchange (never in what a phone broadcasts). If a connected phone has a newer one you see a quiet note on the home screen; nothing is downloaded or installed. Turning this off also stops your phone from telling others its release.</string>
+    <string name="feat_newer_versions_nearby_description">When two phones connect, each tells the other which MeshLive release it runs, in the signed greeting they already exchange (never in what a phone broadcasts). If a connected phone has a newer one you see a quiet note on the home screen; nothing is downloaded or installed. On a live stream that greeting is not encrypted, so anyone listening nearby can read the release too. Turning this off also stops your phone from telling others its release, except while Use Wi-Fi for faster connections is on: then it still tells it on live streams and when it relays a call.</string>
     <string name="update_nearby_notice">A friend nearby has a newer MeshLive. Tap to see how to get it.</string>
     <string name="update_available_notice">Update available: %1$s. Tap to review.</string>
     <string name="update_open_screen">Check now</string>

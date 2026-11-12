@@ -9,6 +9,19 @@ internal object WifiAdvicePolicy {
     const val PREF_ANSWERED_AT = "wifi_advice_answered_at_ms"
     const val QUIET_MS = 24 * 60 * 60 * 1_000L
 
+    /** What the advice asks for (UI audit 2026-11-10, UI-03). */
+    enum class Variant {
+        /** No Wi-Fi switch is on: try a 5 GHz network or turn Wi-Fi off. */
+        TURN_WIFI_OFF,
+
+        /** A Wi-Fi switch is on, and its carriers stop with Wi-Fi off: leave the 2.4 GHz network, keep Wi-Fi on. */
+        KEEP_WIFI_ON,
+    }
+
+    /** [switches]: the three Settings Wi-Fi rows as the user has them ([WifiSwitchHub.current]). */
+    fun variant(switches: WifiSwitches): Variant =
+        if (switches.carrier || switches.widerReach || switches.direct) Variant.KEEP_WIFI_ON else Variant.TURN_WIFI_OFF
+
     fun shouldAsk(voice: Boolean, nowMs: Long, answeredAtMs: Long): Boolean = when {
         voice -> false
         answeredAtMs <= 0L -> true

@@ -249,6 +249,16 @@ internal object ConversationNotifier {
         val node = StoreForwardRuntime.nodeIfOpen() ?: return
         val engine = node.v2 ?: return
         val peer = runCatching { NodeId.fromBytes(hexToBytes(peerHex)) }.getOrNull() ?: return
+        // Re-review S3: before the sealed mute and report lists are read, a muted chat could alert. The refresh waits for
+        // them (it runs again on this worker once they are read) instead of deciding on a partial list.
+        if (!ChatMute.isLoaded(context) || !LocalReporting.isLoaded(context)) {
+            ChatMute.whenLoaded(context) {
+                LocalReporting.whenLoaded(context) {
+                    worker.execute { runCatching { refresh(context, peerHex, alert) }.onFailure(::logFailure) }
+                }
+            }
+            return
+        }
         // A muted chat (ChatMute, the chat list's long-press) keeps its unread count but shows no notification.
         if (ChatMute.isMuted(context, peerHex) || LocalReporting.hidden(context, peerHex)) {
             cancelPeer(context, peerHex)

@@ -607,7 +607,7 @@ class VerifiedContactStore(
             }
         }
         file.parentFile?.mkdirs()
-        atomicWrite(file, cipher.seal(bytes.toByteArray()))
+        WipeGuard.guardedWrite("verified contacts") { atomicWrite(file, cipher.seal(bytes.toByteArray())) }
         cache = contacts
         latched = null
         lastFailure = null

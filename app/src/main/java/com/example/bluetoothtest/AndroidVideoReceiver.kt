@@ -74,6 +74,19 @@ class AndroidVideoReceiver(
     @Volatile private var listenerMuted = false
     @Volatile private var parentTrickle: RelayParentTrickle? = null
     @Volatile private var serverSocket: BluetoothServerSocket? = null
+    /** Wider reach: native parents handed over by the Wi-Fi viewer-request acceptor (at most two). [AM 16] */
+    private val wifiParents = java.util.concurrent.LinkedBlockingQueue<WifiNativeConnection>(2)
+    /** One stream parent at a time, for both radios (F-7). Ungated and inert with Wider reach off. [AM 16] */
+    private val parentOwnership = ParentOwnership()
+
+    /** The one acceptor of this receiver's Wi-Fi viewer request: its identity marks the registry entry as this receiver's. */
+    private val wifiViewerAcceptor: (WifiNativeConnection) -> Unit = { native ->
+        if (running.get() && !wifiParents.offer(native)) native.close() else if (!running.get()) native.close()
+    }
+    private val wifiViewerLock = Any()
+    /** The viewer request last offered over Wi-Fi (null: none), and whether it is wanted on air now (A8 review P1-1). */
+    private var wifiViewerAnnouncement: DiscoveryAnnouncement? = null
+    private var wifiViewerOnAir = false
     /** The current parent said the stream is paused: silence is expected, not a dead link. */
     @Volatile private var parentStreamPaused = false
     /** The parent's stream header arrived on this link: media can flow, so the trickle test may judge. */
@@ -88,6 +101,12 @@ class AndroidVideoReceiver(
      * stream, and judging it would close the link the relay deliberately thinned, again and again.
      */
     @Volatile private var weakLinkPaused = false
+    /** A7: the hop of the current parent link (null while none). */
+    @Volatile private var parentHop: HopLink? = null
+    /** A7: the current stream's one-slot keyframe request queue, for the hop owner. */
+    @Volatile private var parentKeyFrameRequests: ArrayBlockingQueue<Unit>? = null
+    /** A7: serialises the two child-to-parent sealing writers that share one sealer (A7 Am 11). */
+    private val controlSealLock = Any()
     /** LE CoC: a lease on the role's long-lived listener (CocListeners). */
     @Volatile private var cocListener: CocListenLease<BluetoothSocket>? = null
     @Volatile private var clientSocket: BluetoothSocket? = null
@@ -173,6 +192,23 @@ class AndroidVideoReceiver(
                     transport,
                     maxChildren = if (forwardReceivedStreams && streamToken != 0) 1 else 0,
                 )
+                parentOwnership.beginJoin(gated = streamToken != 0 && WifiDiscovery.widerReachOn())
+                if (parentOwnership.gated) {   // [AM 16] gated before the offer is published
+                    val wifiFlags = when (transport) {
+                        BluetoothTransportOption.CLASSIC_RFCOMM -> DiscoveryAnnouncement.FLAG_CLASSIC_TRANSPORT
+                        BluetoothTransportOption.BLE_GATT -> DiscoveryAnnouncement.FLAG_GATT_TRANSPORT
+                        BluetoothTransportOption.BLE_L2CAP -> 0
+                    }
+                    publishWifiViewerRequest(
+                        viewerAnnouncement(identity, capabilities, wifiFlags, streamToken, routeCost, streamBitrateKbps, recoveryFromNodeIdPrefix),
+                    )
+                    thread(name = "ReceiverWifiParents", isDaemon = true) {
+                        serveWifiParents(
+                            context, adapter, transport, identity, capabilities, expectedSourceNodeIdPrefix,
+                            streamToken, routeCost, streamBitrateKbps, phyPreference, ioConfig,
+                        )
+                    }
+                }
                 when (transport) {
                     BluetoothTransportOption.CLASSIC_RFCOMM -> {
                         serverSocket = ClassicSockets.listen(adapter, "Bluetooth Video", ClassicRole.STREAM_RECEIVER)
@@ -256,22 +292,49 @@ class AndroidVideoReceiver(
                         return@thread
                     }
                 }
-                while (running.get()) {
+                acceptLoop@ while (running.get()) {
                     val activeCocListener = cocListener
-                    val socket = if (activeCocListener != null) {
-                        if (streamToken == 0) {
-                            activeCocListener.accept()
+                    val socket: BluetoothSocket? = try {
+                        if (activeCocListener != null) {
+                            if (streamToken == 0) {
+                                activeCocListener.accept()
+                            } else {
+                                activeCocListener.accept(CONNECTION_WAIT_TIMEOUT_MS)
+                            }
                         } else {
-                            activeCocListener.accept(CONNECTION_WAIT_TIMEOUT_MS)
+                            val activeServerSocket = serverSocket ?: break@acceptLoop
+                            if (streamToken == 0) {
+                                activeServerSocket.accept()
+                            } else {
+                                activeServerSocket.accept(CONNECTION_WAIT_TIMEOUT_MS.toInt())
+                            }
                         }
-                    } else {
-                        val activeServerSocket = serverSocket ?: break
-                        if (streamToken == 0) {
-                            activeServerSocket.accept()
-                        } else {
-                            activeServerSocket.accept(CONNECTION_WAIT_TIMEOUT_MS.toInt())
+                    } catch (error: IOException) {
+                        // A join that waits for its Wi-Fi parent keeps waiting: the Bluetooth accept timeout is not an end.
+                        // Ending is atomic with the Wi-Fi worker's claim, so a Wi-Fi parent can never start on a join that is
+                        // ending (A8 review P2-5).
+                        if (streamToken != 0 && parentOwnership.gated && !parentOwnership.endJoinIfUnowned()) {
+                            try {
+                                Thread.sleep(250)
+                            } catch (_: InterruptedException) {
+                                return@thread
+                            }
+                            continue@acceptLoop
                         }
+                        throw error
                     }
+                    if (socket == null) {
+                        if (streamToken != 0 && parentOwnership.gated && !parentOwnership.endJoinIfUnowned()) continue@acceptLoop
+                        break@acceptLoop
+                    }
+                    val token = parentOwnership.claim()
+                    if (token == null) {
+                        runCatching { socket.close() }
+                        Log.i("BluetoothVideo", "BENCHMARK receiver_join: event=second_parent_refused | radio=bluetooth")
+                        continue@acceptLoop
+                    }
+                    try {
+                    takeWifiViewerRequestOffAir()   // a Bluetooth parent took the join (A8 review P1-1)
                     if (activeCocListener == null) ClassicRfcommCap.note(socket) // an accepted Classic RFCOMM peer counts towards the cap log
                     // Review B12: a Classic join takes one sender; its BLE request advert stops once that sender connected.
                     if (transport == BluetoothTransportOption.CLASSIC_RFCOMM && streamToken != 0) {
@@ -346,6 +409,9 @@ class AndroidVideoReceiver(
                             onStatus("Sender disconnected. BLE receiver is advertising again.")
                         }
                     }
+                    } finally {
+                        parentOwnership.release(token)   // [AM 16] last
+                    }
                     if (streamToken != 0) break
                 }
             } catch (error: LocalMediaPipelineException) {
@@ -385,6 +451,7 @@ class AndroidVideoReceiver(
                 BluetoothEpoch.unregister(epochName)
                 RotatingDiscovery.removeBoundaryListener(viewerBoundaryListener)
                 RotatingDiscovery.offAir(RotatingDiscoveryIds.ROLE_VIEWER_REQUEST)
+                stopWifiViewerRequest()   // every stop path, not only close() (A8 review P1-1)
                 viewerInputs = null
                 closeSockets()
                 bleControlServer?.close()
@@ -512,6 +579,7 @@ class AndroidVideoReceiver(
                 inputs.identity, inputs.capabilities, inputs.transportFlags, inputs.streamToken, inputs.routeCost,
                 inputs.streamBitrateKbps, inputs.recoveryFromNodeIdPrefix,
             )
+            updateWifiViewerRequest(announcement)   // [AM 27] through publishOffer; only while the request is still on air
             val silenceMs = RotatingDiscovery.boundarySilenceMs()
             // Review T12: both servers sit out the same silence at once (one after the other, the GATT advert came
             // back a whole silence after the control one).
@@ -520,6 +588,124 @@ class AndroidVideoReceiver(
             runCatching { controlThread?.join() }
             if (BuildConfig.DEBUG) {
                 Log.i("BluetoothVideo", "BENCHMARK rotid_restart: role=viewer | silenceMs=$silenceMs")
+            }
+        }
+    }
+
+    /** Offers [announcement] as this join's Wi-Fi viewer request (Wider reach, the join is gated). */
+    private fun publishWifiViewerRequest(announcement: DiscoveryAnnouncement) = synchronized(wifiViewerLock) {
+        wifiViewerAnnouncement = announcement
+        wifiViewerOnAir = true
+        WifiDiscovery.publishOffer(WifiOfferRole.VIEWER_REQUEST, announcement, wifiViewerAcceptor)
+    }
+
+    /** A boundary's new request: published over Wi-Fi only while the request is still wanted on air there. */
+    private fun updateWifiViewerRequest(announcement: DiscoveryAnnouncement) = synchronized(wifiViewerLock) {
+        if (!wifiViewerOnAir) return@synchronized
+        wifiViewerAnnouncement = announcement
+        WifiDiscovery.publishOffer(WifiOfferRole.VIEWER_REQUEST, announcement, wifiViewerAcceptor)
+    }
+
+    /** A parent (Bluetooth or Wi-Fi) took the join: sources stop dialling this viewer over Wi-Fi. */
+    private fun takeWifiViewerRequestOffAir() = synchronized(wifiViewerLock) {
+        wifiViewerOnAir = false
+        clearOwnWifiViewerRequest()
+    }
+
+    /** The join waits again (an unauthenticated link was dropped): the last request goes back on air. */
+    private fun resumeWifiViewerRequest() = synchronized(wifiViewerLock) {
+        val announcement = wifiViewerAnnouncement ?: return@synchronized
+        if (!running.get()) return@synchronized
+        wifiViewerOnAir = true
+        WifiDiscovery.publishOffer(WifiOfferRole.VIEWER_REQUEST, announcement, wifiViewerAcceptor)
+    }
+
+    /** The receiver stops: the request leaves Wi-Fi for good (a stale rotating ID must never stay published, F-10/X8). */
+    private fun stopWifiViewerRequest() = synchronized(wifiViewerLock) {
+        wifiViewerOnAir = false
+        wifiViewerAnnouncement = null
+        clearOwnWifiViewerRequest()
+    }
+
+    /** Clears the viewer request only when it is this receiver's (another receiver's newer request stays). */
+    private fun clearOwnWifiViewerRequest() {
+        WifiDiscovery.offers.clearIf(WifiOfferRole.VIEWER_REQUEST) { it.acceptor === wifiViewerAcceptor }
+    }
+
+    /** Wider reach: one Wi-Fi-native parent per stream join (A8 step 12.1.5), with the same ownership token as the Bluetooth workers. */
+    private fun serveWifiParents(
+        context: Context,
+        adapter: BluetoothAdapter,
+        transport: BluetoothTransportOption,
+        identity: SigningIdentity,
+        capabilities: NodeCapabilities,
+        expectedSourceNodeIdPrefix: ByteArray?,
+        streamToken: Int,
+        routeCost: Int,
+        streamBitrateKbps: Int,
+        phyPreference: BlePhyPreference,
+        ioConfig: VideoStreamIoConfig,
+    ) {
+        while (running.get()) {
+            val connection = try {
+                wifiParents.poll(1, java.util.concurrent.TimeUnit.SECONDS) ?: continue
+            } catch (_: InterruptedException) {
+                return
+            }
+            val token = parentOwnership.claim()
+            if (token == null) {
+                connection.close()
+                Log.i("BluetoothVideo", "BENCHMARK receiver_join: event=second_parent_refused | radio=wifi")
+                continue
+            }
+            var silenceWatch: Thread? = null
+            try {
+                RotatingDiscovery.offAir(RotatingDiscoveryIds.ROLE_VIEWER_REQUEST)
+                takeWifiViewerRequestOffAir()
+                parentStreamPaused = false
+                parentMediaStarted = false
+                parentVideoOff = false
+                parentAudioOnly = false
+                val reads = SocketReadGapStats()
+                silenceWatch = startViewerLinkSilenceWatch(transport, routeCost, relayParentWatchRunning = false, reads) {
+                    runCatching { connection.close() }
+                }
+                try {
+                    receiveSecure(
+                        context, adapter,
+                        BufferedInputStream(reads.wrap(connection.input), ioConfig.bufferBytes),
+                        BufferedOutputStream(connection.output, ioConfig.bufferBytes),
+                        transport, identity, capabilities, expectedSourceNodeIdPrefix, streamToken, routeCost, streamBitrateKbps,
+                        phyPreference, ioConfig,
+                        carrier0IsBluetooth = false,                       // A7's parameter, by name: no HopLink upgrade [X14][A7]
+                        onLinkAuthenticated = { connection.admitted() },    // F-3 admission [AM 12]
+                    ) { " | " + WifiCallNotices.LABEL + " peer=" + connection.peerHash }
+                } catch (error: StreamRouteWithdrawnException) {
+                    stopCause = ReceiverStopCause.of(ReceiverStopKind.ROUTE_WITHDRAWN, error)
+                    if (running.get()) {
+                        onRouteWithdrawn(error.reason)
+                        onStatus("The immediate parent withdrew this stream route.")
+                    }
+                } catch (error: IOException) {
+                    stopCause = ReceiverStopCause.of(ReceiverStopKind.LINK, error)
+                    if (running.get()) onStatus("Wi-Fi sender disconnected (${error.message ?: "I/O failure"}).")
+                } catch (error: Exception) {
+                    stopCause = ReceiverStopCause.of(ReceiverStopKind.OTHER, error)
+                    if (running.get()) onStatus("Incoming Wi-Fi stream stopped: ${error.message ?: error.javaClass.simpleName}")
+                } finally {
+                    silenceWatch?.interrupt()
+                    onStreamActive(false)   // this worker owns the token here
+                    closeDecoders()
+                    connection.close()
+                }
+                if (streamToken != 0) {           // [AM 16] a join ends with its parent; the Bluetooth worker's outer finally runs once
+                    running.set(false)
+                    stopWifiViewerRequest()
+                    closeSockets()
+                    gattVideoServer?.close()
+                }
+            } finally {
+                parentOwnership.release(token)   // [AM 16] last
             }
         }
     }
@@ -557,18 +743,33 @@ class AndroidVideoReceiver(
             streamBitrateKbps, recoveryFromNodeIdPrefix,
         )
         // Review B3/B9: one join wait across connections, extended once for a link still in setup.
-        val joinWait = if (streamToken == 0) null else ReceiverJoinWait(android.os.SystemClock.elapsedRealtime(), CONNECTION_WAIT_TIMEOUT_MS)
+        var joinWait = if (streamToken == 0) null else ReceiverJoinWait(android.os.SystemClock.elapsedRealtime(), CONNECTION_WAIT_TIMEOUT_MS)
         while (running.get()) {
             val connection = if (joinWait == null) {
                 connections.take()
             } else {
-                pollJoinConnection(connections, joinWait, server) ?: run {
+                val taken = pollJoinConnection(connections, joinWait, server)
+                if (taken == null) {
+                    // [AM 16] a Wi-Fi parent may own the join: the Bluetooth wait starts over instead of ending the receiver.
+                    if (parentOwnership.gated && !parentOwnership.endJoinIfUnowned()) {   // atomic with a Wi-Fi claim (P2-5)
+                        joinWait = ReceiverJoinWait(android.os.SystemClock.elapsedRealtime(), CONNECTION_WAIT_TIMEOUT_MS)
+                        continue
+                    }
                     // Review B4: a typed cause, so the "avoid a failing parent" fallback counts this parent.
                     if (running.get()) stopCause = ReceiverStopCause.joinTimeout()
                     return
                 }
+                taken
             }
+            val token = parentOwnership.claim()
+            if (token == null) {
+                runCatching { connection.close() }
+                Log.i("BluetoothVideo", "BENCHMARK receiver_join: event=second_parent_refused | radio=bluetooth")
+                continue
+            }
+            try {
             RotatingDiscovery.offAir(RotatingDiscoveryIds.ROLE_VIEWER_REQUEST)
+            takeWifiViewerRequestOffAir()
             gattParentLink = connection
             var linkAuthenticated = false
             parentStreamPaused = false
@@ -644,6 +845,10 @@ class AndroidVideoReceiver(
                 // Review B9: a connection that never authenticated was not this join's parent: drop it, keep waiting.
                 if (!running.get() || !joinWait.keepWaitingAfter(linkAuthenticated, android.os.SystemClock.elapsedRealtime())) return
                 Log.i("BluetoothVideo", "BENCHMARK receiver_join: event=unauthenticated_link_dropped | action=keep_waiting")
+                resumeWifiViewerRequest()   // the join still waits: its Wi-Fi request goes back on air
+            }
+            } finally {
+                parentOwnership.release(token)   // [AM 16] last
             }
         }
     }
@@ -738,13 +943,19 @@ class AndroidVideoReceiver(
                         Thread.sleep(PARENT_SILENCE_CHECK_MS)
                         val nowNs = System.nanoTime()
                         val paused = parentStreamPaused
-                        val silent = relayParentSilent(nowNs, readGaps.lastReadAtNs, startedNs, paused)
+                        val onWifi = parentHop?.acceptKind ?: CarrierKind.BLUETOOTH
+                        val silent = relayParentSilent(nowNs, readGaps.lastReadAtNs, startedNs, parentLinkJudgedPaused(paused, onWifi))
                         val trickleKbps = if (silent) {
                             null
                         } else {
                             // A weak-link pause (relay child thinning at audio only) is a pause for the trickle test (B10);
                             // the silence test still closes a link that delivers nothing at all.
-                            trickle?.onTick(nowNs, readGaps.bytesRead, paused || weakLinkPaused, armed = parentMediaStarted)
+                            trickle?.onTick(
+                                nowNs,
+                                readGaps.bytesRead,
+                                parentLinkJudgedPaused(paused || weakLinkPaused, onWifi),
+                                armed = parentMediaStarted,
+                            )
                         }
                         if (silent || trickleKbps != null) {
                             Log.i(
@@ -805,7 +1016,10 @@ class AndroidVideoReceiver(
                         System.nanoTime(),
                         reads.lastReadAtNs,
                         mediaStarted = parentMediaStarted,
-                        silenceExpected = parentStreamPaused || parentVideoOff || parentAudioOnly || weakLinkPaused,
+                        silenceExpected = parentLinkJudgedPaused(
+                            parentStreamPaused || parentVideoOff || parentAudioOnly || weakLinkPaused,
+                            parentHop?.acceptKind ?: CarrierKind.BLUETOOTH,
+                        ),
                     ) ?: continue
                     Log.i("BluetoothVideo", ViewerLinkSilenceWatch.benchmarkLine(silentMs, transport, routeCost))
                     onStatus("No video arrived for ${silentMs / 1_000L} s; reconnecting.")
@@ -869,6 +1083,8 @@ class AndroidVideoReceiver(
         ioConfig: VideoStreamIoConfig,
         receiveQueueState: () -> Pair<Int, Int>? = { null },
         onLinkAuthenticated: (SecureBluetoothSession) -> Unit = {},
+        /** A7: a Wi-Fi-native parent passes false (mode OFF, no CAPS, no attempt); every Bluetooth parent keeps true. */
+        carrier0IsBluetooth: Boolean = true,
         linkDetails: () -> String,
     ) {
         val linkLoad = NodeLinkLoad.open(transport, LinkDirection.RECEIVE)
@@ -880,6 +1096,7 @@ class AndroidVideoReceiver(
                 output,
                 identity,
                 linkCapabilities,
+                raiseTag = true,
             )
         } catch (error: Throwable) {
             linkLoad.close()
@@ -891,6 +1108,7 @@ class AndroidVideoReceiver(
         var streamForwarder: ReceiverStreamForwarder? = null
         var labelSourcePrefix: String? = null
         var debugMediaTrace: DebugMediaTrace? = null
+        var hopLink: HopLink? = null
         val controlRunning = AtomicBoolean(false)
         var controlThread: Thread? = null
         try {
@@ -909,9 +1127,39 @@ class AndroidVideoReceiver(
             } else {
                 null
             }
+            val hop = HopLink(
+                role = HopCapsPlan.HopRole.STREAM_CHILD,
+                session = session,
+                closeRaw = {},
+                anyLocalSwitchOn = WifiSwitchHub::anyOn,
+                log = WifiLog::emit,
+                owner = receiverHopOwner(transport, streamBitrateKbps) { hopLink },
+                newAgent = ::newHopAgent,
+                carrier0IsBluetooth = carrier0IsBluetooth,
+            )
+            hopLink = hop
+            parentHop = hop
             // Experimental peer labels (default off): bit 5 in this endpoint hello only, never in
             // the link hello and never for the group (BGK1) harness.
             val labelsOn = PeerLabelFeature.enabled
+            // SEC-B2: the selected version 2 offer belongs to the link peer itself (a forwarder offers under its own node
+            // and hands the media key to this child), so a link peer with another node cannot relay the source's handshake.
+            // Only the DEBUG manual relay is exempt: its offer belongs to the source behind it.
+            val relayExempt = StreamHopPeerBinding.relayExempt(
+                session.peerCapabilities.maxChildren,
+                rotating = expectedSourceNodeIdPrefix != null && expectedSourceRotating,
+            )
+            if (expectedSourceNodeIdPrefix != null && !expectedSourceRotating) {
+                require(StreamHopPeerBinding.linkMatchesOffer(session.peerNodeId, expectedSourceNodeIdPrefix, relayExempt)) {
+                    "Stream source identity changed between discovery and connection"
+                }
+            }
+            StreamHopPeerBinding.requireGroupAllowed(
+                "viewer",
+                expectedSourceNodeIdPrefix != null && expectedSourceRotating,
+                session.peerCapabilities.maxChildren,
+                "Stream source identity changed between discovery and connection",
+            )
             if (session.peerCapabilities.maxChildren > 1) {
                 groupSession = BroadcastGroupHandshake.respond(session, identity, capabilities)
             } else {
@@ -919,6 +1167,15 @@ class AndroidVideoReceiver(
                     .also { it.opener.acceptLabels = labelsOn }
             }
             val endpointSession = groupSession?.endpoint ?: requireNotNull(contentSession)
+            // SEC-B2: the authenticated end-to-end peer is the authenticated link peer on every version and transport.
+            StreamHopPeerBinding.requireBound(
+                "viewer",
+                expectedSourceNodeIdPrefix != null && expectedSourceRotating,
+                session.peerNodeId,
+                endpointSession.peerNodeId,
+                session.peerCapabilities.maxChildren,
+                "Stream source identity changed between discovery and connection",
+            )
             if (expectedSourceNodeIdPrefix != null) {
                 if (expectedSourceRotating) {
                     // RV15: the check follows the selected version 5 offer: its RDI must open for the link
@@ -956,7 +1213,7 @@ class AndroidVideoReceiver(
             }
             if (DebugTunables.joinProbeSeed) session.reader.enableJoinBurstMeasure()
             val forwardedGrant = if (endpointSession.peerCapabilities.maxChildren > 0) {
-                val wrapped = session.reader.read()
+                val wrapped = hop.reader.read()
                 require(wrapped.type == SecureRecordType.END_TO_END_CONTENT) {
                     "Expected a forwarded-stream key grant"
                 }
@@ -973,7 +1230,7 @@ class AndroidVideoReceiver(
             val labelsPayload = contentSession?.takeIf {
                 groupSession == null &&
                     LabelRecords.streamHopNegotiated(labelsOn, session.peerNodeId, it.peerNodeId, it.peerCapabilities)
-            }?.let { LabelRecords.read(session.reader, it.opener) }
+            }?.let { LabelRecords.read(hop.reader, it.opener) }
             val mediaOpener = forwardedGrant?.let { grant ->
                 EndToEndContentOpener(grant.key).also {
                     forwardedMediaOpener = it
@@ -998,6 +1255,7 @@ class AndroidVideoReceiver(
             }
             val pendingForwardingEnvelopes = mutableListOf<MeshEnvelope>()
             val keyFrameRequests = ArrayBlockingQueue<Unit>(1)
+            parentKeyFrameRequests = keyFrameRequests
             val forwardedChildCount = AtomicInteger(0)
             val forwardedChildAudioDropsAtJoin = AtomicLong(0)
             val downstreamKeyFramePending = AtomicBoolean(false)
@@ -1013,7 +1271,7 @@ class AndroidVideoReceiver(
             var layeredRelayBudgetKbps = 0.0
 
             val streamReader = EndToEndStreamReader(
-                session.reader,
+                hop.reader,
                 mediaOpener,
                 mediaSourceNodeId,
             ) { envelope ->
@@ -1055,6 +1313,7 @@ class AndroidVideoReceiver(
                 markerMismatchMarkedAudio = mismatch.offerMarkedAudioOnly
                 throw mismatch
             }
+            hop.noteFirstHeader()
             parentAudioOnly = header.isAudioOnly
             parentMediaStarted = true
             forwardedGrant?.let { grant ->
@@ -1129,20 +1388,31 @@ class AndroidVideoReceiver(
                     MeshBandwidthEstimator.perLinkKbps(streamBitrateKbps, header.fps)
                 }
                 val measuredRelayBudgetKbps = LinkCapacity.budgetKbps(transport, LinkLoadKind.RELAY, relayLinkKbps)
-                val coldStart = DebugTunables.relayColdStart && LinkCapacityPolicy.relayColdStart(
+                // The relay floors (LinkCapacityPolicy.relayFloor): the default-on cold start, then the Experimental
+                // no-ceiling floor (test_relay_no_ceiling_floor, design decision 2026-11-06); off, the cold start alone.
+                val relayFloor = LinkCapacityPolicy.relayFloor(
                     LinkCapacity.learned(transport, LinkLoadKind.RELAY),
                     System.currentTimeMillis(),
+                    coldStartOn = DebugTunables.relayColdStart,
+                    noCeilingOn = DebugTunables.relayNoCeilingFloor,
                 )
-                val relayBudgetKbps = LinkCapacityPolicy.relayBudgetKbps(measuredRelayBudgetKbps, relayLinkKbps, coldStart)
+                val coldStart = relayFloor == LinkCapacityPolicy.FLOOR_COLD_START
+                val relayBudgetKbps = LinkCapacityPolicy.relayBudgetKbps(
+                    measuredRelayBudgetKbps,
+                    relayLinkKbps,
+                    relayFloor != LinkCapacityPolicy.FLOOR_NONE,
+                )
                 Log.i(
                     "BluetoothVideo",
-                    "BENCHMARK relay_admission: cold_start=%s | needKbps=%.0f | budgetKbps=%.0f | measuredKbps=%.0f | fits=%s | %s".format(
+                    "BENCHMARK relay_admission: cold_start=%s | needKbps=%.0f | budgetKbps=%.0f | measuredKbps=%.0f | fits=%s%s | %s".format(
                         java.util.Locale.ROOT,
                         coldStart,
                         2 * relayLinkKbps,
                         relayBudgetKbps,
                         measuredRelayBudgetKbps,
                         relayFits(relayBudgetKbps, relayLinkKbps),
+                        // Only while the Experimental floor is on, so every other line keeps its exact format.
+                        if (DebugTunables.relayNoCeilingFloor) " | floor=$relayFloor" else "",
                         LinkCapacity.summary(transport),
                     ),
                 )
@@ -1303,8 +1573,8 @@ class AndroidVideoReceiver(
                         Log.i("BluetoothVideo", "BENCHMARK direct GATT heartbeat send enabled intervalMs=$heartbeatIntervalMs")
                     }
                     if (sendPeriodicHeartbeat) {
-                        SecureLinkControlProtocol.writeHeartbeat(session.writer)
-                        session.writer.flush()
+                        SecureLinkControlProtocol.writeHeartbeat(hop.writer)
+                        hop.writer.flush()
                     }
                     var lastCapacityReportNs = 0L
                     var reportedTrains = 0L
@@ -1325,16 +1595,18 @@ class AndroidVideoReceiver(
                             TimeUnit.MILLISECONDS,
                         ) != null
                         if (keyFrameRequested) {
-                            EndToEndStreamProtocol.writeKeyFrameRequest(
-                                session.writer,
-                                controlContentSession.sealer,
-                            )
-                            session.writer.flush()
+                            synchronized(controlSealLock) {
+                                EndToEndStreamProtocol.writeKeyFrameRequest(
+                                    hop.writer,
+                                    controlContentSession.sealer,
+                                )
+                                hop.writer.flush()
+                            }
                         }
                         // Workstream B: tell the parent what this link measured and whether a link
                         // below this relay is tight (new trains or a changed state only).
                         val nowNs = System.nanoTime()
-                        val trains = session.reader.measuredTrains
+                        val trains = hop.measureReader().measuredTrains
                         // Hop-local: media on the link from the parent reaches this phone late (its
                         // adaptive playout delay is pinned at the maximum); the stack can hide that
                         // backlog from the parent. Children's links are this phone's own business.
@@ -1347,7 +1619,7 @@ class AndroidVideoReceiver(
                         val receivedBytes = streamReader.delivery.snapshot().receivedBytes
                         val onTimeDue = onTimeReportDue(
                             onTimeReports,
-                            session.reader.genuineTrains,
+                            hop.measureReader().genuineTrains,
                             tight,
                             receivedBytes > onTimeReportedBytes,
                             nowNs - lastCapacityReportNs,
@@ -1355,11 +1627,11 @@ class AndroidVideoReceiver(
                         val fullDue = (changed || onTimeDue) && nowNs - lastCapacityReportNs >= reportIntervalNs
                         val deliveryDue = deliveryReports && nowNs - lastDeliveryReportNs >= reportIntervalNs
                         if (fullDue || deliveryDue) {
-                            val kbps = session.reader.arrivalCapacityKbps() ?: 0
+                            val kbps = hop.measureReader().arrivalCapacityKbps() ?: 0
                             val full = fullDue && (kbps > 0 || tight != reportedTight || delayChanged || onTimeDue)
                             if (full || deliveryDue) {
                                 SecureLinkControlProtocol.writeCapacityReport(
-                                    session.writer,
+                                    hop.writer,
                                     LinkCapacityReport(
                                         kbps,
                                         tight,
@@ -1368,7 +1640,7 @@ class AndroidVideoReceiver(
                                         deliveryOnly = !full,
                                     ),
                                 )
-                                session.writer.flush()
+                                hop.writer.flush()
                                 lastDeliveryReportNs = nowNs
                                 if (full) {
                                     reportedAddedDelayMs = addedDelayMs
@@ -1382,14 +1654,14 @@ class AndroidVideoReceiver(
                                     lastCapacityReportNs = nowNs
                                     onTimeReportedBytes = receivedBytes
                                     reportedTrains = trains
-                                    if (kbps > 0) session.reader.joinBurstReported()
+                                    if (kbps > 0) hop.measureReader().joinBurstReported()
                                     reportedTight = tight
                                 }
                             }
                         }
                         if (sendPeriodicHeartbeat) {
-                            SecureLinkControlProtocol.writeHeartbeat(session.writer)
-                            session.writer.flush()
+                            SecureLinkControlProtocol.writeHeartbeat(hop.writer)
+                            hop.writer.flush()
                         }
                     }
                 } catch (interrupted: InterruptedException) {
@@ -1444,11 +1716,11 @@ class AndroidVideoReceiver(
                         streamReader.readStreamContent()
                     } catch (withdrawal: StreamRouteWithdrawnException) {
                         try {
-                            session.writer.write(
+                            hop.sendHopControl(
                                 SecureRecordType.ROUTE_CONTROL_ACK,
                                 StreamRouteControlProtocol.encode(withdrawal.reason),
                             )
-                            session.writer.flush()
+                            hop.writer.flush()
                         } catch (acknowledgementError: Exception) {
                             Log.w(
                                 "BluetoothVideo",
@@ -1537,11 +1809,13 @@ class AndroidVideoReceiver(
                                     val childAcknowledged = streamForwarder?.awaitTerminalAck(
                                         FORWARDED_END_ACK_TIMEOUT_MS,
                                     ) ?: true
-                                    EndToEndStreamProtocol.writeStreamEndAck(
-                                        session.writer,
-                                        controlContentSession.sealer,
-                                    )
-                                    session.writer.flush()
+                                    synchronized(controlSealLock) {
+                                        EndToEndStreamProtocol.writeStreamEndAck(
+                                            hop.writer,
+                                            controlContentSession.sealer,
+                                        )
+                                        hop.writer.flush()
+                                    }
                                     streamEnded = true
                                     onStreamActive(false)
                                     onStatus(
@@ -1933,9 +2207,44 @@ class AndroidVideoReceiver(
             debugMediaTrace?.close()
             forwardedMediaOpener?.close()
             labelSourcePrefix?.let { prefix -> SessionPeerLabels.update(prefix) { it.copy(streamTitle = null) } }
+            parentKeyFrameRequests = null
+            parentHop = null
+            hopLink?.close()
+            hopLink = null
             if (groupSession != null) groupSession?.close() else contentSession?.close()
             session.close()
         }
+    }
+
+    /** A7: what the hop's carrier switch reports back to this viewer. */
+    /** [hop] is this receiveSecure call's own hop (null once its `finally` ran), never the field of a later parent. */
+    private fun receiverHopOwner(
+        transport: BluetoothTransportOption,
+        streamBitrateKbps: Int,
+        hop: () -> HopLink?,
+    ): HopOwner = object : HopOwner {
+        override fun sendCarrierChanged(kind: CarrierKind) {
+            LinkChangeEvents.carrierChanged()
+        }
+
+        override fun localKeyframeNeeded() = Unit
+
+        override fun peerKeyframeNeeded() {
+            val own = hop() ?: return
+            if (parentHop === own) parentKeyFrameRequests?.offer(Unit)
+        }
+
+        override fun reassertState() = Unit
+
+        override fun hopEnded(reason: String) {
+            Log.i("BluetoothVideo", "BENCHMARK hop_end: role=stream_child | reason=${WifiLog.clean(reason)}")
+            // A7 review P3-1: a late `hop-<id>-end` thread closes the hop that ended, never the next parent's.
+            hop()?.close()
+        }
+
+        override fun bluetoothBudgetKbps(): Int? = LinkCapacity.measuredLinkKbps(transport, CarrierKind.BLUETOOTH)
+
+        override fun targetKbps(): Int? = streamBitrateKbps
     }
 
     private fun linkDetails(
@@ -1954,7 +2263,10 @@ class AndroidVideoReceiver(
     override fun close() {
         debugStageTrace?.close()
         BluetoothEpoch.unregister(epochName)
+        stopWifiViewerRequest()   // before the guard: a worker that already ended may not have cleared it (A8 review P1-1)
         if (!running.getAndSet(false)) return
+        wifiParents.forEach { runCatching { it.close() } }
+        wifiParents.clear()
         closeDecoders()
         closeSockets()
         workerThread?.interrupt()
@@ -2083,6 +2395,12 @@ private fun recoveryDiscoveryFlag(previousUpstreamNodeIdPrefix: ByteArray?): Int
 /** How often, and after how much total silence, a child judges its relay parent link dead. */
 internal const val PARENT_SILENCE_CHECK_MS = 500L
 internal const val PARENT_SILENCE_NS = 5_000_000_000L
+
+/**
+ * A7: a relayed parent's link watches judge raw Bluetooth bytes. Once Wi-Fi accepts the parent's media, the standby is
+ * idle on purpose (A3 keeps it alive with heartbeats); the watches must not close a healthy parent for that silence.
+ */
+internal fun parentLinkJudgedPaused(paused: Boolean, acceptKind: CarrierKind): Boolean = paused || acceptKind.isWifi
 
 /**
  * A relayed parent link is dead when no byte arrived for [PARENT_SILENCE_NS] since the later of the

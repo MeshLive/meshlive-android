@@ -126,7 +126,14 @@ enum class PlaybackDelayProfile(
     val adaptive: Boolean
         get() = adaptiveMaxDelayMs > delayMs
 
-    fun newPlayoutClock(delayOverrideMs: Long? = null): MediaPlayoutClock = if (delayOverrideMs != null && delayOverrideMs != delayMs) {
+    /**
+     * [fastRecovery] (Experimental `test_call_fast_recovery`, [CallFastRecovery.forProfile]) is attached only to an
+     * adaptive call clock; fixed and stream clocks ignore it.
+     */
+    fun newPlayoutClock(
+        delayOverrideMs: Long? = null,
+        fastRecovery: CallFastRecovery? = null,
+    ): MediaPlayoutClock = if (delayOverrideMs != null && delayOverrideMs != delayMs) {
         MediaPlayoutClock(
             delayOverrideMs,
             maxScheduleAheadMs = scheduleAheadMs(delayOverrideMs),
@@ -145,6 +152,7 @@ enum class PlaybackDelayProfile(
             // Experimental time-based target: streams only; calls keep their conversational bounds.
             timeTarget = if (stabilityLabel == "Call") null else PlayoutJitterTarget.fromTunables(),
             burstGrowthFactor = burstGrowthFactor(),
+            fastRecovery = fastRecovery?.takeIf { stabilityLabel == "Call" && adaptive },
         )
     }
 

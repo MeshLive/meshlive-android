@@ -186,6 +186,11 @@ class CodecPowerAwareTest {
     @Test
     fun controlArmOffInDebugKeepsThePlainOrder() {
         CodecPowerAware.enabled = false
+        if (!BuildConfig.DEBUG) {
+            // A release build ignores the control arm: the shipped constant stays in force.
+            assertEquals(ConnectivityFeatureDefaults.CODEC_POWER_AWARE, CodecPowerAware.enabled)
+            return
+        }
         assertFalse(CodecPowerAware.enabled)
         assertEquals(null, CodecPowerAware.reorder(avcOnly(), CodecPowerState.SAVER, CodecPowerAware.enabled, none))
     }

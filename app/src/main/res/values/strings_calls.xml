@@ -35,7 +35,7 @@
     <string name="feature_auto_sync_description">When a contact comes into range, send and receive waiting messages without a tap. Needs Chats.</string>
 
     <string name="feature_names">Names and stream titles</string>
-    <string name="feature_names_description">Add an optional name to your ID, a subject to calls and a title to your livestream. A stream title can be seen by anyone nearby before they join.</string>
+    <string name="feature_names_description">Add an optional name to your ID and a title to your livestream. A stream title can be seen by anyone nearby before they join.</string>
 
     <!-- Call screen -->
     <string name="call_peer_no_voice">%1$s\'s app does not support voice calls, so it started its camera. You can turn on your video too.</string>

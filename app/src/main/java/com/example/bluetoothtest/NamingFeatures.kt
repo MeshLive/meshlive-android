@@ -14,8 +14,14 @@ internal object NamingFeatureDefaults {
     /** Public stream title pages (G1 split). On since 2026-10-17, no Settings switch (design decision). */
     const val TITLE_PAGES = true
 
-    /** "Show my name before they answer" (design decision G-Q1). Applies only while names are on; phone check N2. */
-    const val NAMES_BEFORE_ANSWER = true
+    /**
+     * Experimental: "Show my name before they answer" (design decision G-Q1; the user default from 2026-10-12 to
+     * 2026-11-06). Off since the design decision of 2026-11-06 ("A caller's name waits for the reveal"): a stranger this
+     * phone calls gets the name only after its verified REVEAL passes the block check ([CallerNameRelease]). On, the name
+     * goes before the Invite, so a blocked person behind a fresh throwaway would receive it. Kept as the comparison arm
+     * (never delete an experiment); only the DEBUG extra `test_names_before_answer` turns it on. Phone check N2.
+     */
+    const val NAMES_BEFORE_ANSWER = false
 
     /**
      * G4: BVMID2 verification codes. On since 2026-10-19 (design decision Q-QL1): N5 and the Design QL lease test passed on two
@@ -36,12 +42,11 @@ internal object NamingFeatures {
 
     val GENERATED_NAMES = FeatureSpec(
         id = "generated_names",
-        prefKey = "feature_generated_names",
+        // No Settings switch since 2026-11-04 (design decision): off gave no privacy (the name is computed from the public
+        // rotating ID) and only showed every stranger, and this phone, as "Nearby phone"; an old stored "off" is ignored.
+        prefKey = null,
         defaultEnabled = NamingFeatureDefaults.GENERATED_NAMES,
         benchmarkExtra = "test_generated_names",
-        titleRes = R.string.feature_generated_names,
-        descriptionRes = R.string.feature_generated_names_description,
-        iconRes = R.drawable.ic_person,
         group = GROUP,
         phoneTest = "N3",
     )
@@ -61,15 +66,17 @@ internal object NamingFeatures {
         phoneTest = "T5",
     )
 
-    /** A sub-option of "Names and subjects" ([CallFeature.NAMES_AND_TITLES], id `names_and_titles`). */
+    /**
+     * Experimental, off ([NamingFeatureDefaults.NAMES_BEFORE_ANSWER]): a sub-option of "Names and subjects"
+     * ([CallFeature.NAMES_AND_TITLES], id `names_and_titles`). docs/dev/switches.md lists it.
+     */
     val NAMES_BEFORE_ANSWER = FeatureSpec(
         id = "names_before_answer",
-        prefKey = NamingSettings.PREF_BEFORE_ANSWER,
+        // No Settings switch since 2026-11-04 (owner: one name, one "Who sees my name" choice): the audience decides who
+        // gets the name; an "off" stored by 0.4.4 or older under NamingSettings.PREF_BEFORE_ANSWER is ignored.
+        prefKey = null,
         defaultEnabled = NamingFeatureDefaults.NAMES_BEFORE_ANSWER,
         benchmarkExtra = NamingSettings.EXTRA_BEFORE_ANSWER,
-        titleRes = R.string.feature_names_before_answer,
-        descriptionRes = R.string.feature_names_before_answer_description,
-        iconRes = R.drawable.ic_call,
         group = GROUP,
         dependsOn = listOf("names_and_titles"),
         phoneTest = "N2",
@@ -78,24 +85,20 @@ internal object NamingFeatures {
     /** Expiring one-use verification codes on the Add contact screen (bound to the endpoint through [MeetBridge]). */
     val BVMID2 = FeatureSpec(
         id = "bvmid2",
-        prefKey = "feature_bvmid2",
+        // No Settings switch since 2026-11-04 (owner: fewer knobs); a stored choice is ignored, the DEBUG extra still works.
+        prefKey = null,
         defaultEnabled = NamingFeatureDefaults.BVMID2,
         benchmarkExtra = "test_bvmid2",
-        titleRes = R.string.feature_bvmid2,
-        descriptionRes = R.string.feature_bvmid2_description,
-        iconRes = R.drawable.ic_schedule,
         group = GROUP,
         phoneTest = "N5",
     )
 
     val BVMID1_COMPAT = FeatureSpec(
         id = "bvmid1_compat",
-        prefKey = "feature_bvmid1_compat",
+        // No Settings switch since 2026-11-04 (owner: fewer knobs); a stored choice is ignored, the DEBUG extra still works.
+        prefKey = null,
         defaultEnabled = NamingFeatureDefaults.BVMID1_COMPAT,
         benchmarkExtra = "test_bvmid1_compat",
-        titleRes = R.string.feature_bvmid1_compat,
-        descriptionRes = R.string.feature_bvmid1_compat_description,
-        iconRes = R.drawable.ic_verified_user,
         group = GROUP,
         dependsOn = listOf("bvmid2"),
         phoneTest = "N5",
@@ -116,9 +119,8 @@ internal object NamingFeatures {
     /** Registered in this order: parents first ([FeatureCatalog.register]). `names_and_titles` is registered by [CallFeatureSpecs]. */
     val all: List<FeatureSpec> = listOf(GENERATED_NAMES, TITLE_PAGES, NAMES_BEFORE_ANSWER, BVMID2, BVMID1_COMPAT, VISIBLE_BY_NAME)
 
-    /** The switches that have a Settings row (Settings > Privacy). `bvmid1_compat` and `visible_by_name` ship off. */
-    val settingsRows: List<FeatureSpec> =
-        listOf(GENERATED_NAMES, NAMES_BEFORE_ANSWER, BVMID2, BVMID1_COMPAT, VISIBLE_BY_NAME)
+    /** The switches that have a Settings row (Settings > Experiments since 2026-11-04). `visible_by_name` ships off. */
+    val settingsRows: List<FeatureSpec> = listOf(VISIBLE_BY_NAME)
 
     /** Idempotent. Needs [CallFeatureSpecs.registerAll] first (the parent of `names_before_answer`). */
     fun registerAll() = all.forEach(FeatureCatalog::register)

@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import subprocess
 import struct
+import sys
 import tempfile
 import threading
 import time
@@ -122,6 +123,32 @@ class UnifiedSuiteTest(unittest.TestCase):
         with self.assertRaises(suite.PrerequisiteError):
             with suite.DeviceLease(leases, registry, ["a"], False, "next-owner"):
                 self.fail("Still-running phone was reassigned")
+
+    def test_a_killed_suite_no_longer_blocks_its_phones_but_a_quarantined_one_still_does(self):
+        registry = devices("ab")
+        leases = self.folder / "leases"
+        ended = subprocess.Popen([sys.executable, "-c", "pass"])
+        ended.wait()
+        lease = suite.DeviceLease(leases, registry, "a", False, "killed-runner")
+        leases.mkdir(parents=True)
+        for key in lease.keys + ["session-" + lease.token]:
+            suite.write(leases / (key + ".json"), {"owner": "killed-runner", "pid": ended.pid, "token": lease.token})
+        with suite.DeviceLease(leases, registry, "a", False, "next-owner"):
+            pass
+        stuck = suite.DeviceLease(leases, registry, "b", False, "quarantined-runner")
+        for key in stuck.keys:
+            suite.write(leases / (key + ".json"), {"owner": "quarantined-runner", "pid": ended.pid, "token": stuck.token,
+                                                   "status": "QUARANTINED"})
+        with self.assertRaises(suite.PrerequisiteError):
+            with suite.DeviceLease(leases, registry, "b", False, "next-owner"):
+                self.fail("A phone left in an unconfirmed state was reassigned")
+        live = suite.DeviceLease(leases, registry, "a", False, "live-runner").__enter__()
+        try:
+            with self.assertRaises(suite.PrerequisiteError):
+                with suite.DeviceLease(leases, registry, "a", False, "next-owner"):
+                    self.fail("A running suite's phone was reassigned")
+        finally:
+            live.__exit__(None, None, None)
 
     def test_unknown_phone_cleanup_is_not_treated_as_stopped(self):
         registry = devices("a")
@@ -624,6 +651,17 @@ class UnifiedSuiteTest(unittest.TestCase):
         runner.assert_not_called()
         self.assertEqual([], list(leases.iterdir()))
 
+    def test_a_case_blocked_for_heat_is_kept_with_its_reason_and_never_launches(self):
+        registry = self.inputs([case()])
+        job = {**suite.load_jobs(self.folder / "input.json", registry)[0], "owner": "offline-test"}
+        leases = self.folder / "leases"
+        with patch.object(suite, "preflight", side_effect=suite.ThermalBlocked("thermal: a status 4")), \
+             patch.object(suite, "Runner", side_effect=AssertionError("runner must stay idle")):
+            attempted = suite.execute(job, registry, "adb", "a" * 64, self.folder / "attempt", leases)
+        self.assertEqual(("BLOCKED", "thermal"), (attempted["result"]["status"], attempted["result"]["blocked_reason"]))
+        self.assertEqual("thermal: a status 4", attempted["result"]["reason"])
+        self.assertEqual([], list(leases.iterdir()))
+
     def test_broadcast_checks_sender_offer_without_requiring_receiver_encoder(self):
         exports = capabilities(devices("ab"))
         exports["b"]["encoders"] = []
@@ -638,6 +676,19 @@ class UnifiedSuiteTest(unittest.TestCase):
             mutation(invalid)
             with self.assertRaises(suite.PrerequisiteError):
                 suite.validate_capabilities(case(), invalid)
+
+    def test_a_wifi_exact_rate_needs_an_offered_geometry_but_not_a_settings_step(self):
+        exports = capabilities(devices("ab"))
+        for phone in "ab":
+            exports[phone]["transport_max_kbps"] = {"gatt": 1100}
+        fast = {**case(), "transport": "gatt", "carrier": "wifi_direct",
+                "profile": {**case()["profile"], "bitrate_kbps": 3000}, "tunables": {"wifi_exact_kbps": 3000}}
+        suite.validate_capabilities(fast, exports)
+        for invalid in ({**fast, "tunables": {}}, {**fast, "tunables": {"wifi_exact_kbps": 2000}},
+                        {key: value for key, value in fast.items() if key != "carrier"},
+                        {**fast, "profile": {**fast["profile"], "width": 1280}}):
+            with self.subTest(invalid=invalid), self.assertRaises(suite.PrerequisiteError):
+                suite.validate_capabilities(invalid, exports)
 
     def test_private_call_checks_both_independent_outgoing_encoders(self):
         exports = capabilities(devices("ab"))
@@ -742,6 +793,32 @@ class UnifiedSuiteTest(unittest.TestCase):
         with patch.object(suite.subprocess, "run", side_effect=command):
             with self.assertRaises(suite.PrerequisiteError):
                 suite.preflight("adb", registry, job, self.folder, "a" * 64)
+
+    def test_preflight_names_bluetooth_off_as_the_reason_a_phone_is_not_ready(self):
+        registry = devices("ab")
+        permissions = "\n".join("android.permission." + p + ": granted=true" for p in
+                                  ("CAMERA", "RECORD_AUDIO", "BLUETOOTH_SCAN", "BLUETOOTH_CONNECT", "BLUETOOTH_ADVERTISE"))
+        def command(argv, **_):
+            phone = argv[argv.index("-s") + 1].removeprefix("serial-")
+            text = {("get-state",): "device",
+                    ("shell", "settings", "get", "global", "bluetooth_on"): "0" if phone == "a" else "1",
+                    ("shell", "dumpsys", "window", "policy"): "KeyguardServiceDelegate\n showing=false\n inputRestricted=false",
+                    ("shell", "dumpsys", "power"): "mWakefulness=Awake",
+                    ("shell", "dumpsys", "package", suite.PACKAGE): permissions,
+                    ("shell", "getprop", "ro.build.version.sdk"): "36"}
+            return subprocess.CompletedProcess(argv, 0, text.get(tuple(argv[3:]), ""), "")
+        job = {"case": case(), "phones": ["a", "b"], "execution": "concurrent", "owner": "offline-test"}
+        with patch.object(suite.subprocess, "run", side_effect=command):
+            with self.assertRaisesRegex(suite.PrerequisiteError, r"a: not ready; Bluetooth off$"):
+                suite.preflight("adb", registry, job, self.folder, "a" * 64)
+
+    def test_not_ready_reason_lists_every_cause_and_only_the_real_ones(self):
+        self.assertEqual("a: not ready; denied permissions=['CAMERA']",
+                         suite.not_ready_reason("a", {"adb_state": "device", "bluetooth_on": "1"}, ["CAMERA"]))
+        self.assertEqual("a: not ready; Bluetooth off; denied permissions=['CAMERA']",
+                         suite.not_ready_reason("a", {"adb_state": "device", "bluetooth_on": "0"}, ["CAMERA"]))
+        self.assertIn("adb state='offline'",
+                      suite.not_ready_reason("a", {"adb_state": "offline", "bluetooth_on": "1"}, []))
 
     def test_interrupt_report_retains_active_and_not_started_cases(self):
         self.inputs([case(), case("two", "c", "d"), case("three", "e", "f")])
@@ -936,50 +1013,12 @@ class UnifiedSuiteTest(unittest.TestCase):
         self.cancellation_during_connection(private=True)
 
     def preflight_copy(self, corrupt):
-        registry = devices("ab")
-        exports = capabilities(registry)
-        apk = b"offline test frozen APK bytes"
-        expected = hashlib.sha256(apk).hexdigest()
-        output = self.folder / "preflight"
-        output.mkdir()
-        unrelated = output / "retained-other.apk"
-        unrelated.write_bytes(b"not the pulled APK")
-        pulled = []
-        permissions = "\n".join("android.permission." + p + ": granted=true" for p in
-                                  ("CAMERA", "RECORD_AUDIO", "BLUETOOTH_SCAN", "BLUETOOTH_CONNECT", "BLUETOOTH_ADVERTISE"))
-        def command(argv, **_):
-            phone = argv[argv.index("-s") + 1].removeprefix("serial-")
-            operation = argv[3:]
-            if operation[0] == "pull":
-                destination = Path(operation[2]).resolve()
-                destination.relative_to(output.resolve())
-                destination.write_bytes(b"mismatched copy" if corrupt else apk)
-                pulled.append(destination)
-                return subprocess.CompletedProcess(argv, 0, "1 file pulled", "")
-            values = {("get-state",): "device", ("shell", "settings", "get", "global", "bluetooth_on"): "1",
-                      ("shell", "dumpsys", "window", "policy"): "KeyguardServiceDelegate\n showing=false\n inputRestricted=false",
-                      ("shell", "dumpsys", "power"): "mWakefulness=Awake",
-                      ("shell", "dumpsys", "package", suite.PACKAGE): permissions,
-                      ("shell", "getprop", "ro.build.version.sdk"): "36",
-                      ("shell", "pm", "path", suite.PACKAGE): "package:/data/app/base.apk",
-                      ("shell", "sha256sum", "/data/app/base.apk"): expected + " /data/app/base.apk",
-                      ("shell", "getprop", "ro.build.fingerprint"): "fingerprint-" + phone,
-                      ("shell", "cat", f"/sdcard/Android/data/{suite.PACKAGE}/files/benchmark-capabilities.json"): json.dumps(exports[phone]),
-                      ("shell", "dumpsys", "bluetooth_manager"): {
-                          "a": "  address: AA:AA:AA:AA:AA:01\n  Bonded devices:\n    BB:BB:BB:BB:BB:02 [ DUAL ] b\n",
-                          "b": "  address: BB:BB:BB:BB:BB:02\n  Bonded devices:\n    AA:AA:AA:AA:AA:01 [ DUAL ] a\n",
-                      }[phone]}
-            self.assertIn(tuple(operation), values, "Unexpected mocked preflight command")
-            return subprocess.CompletedProcess(argv, 0, values[tuple(operation)], "")
-        job = {"case": case(), "phones": ["a", "b"], "execution": "concurrent", "owner": "offline-test"}
-        with patch.object(suite.subprocess, "run", side_effect=command):
-            if corrupt:
-                with self.assertRaises(suite.PrerequisiteError):
-                    suite.preflight("unused-adb", registry, job, output, expected)
-            else:
-                suite.preflight("unused-adb", registry, job, output, expected)
+        evidence, error, _, pulled, apk, expected, unrelated = self.run_preflight(corrupt=corrupt)
+        if corrupt:
+            self.assertIsInstance(error, suite.PrerequisiteError)
+        else:
+            self.assertIsNone(error)
         self.assertEqual(b"not the pulled APK", unrelated.read_bytes())
-        evidence = suite.read(output / "preflight.json")
         if corrupt:
             self.assertEqual(1, len(pulled))
             self.assertEqual(b"mismatched copy", pulled[0].read_bytes())
@@ -990,6 +1029,188 @@ class UnifiedSuiteTest(unittest.TestCase):
                 receipt = evidence[phone]["independent_apk_verification"]
                 self.assertEqual(expected, receipt["sha256"])
                 self.assertEqual(len(apk), receipt["bytes"])
+
+    def run_preflight(self, corrupt=False, apk=b"offline test frozen APK bytes", tunables=None, pull_timeouts=0,
+                      thermal=lambda phone, poll: 0, power=lambda phone: "mWakefulness=Awake", case_fields=None):
+        """suite.preflight against a scripted adb. Returns (evidence, error, operations sent, pulled copies, apk,
+        expected hash, an unrelated file that must survive)."""
+        registry = devices("ab")
+        exports = capabilities(registry)
+        expected = hashlib.sha256(apk).hexdigest()
+        sent, polls, timeouts_left = [], {}, [pull_timeouts]
+        output = self.folder / "preflight"
+        output.mkdir()
+        unrelated = output / "retained-other.apk"
+        unrelated.write_bytes(b"not the pulled APK")
+        pulled = []
+        permissions = "\n".join("android.permission." + p + ": granted=true" for p in
+                                  ("CAMERA", "RECORD_AUDIO", "BLUETOOTH_SCAN", "BLUETOOTH_CONNECT", "BLUETOOTH_ADVERTISE"))
+        def command(argv, **_):
+            phone = argv[argv.index("-s") + 1].removeprefix("serial-")
+            operation = argv[3:]
+            sent.append((phone, tuple(operation)))
+            if operation == ["shell", "dumpsys", "thermalservice"]:
+                polls[phone] = polls.get(phone, -1) + 1
+                return subprocess.CompletedProcess(argv, 0, f"Thermal Status: {thermal(phone, polls[phone])}\n", "")
+            if operation[0] == "pull" and timeouts_left[0] > 0:
+                timeouts_left[0] -= 1
+                raise subprocess.TimeoutExpired(argv, 30)
+            if operation[0] == "pull":
+                destination = Path(operation[2]).resolve()
+                destination.relative_to(output.resolve())
+                destination.write_bytes(b"mismatched copy" if corrupt else apk)
+                pulled.append(destination)
+                return subprocess.CompletedProcess(argv, 0, "1 file pulled", "")
+            values = {("get-state",): "device", ("shell", "settings", "get", "global", "bluetooth_on"): "1",
+                      ("shell", "dumpsys", "window", "policy"): "KeyguardServiceDelegate\n showing=false\n inputRestricted=false",
+                      ("shell", "dumpsys", "power"): power(phone),
+                      ("shell", "dumpsys", "package", suite.PACKAGE): permissions,
+                      ("shell", "getprop", "ro.build.version.sdk"): "36",
+                      ("shell", "input", "keyevent", "KEYCODE_WAKEUP"): "",
+                      ("shell", "pm", "path", suite.PACKAGE): "package:/data/app/base.apk",
+                      ("shell", "sha256sum", "/data/app/base.apk"): expected + " /data/app/base.apk",
+                      ("shell", "getprop", "ro.build.fingerprint"): "fingerprint-" + phone,
+                      ("shell", "cat", f"/sdcard/Android/data/{suite.PACKAGE}/files/benchmark-capabilities.json"): json.dumps(exports[phone]),
+                      ("shell", "dumpsys", "bluetooth_manager"): {
+                          "a": "  address: AA:AA:AA:AA:AA:01\n  Bonded devices:\n    BB:BB:BB:BB:BB:02 [ DUAL ] b\n",
+                          "b": "  address: BB:BB:BB:BB:BB:02\n  Bonded devices:\n    AA:AA:AA:AA:AA:01 [ DUAL ] a\n",
+                      }[phone]}
+            self.assertIn(tuple(operation), values, "Unexpected mocked preflight command")
+            return subprocess.CompletedProcess(argv, 0, values[tuple(operation)], "")
+        job = {"case": {**case(), **({"tunables": tunables} if tunables else {}), **(case_fields or {})}, "phones": ["a", "b"],
+               "execution": "concurrent", "owner": "offline-test"}
+        suite.BUILD_TEST_EXTRAS.pop(expected, None)
+        suite.VERIFIED_INSTALLS.clear()
+        error = None
+        with patch.object(suite.subprocess, "run", side_effect=command), patch.object(suite.time, "sleep"):
+            try:
+                suite.preflight("unused-adb", registry, job, output, expected)
+            except suite.PrerequisiteError as caught:
+                error = caught
+        evidence = suite.read(output / "preflight.json") if (output / "preflight.json").exists() else None
+        return evidence, error, sent, pulled, apk, expected, unrelated
+
+    SAVER_ON = "mWakefulness=Awake\nBattery Saver is currently: ON\n"
+    SAVER_OFF = "mWakefulness=Awake\nBattery Saver is currently: OFF\n"
+
+    def test_battery_saver_on_blocks_a_wifi_case_in_the_preflight_and_names_the_phone(self):
+        evidence, error, sent, *_ = self.run_preflight(
+            tunables={"user_launch": True}, case_fields={"user_settings": {"wifi": True}},
+            power=lambda phone: self.SAVER_ON if phone == "b" else self.SAVER_OFF)
+        self.assertIsInstance(error, suite.BatterySaverBlocked)
+        self.assertEqual("battery_saver_on", error.reason_code)
+        self.assertTrue(str(error).startswith("b: battery_saver_on"), str(error))
+        self.assertIs(False, evidence["a"]["battery_saver"])
+        self.assertIs(True, evidence["b"]["battery_saver"])
+        self.assertFalse([operation for who, operation in sent if who == "b" and operation[0] == "pull"])  # it stopped at b
+
+    def test_battery_saver_does_not_block_a_case_that_asks_for_no_wifi(self):
+        evidence, error, *_ = self.run_preflight(power=lambda phone: self.SAVER_ON)
+        self.assertIsNone(error)
+        self.assertTrue(all(evidence[phone]["battery_saver"] is True for phone in "ab"))  # recorded, not a block
+
+    def test_a_wifi_case_with_battery_saver_off_is_not_blocked(self):
+        evidence, error, *_ = self.run_preflight(tunables={"user_launch": True}, case_fields={"user_settings": {"wifi": True}},
+                                                 power=lambda phone: self.SAVER_OFF)
+        self.assertIsNone(error)
+        self.assertIs(False, evidence["a"]["battery_saver"])
+
+    def test_a_wifi_case_whose_power_dump_has_no_battery_saver_line_is_unknown_not_blocked(self):
+        evidence, error, *_ = self.run_preflight(tunables={"user_launch": True}, case_fields={"user_settings": {"wifi": True}})
+        self.assertIsNone(error)
+        self.assertIsNone(evidence["a"]["battery_saver"])
+
+    def test_the_manifest_records_battery_saver_per_device_from_the_preflight_text(self):
+        manifest = self.folder / "manifest.json"
+        suite.write(manifest, {"devices": {"a": {"serial": "x"}, "b": {"serial": "y"}}})
+        suite.record_battery_saver(manifest, {"a": {"battery_saver": False}, "b": {"battery_saver": True}})
+        recorded = suite.read(manifest)["devices"]
+        self.assertEqual((False, True), (recorded["a"]["battery_saver"], recorded["b"]["battery_saver"]))
+        suite.record_battery_saver(self.folder / "missing.json", {})  # no manifest, nothing to record
+
+    def test_a_pull_that_times_out_after_the_phone_woke_from_doze_is_retried_once(self):
+        evidence, error, sent, pulled, *_ = self.run_preflight(pull_timeouts=1)
+        self.assertIsNone(error)
+        for phone in "ab":
+            self.assertEqual({"attempts": 2 if phone == "a" else 1, "woke": True},  # one scripted timeout, on the first pull
+                             {key: evidence[phone]["apk_pull"][key] for key in ("attempts", "woke")})
+            operations = [operation for who, operation in sent if who == phone]
+            first_pull = next(index for index, operation in enumerate(operations) if operation[0] == "pull")
+            self.assertIn(("shell", "input", "keyevent", "KEYCODE_WAKEUP"), operations[:first_pull])  # woke before pulling
+            self.assertEqual(2 if phone == "a" else 1, sum(operation[0] == "pull" for operation in operations))
+        self.assertFalse([operation for _, operation in sent if "KEYCODE_SLEEP" in operation])
+
+    def test_a_pull_that_times_out_twice_blocks_the_case(self):
+        _, error, sent, *_ = self.run_preflight(pull_timeouts=2)
+        self.assertIsInstance(error, suite.PrerequisiteError)
+        self.assertIn("timed out", str(error))
+        self.assertEqual(2, sum(operation[0] == "pull" for who, operation in sent if who == "a"))
+
+    def test_a_pull_that_fails_for_another_reason_is_not_retried(self):
+        _, error, sent, *_ = self.run_preflight(corrupt=True)
+        self.assertEqual(1, sum(operation[0] == "pull" for who, operation in sent if who == "a"))
+
+    @staticmethod
+    def apk_with(*extras):
+        import io
+        import zipfile
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, "w") as archive:
+            archive.writestr("classes.dex", b"dex\n035\x00" + b"".join(b"\x14" + name.encode() + b"\x00" for name in extras))
+            archive.writestr("classes2.dex", b"dex\n035\x00\x0dtest_in_dex_2\x00")
+        return stream.getvalue()
+
+    def test_a_tunable_whose_extra_is_not_in_the_frozen_build_blocks_before_any_launch(self):
+        apk = self.apk_with("test_gatt_gap_fast_fail")
+        evidence, error, *_ = self.run_preflight(apk=apk, tunables={"post_phy_liveness": True, "gatt_gap_fast_fail": False})
+        self.assertIsInstance(error, suite.PrerequisiteError)
+        self.assertIn("tunable not in this build: test_post_phy_liveness", str(error))
+        self.assertEqual("FAIL", evidence["a"]["tunables_in_build"]["status"])
+        self.assertEqual(["test_post_phy_liveness"], evidence["a"]["tunables_in_build"]["missing"])
+
+    def test_tunables_found_in_any_dex_of_the_build_pass_and_are_recorded(self):
+        apk = self.apk_with("test_gatt_gap_fast_fail", "test_post_phy_liveness")
+        evidence, error, *_ = self.run_preflight(apk=apk, tunables={"post_phy_liveness": True, "gatt_gap_fast_fail": False})
+        self.assertIsNone(error)
+        self.assertEqual("PASS", evidence["b"]["tunables_in_build"]["status"])
+
+    def test_a_longer_extra_name_does_not_stand_in_for_a_shorter_one(self):
+        apk = self.apk_with("test_post_phy_liveness_extra")
+        _, error, *_ = self.run_preflight(apk=apk, tunables={"post_phy_liveness": True})
+        self.assertIn("test_post_phy_liveness", str(error))
+
+    def test_an_apk_that_cannot_be_scanned_is_unmeasured_not_a_block(self):
+        evidence, error, *_ = self.run_preflight(tunables={"post_phy_liveness": True})  # bytes, not a zip
+        self.assertIsNone(error)
+        self.assertEqual("UNMEASURED", evidence["a"]["tunables_in_build"]["status"])
+
+    def test_the_thermal_status_at_start_is_recorded_for_every_participant(self):
+        evidence, error, *_ = self.run_preflight()
+        self.assertEqual({"verdict": "COOL", "at_start": {"a": 0, "b": 0}, "waited_s": 0},
+                         {key: evidence["thermal_gate"][key] for key in ("verdict", "at_start", "waited_s")})
+
+    def test_a_participant_at_moderate_makes_the_case_wait_until_all_are_cooler(self):
+        evidence, error, sent, *_ = self.run_preflight(thermal=lambda phone, poll: 3 if phone == "b" and poll < 2 else 1)
+        self.assertIsNone(error)
+        gate = evidence["thermal_gate"]
+        self.assertEqual(({"a": 1, "b": 3}, "WAITED"), (gate["at_start"], gate["verdict"]))
+        self.assertEqual({"a": 1, "b": 1}, gate["at_end"])
+        self.assertEqual(2, len(gate["polls"]))
+
+    def test_a_participant_that_stays_hot_blocks_the_case_with_reason_thermal(self):
+        clock = iter(range(0, 100000, 30))
+        with patch.object(suite.time, "monotonic", side_effect=lambda: next(clock)):
+            evidence, error, *_ = self.run_preflight(thermal=lambda phone, poll: 4 if phone == "a" else 0)
+        self.assertIsInstance(error, suite.ThermalBlocked)
+        self.assertEqual("thermal", error.reason_code)
+        self.assertIn("a status 4", str(error))
+        self.assertEqual("BLOCKED", evidence["thermal_gate"]["verdict"])
+        self.assertGreaterEqual(evidence["thermal_gate"]["waited_s"], suite.THERMAL_WAIT_S - suite.THERMAL_POLL_S)
+
+    def test_a_phone_that_reports_no_thermal_status_is_never_held_back(self):
+        evidence, error, *_ = self.run_preflight(thermal=lambda phone, poll: "")
+        self.assertIsNone(error)
+        self.assertEqual({"a": None, "b": None}, evidence["thermal_gate"]["at_start"])
 
     def test_preflight_retains_independent_hash_receipt_and_removes_only_matched_copy(self):
         self.preflight_copy(corrupt=False)
@@ -1450,6 +1671,11 @@ class ClassicBondPreflightTest(unittest.TestCase):
         self.assertEqual([("a", "caller"), ("b", "middle"), ("c", "callee")], suite.job_roles({"case": relayed}))
         chain = {"receivers": [{"phone": "b", "parent": "a"}, {"phone": "c", "parent": "b"}]}
         self.assertEqual([("a", "b"), ("b", "c")], suite.classic_edges(chain))
+
+    def test_wifi_client_band_is_read_from_cmd_wifi_status(self):
+        self.assertEqual(2437, suite.wifi_client_mhz("Wifi is enabled\nFrequency: 2437MHz, ..."))
+        self.assertIsNone(suite.wifi_client_mhz("Wifi is disconnected"))
+        self.assertIsNone(suite.wifi_client_mhz(""))
 
 if __name__ == "__main__":
     unittest.main()

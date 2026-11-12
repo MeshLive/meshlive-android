@@ -1,17 +1,20 @@
 package com.example.bluetoothtest
 
 /**
- * When a name or subject is sent in a call, and to whom (Design G, G1; PROTOCOL "Naming v2 / Label timing and audience").
+ * When a name is sent in a call, and to whom (Design G, G1; PROTOCOL "Naming v2 / Label timing and audience").
  * No new bytes: `BNL1`, the `LABELS` container, bit 5 and the receiver checks are unchanged. What changes is the moment a
  * sender queues them, so this file is the single decision and the call code only carries it out. Pure Kotlin.
  *
  * - Audience ("Who sees my name"): [NamesAudience.EVERYONE] (default), [NamesAudience.VERIFIED_ONLY], [NamesAudience.NOBODY].
- *   It decides whether the kind 1 name is sent at all; a subject is per call and is not governed by it.
- * - Caller, stranger session (the callee presented a throwaway key): with "Show my name before they answer" the name is
- *   queued before `INVITE`, signed by the attempt pseudonym, so the ring screen shows "~Rahul"; without it (the Design F
- *   arm, kept as the control) it waits for the callee's verified `REVEAL`. The **subject is always held** until the reveal
- *   in both arms: "medical emergency at tent 4" is more sensitive than a name, and an advert can be copied (review F15).
- * - Callee: unchanged for "Everyone I call or answer" (name at Ringing to a verified contact, else with Accept). For
+ *   It decides whether the kind 1 name is sent at all. No call subject (kind 3) is sent: retired 2026-11-05.
+ * - Caller, stranger session (the callee presented a throwaway key): the name waits for the callee's verified `REVEAL`
+ *   and goes only if the revealed person is not blocked ([CallerNameRelease]; design decision 2026-11-06). The
+ *   Experimental arm "Show my name before they answer" (`names_before_answer`, off, DEBUG extra only) queues it before
+ *   `INVITE`, signed by the attempt pseudonym.
+ * - Callee: for "Everyone I call or answer" the name goes at Ringing to a verified contact, else with Accept; with the
+ *   `test_callee_name_after_reveal` (audit CALL-06, on since 2026-11-10) a stranger caller behind a throwaway gets it only
+ *   after its REVEAL verified and the person is not blocked ([CalleeNameRelease]), like the callee's camera and microphone.
+ *   For
  *   "Only people I verified" the callee cannot tell a stranger from a contact whose lease expired before the caller's
  *   reveal, so its name is queued only after that reveal is verified and found to be a verified contact (review F11).
  *   Declining or letting it ring reveals nothing.
@@ -52,13 +55,12 @@ internal enum class LabelSendMoment {
     AT_ACCEPT,
 }
 
-internal data class CallerLabelPlan(val name: LabelSendMoment, val subject: LabelSendMoment)
+internal data class CallerLabelPlan(val name: LabelSendMoment)
 
 internal data class CallerLabelContext(
     /** Both endpoint hellos carry bit 5. */
     val labelsNegotiated: Boolean,
     val hasName: Boolean,
-    val hasSubject: Boolean,
     val audience: NamesAudience,
     /** "Show my name before they answer". */
     val nameBeforeAnswer: Boolean,
@@ -78,17 +80,15 @@ internal data class CalleeLabelContext(
     val ownPseudonymous: Boolean,
     /** The caller's real key is known now and equals a verified contact's (a real-key session). */
     val callerIsVerifiedContact: Boolean,
+    /** The caller presented a throwaway key too, so its REVEAL (and the block check on the person) is still to come. */
+    val callerPseudonymous: Boolean = false,
+    /** `test_callee_name_after_reveal` (audit CALL-06, default on): hold the name for the caller's reveal, as media is held. */
+    val holdUntilReveal: Boolean = false,
 )
 
 internal object CallLabelPolicy {
     fun callerPlan(c: CallerLabelContext): CallerLabelPlan {
-        if (!c.labelsNegotiated) return CallerLabelPlan(LabelSendMoment.NEVER, LabelSendMoment.NEVER)
-        val subject = when {
-            !c.hasSubject -> LabelSendMoment.NEVER
-            c.calleeAwaitsReveal -> LabelSendMoment.AFTER_REVEAL
-            c.relayedAwaitsOpening -> LabelSendMoment.AFTER_OPENING
-            else -> LabelSendMoment.NOW
-        }
+        if (!c.labelsNegotiated) return CallerLabelPlan(LabelSendMoment.NEVER)
         val name = when {
             !c.hasName || c.audience == NamesAudience.NOBODY -> LabelSendMoment.NEVER
             c.audience == NamesAudience.VERIFIED_ONLY -> when {
@@ -101,14 +101,19 @@ internal object CallLabelPolicy {
             c.relayedAwaitsOpening -> LabelSendMoment.AFTER_OPENING
             else -> LabelSendMoment.NOW
         }
-        return CallerLabelPlan(name, subject)
+        return CallerLabelPlan(name)
     }
 
     fun calleeMoment(c: CalleeLabelContext): LabelSendMoment {
         if (!c.labelsNegotiated || !c.hasName) return LabelSendMoment.NEVER
         return when (c.audience) {
             NamesAudience.NOBODY -> LabelSendMoment.NEVER
-            NamesAudience.EVERYONE -> if (c.callerIsVerifiedContact) LabelSendMoment.AT_RINGING else LabelSendMoment.AT_ACCEPT
+            NamesAudience.EVERYONE -> when {
+                c.callerIsVerifiedContact -> LabelSendMoment.AT_RINGING
+                // Both sides behind throwaways: the block check on the caller happens at its REVEAL, after Accept.
+                c.holdUntilReveal && c.ownPseudonymous && c.callerPseudonymous -> LabelSendMoment.AFTER_REVEAL
+                else -> LabelSendMoment.AT_ACCEPT
+            }
             NamesAudience.VERIFIED_ONLY -> when {
                 c.callerIsVerifiedContact -> LabelSendMoment.AT_RINGING
                 c.ownPseudonymous -> LabelSendMoment.AFTER_REVEAL_IF_VERIFIED
@@ -134,7 +139,7 @@ internal object NamingSettings {
     fun audience(benchmarkLaunch: Boolean, extra: (String) -> String?, stored: (String) -> String?): NamesAudience =
         NamesAudience.fromPref(if (benchmarkLaunch) extra(EXTRA_AUDIENCE) else stored(PREF_AUDIENCE))
 
-    /** The spec's one default ([NamingFeatureDefaults.NAMES_BEFORE_ANSWER], design decision G-Q1) by the shared rule. */
+    /** The spec's one default ([NamingFeatureDefaults.NAMES_BEFORE_ANSWER]: Experimental, off since 2026-11-06) by the shared rule. */
     fun nameBeforeAnswer(benchmarkLaunch: Boolean, extra: (String) -> Boolean, stored: (String) -> Boolean?): Boolean =
         FeatureCatalog.resolve(NamingFeatures.NAMES_BEFORE_ANSWER, benchmarkLaunch, extra, stored)
 }

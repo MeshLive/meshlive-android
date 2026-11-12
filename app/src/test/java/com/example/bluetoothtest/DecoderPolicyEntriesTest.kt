@@ -53,7 +53,8 @@ class DecoderPolicyEntriesTest {
         // Vendor extensions reach OMX components from API 26 (ACodec setVendorParameters).
         assertNull(CodecPolicy.vendorLowLatencyKey("OMX.qcom.video.decoder.avc", DeviceTraits("qcom", "msm8996", 25, "x")))
         DebugTunables.devicePolicyOff = setOf(DecoderPolicyEntries.QCOM_DECODER_VENDOR_LOW_LATENCY.id)
-        assertNull(CodecPolicy.vendorLowLatencyKey("OMX.qcom.video.decoder.avc", asus))
+        // test_device_policy_off is DEBUG-only: a release build always keeps every entry.
+        assertEquals(if (BuildConfig.DEBUG) null else qti, CodecPolicy.vendorLowLatencyKey("OMX.qcom.video.decoder.avc", asus))
     }
 
     @Test
@@ -61,6 +62,11 @@ class DecoderPolicyEntriesTest {
         val entry = DecoderPolicyEntries.C2_MTK_RELEASE_INSTEAD_OF_FLUSH
         assertEquals("test_device_policy_off=c2-mtk-release-instead-of-flush", entry.offSwitch)
         DebugTunables.devicePolicyOff = setOf(entry.id)
+        if (!BuildConfig.DEBUG) {
+            // test_device_policy_off is DEBUG-only: a release build always keeps every entry.
+            assertTrue(CodecPolicy.releaseInsteadOfFlush("c2.mtk.vp9.decoder", mtk))
+            return
+        }
         assertFalse(CodecPolicy.releaseInsteadOfFlush("c2.mtk.vp9.decoder"))
         assertFalse(CodecPolicy.releaseInsteadOfFlush("c2.mtk.vp9.decoder", mtk))
         DebugTunables.devicePolicyOff = setOf("all")
@@ -92,6 +98,13 @@ class DecoderPolicyEntriesTest {
         assertTrue(CodecPolicy.stallWatchdogEnabled())
         assertEquals(5_000L, CodecPolicy.boundedReleaseTimeoutMs(exynos))
         assertEquals(5_000L, CodecPolicy.boundedReleaseTimeoutMs())
+        if (!BuildConfig.DEBUG) {
+            // test_device_policy_off is DEBUG-only: a release build always keeps every entry.
+            DebugTunables.devicePolicyOff = setOf("all")
+            assertTrue(CodecPolicy.stallWatchdogEnabled(exynos))
+            assertEquals(5_000L, CodecPolicy.boundedReleaseTimeoutMs(exynos))
+            return
+        }
         DebugTunables.devicePolicyOff = setOf("decoder-no-output-watchdog")
         assertFalse(CodecPolicy.stallWatchdogEnabled(exynos))
         assertEquals(5_000L, CodecPolicy.boundedReleaseTimeoutMs(exynos))

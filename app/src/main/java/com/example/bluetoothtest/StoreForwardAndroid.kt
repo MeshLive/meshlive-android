@@ -77,9 +77,11 @@ internal class AndroidMailboxKeyStore(private val dir: File, private val cipher:
             }
         }
         val pair = generateEcKeyPair()
-        atomicWrite(File(dir, "mailbox.key"), cipher.seal(pair.private.encoded))
-        atomicWrite(File(dir, "mailbox.pub"), pair.public.encoded)
-        atomicWrite(kindFile, MailboxKeyPlanner.KIND_SOFTWARE.toByteArray())
+        WipeGuard.guardedWrite("mailbox key") {
+            atomicWrite(File(dir, "mailbox.key"), cipher.seal(pair.private.encoded))
+            atomicWrite(File(dir, "mailbox.pub"), pair.public.encoded)
+            atomicWrite(kindFile, MailboxKeyPlanner.KIND_SOFTWARE.toByteArray())
+        }
         return SoftwareMailboxKey(pair)
     }
 

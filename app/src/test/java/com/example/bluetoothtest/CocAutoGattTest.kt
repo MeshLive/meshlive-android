@@ -197,14 +197,10 @@ class CocAutoGattTest {
             CocAutoGattSettings(true, 8),
             CocAutoGattSettings.resolve(true, true, 8, false, leakyStack = false),
         )
-        // Normal launch: the user's explicit choice, no Manual-settings toggle involved.
+        // Normal launch: the shipped default; a choice stored before 2026-11-04 (no Settings switch since) is ignored.
         assertEquals(
-            CocAutoGattSettings(true, CocAutoGattSettings.DEFAULT_THRESHOLD, thresholdActive = true),
-            CocAutoGattSettings.resolve(false, false, 5, true, leakyStack = true),
-        )
-        assertEquals(
-            CocAutoGattSettings(false, CocAutoGattSettings.DEFAULT_THRESHOLD, thresholdActive = true),
-            CocAutoGattSettings.resolve(false, true, 5, false, leakyStack = true),
+            CocAutoGattSettings(ConnectivityFeatureDefaults.COC_AUTO_GATT, CocAutoGattSettings.DEFAULT_THRESHOLD, thresholdActive = true),
+            CocAutoGattSettings.resolve(false, false, 5, !ConnectivityFeatureDefaults.COC_AUTO_GATT, leakyStack = true),
         )
         // Never decided: the shipped default (off until phone test T6), whatever the launch extras say.
         assertEquals(
@@ -215,10 +211,11 @@ class CocAutoGattTest {
     }
 
     @Test
-    fun anUntouchedSwitchFollowsTheDefaultConstantButAnExplicitChoiceSticks() {
+    fun theDefaultConstantDecidesAndAnOldStoredChoiceIsIgnored() {
+        // No Settings switch since 2026-11-04.
         val spec = ConnectivityFeatures.cocAutoGatt.copy(defaultEnabled = true)
         assertTrue(FeatureCatalog.resolve(spec, false, { false }, { null }))
-        assertFalse(FeatureCatalog.resolve(spec, false, { true }, { false }))
+        assertTrue(FeatureCatalog.resolve(spec, false, { true }, { false }))
         // A benchmark launch ignores both the default and the stored choice.
         assertFalse(FeatureCatalog.resolve(spec, true, { false }, { true }))
     }

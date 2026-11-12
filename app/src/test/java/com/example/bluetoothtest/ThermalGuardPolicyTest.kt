@@ -69,4 +69,30 @@ class ThermalGuardPolicyTest {
             ThermalGuardPolicy.maximumBitrate(600_000, PowerManager.THERMAL_STATUS_SEVERE, false),
         )
     }
+
+    @Test
+    fun atCriticalHeatAVideoCallGoesOnAsVoiceAndAVoiceCallIsUnchanged() {
+        for (status in listOf(
+            PowerManager.THERMAL_STATUS_CRITICAL,
+            PowerManager.THERMAL_STATUS_EMERGENCY,
+            PowerManager.THERMAL_STATUS_SHUTDOWN,
+        )) {
+            assertFalse(ThermalGuardPolicy.callVideoAllowed(status))
+            assertEquals(CallType.VOICE, ThermalGuardPolicy.callTypeAtHeat(CallType.VIDEO, status))
+            assertEquals(CallType.VOICE, ThermalGuardPolicy.callTypeAtHeat(CallType.VOICE, status))
+        }
+    }
+
+    @Test
+    fun belowCriticalHeatEveryCallKeepsTheTypeTheUserChose() {
+        for (status in listOf(
+            PowerManager.THERMAL_STATUS_NONE,
+            PowerManager.THERMAL_STATUS_MODERATE,
+            PowerManager.THERMAL_STATUS_SEVERE,
+        )) {
+            assertTrue(ThermalGuardPolicy.callVideoAllowed(status))
+            assertEquals(CallType.VIDEO, ThermalGuardPolicy.callTypeAtHeat(CallType.VIDEO, status))
+            assertEquals(CallType.VOICE, ThermalGuardPolicy.callTypeAtHeat(CallType.VOICE, status))
+        }
+    }
 }

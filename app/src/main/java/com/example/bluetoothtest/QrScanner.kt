@@ -52,6 +52,13 @@ internal object ScannerInsets {
 
 /** The zxing scanner with its prompt kept clear of the system bars ([ScannerInsets]). */
 class ScannerCaptureActivity : CaptureActivity() {
+    override fun onStop() {
+        // Design QL: going Home (or anywhere but back) from the camera leaves the Add contact screen as well; a scan that
+        // finishes, or a configuration change, does not. The screen begins a new visit when it is shown again.
+        if (!isFinishing && !isChangingConfigurations) QrMeet.visit.end()
+        super.onStop()
+    }
+
     override fun initializeContent(): DecoratedBarcodeView {
         val scanner = super.initializeContent()
         val status = scanner.statusView ?: return scanner

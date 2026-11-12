@@ -12,7 +12,7 @@ import android.content.Intent
  * `test_link_budget_admission`, `test_gatt_server_hold`, `test_gatt_settle_ms=<ms>`, `test_connect_gatt_main`,
  * `test_gatt_payload=244|495|default`, `test_bt_audio_load_cut`, `test_bt_audio_capacity_key`,
  * `test_gatt_refresh`, `test_gatt_acl_wait`, `test_gatt_remote_full_failfast`, `test_gatt_byte_window=<bytes>`,
- * `test_gatt_window_kbps=<kbps>`.
+ * `test_gatt_window_kbps=<kbps>`, `test_gatt_native_wedge_guard=true|false`, `test_relay_gatt_acknowledged_writes=true|false`.
  */
 internal object GattSwitches {
     /** `test_gatt_payload`: ATT value size per GATT write or notification (G-09, Experimental). */
@@ -121,6 +121,30 @@ internal object GattSwitches {
             field = if (BuildConfig.DEBUG) value.coerceIn(0, MAX_WINDOW_KBPS) else 0
         }
 
+    /**
+     * `test_gatt_native_wedge_guard` (default true since 2026-11-10, owner answer BT-07 Q4; false is the control arm, DEBUG
+     * only): on a phone matched by the DeviceFamilyPolicy entry `mediatek-coloros-native-gatt-client-wedge` (MediaTek with
+     * ColorOS or Realme UI, Android 16+), two immediate status-128 central connect failures with no GATT client held raise
+     * the Bluetooth off/on guidance card at once ([GattNativeClientWedge]). It only shows a card and toggles nothing; every
+     * other phone is untouched because the entry does not match. A release build always has it on.
+     */
+    @Volatile var nativeClientWedgeGuard: Boolean = true
+        set(value) {
+            field = value || !BuildConfig.DEBUG
+        }
+
+    /**
+     * `test_relay_gatt_acknowledged_writes` (Experimental, default off): a legacy-Qualcomm call relay opens its next GATT
+     * hop with acknowledged writes paced at 24 KB/s (DeviceFamilyPolicy `qcom-legacy-call-relay-gatt-acknowledged-writes`).
+     * The shipped relay writes without response, as every other relay does: with the rule on, 0 of 3 relayed calls S22 ->
+     * ASUS -> A15s held 60 s (the A15s dropped write responses, the GATT write timed out), and with it off 2 of 3 did
+     * (run l2q27ab-20261110g). DEBUG builds only; release always writes without response.
+     */
+    @Volatile var relayAcknowledgedWrites: Boolean = false
+        set(value) {
+            field = value && BuildConfig.DEBUG
+        }
+
     fun applyLaunchExtras(intent: Intent?) {
         if (intent == null) return
         applyExtras(
@@ -151,6 +175,8 @@ internal object GattSwitches {
         remoteFullFailFast = boolExtra("test_gatt_remote_full_failfast", false)
         byteWindowBytes = intExtra("test_gatt_byte_window", 0)
         windowDrainKbps = intExtra("test_gatt_window_kbps", 0)
+        nativeClientWedgeGuard = boolExtra("test_gatt_native_wedge_guard", true)
+        relayAcknowledgedWrites = boolExtra("test_relay_gatt_acknowledged_writes", false)
     }
 
     /** Every non-default arm, for the launch record (empty when the shipped defaults are in force). */
@@ -169,6 +195,8 @@ internal object GattSwitches {
         "acl_wait".takeIf { aclWaitOnRedial },
         "remote_full_failfast".takeIf { remoteFullFailFast },
         "byte_window=$byteWindowBytes@${windowDrainKbps}kbps".takeIf { byteWindowBytes > 0 },
+        "native_wedge_guard=off".takeIf { !nativeClientWedgeGuard },
+        "relay_acknowledged_writes".takeIf { relayAcknowledgedWrites },
     ).joinToString(",").ifEmpty { "none" }
 
     /** Back to the shipped defaults (unit tests). */

@@ -168,6 +168,7 @@ internal object GattPoolBackoff {
 
     fun recordSuccess(source: PoolSource) {
         if (source == PoolSource.SCANNER) scannerFailing = false
+        if (source == PoolSource.CLIENT) GattNativeClientWedge.onCentralConnectSuccess()
         val ended = shared.onSuccess(source)
         policy.onRegistrationSuccess(source)
         if (ended > 0) {

@@ -68,7 +68,11 @@ def validate_intercom_case(case, participants):
         per_phone = case["phone_tunables"]
         if not isinstance(per_phone, dict) or not all(isinstance(value, dict) for value in per_phone.values()):
             raise ValueError("Per-phone call tunables must map an endpoint to an object")
-        if not set(per_phone) <= set(participants):
+        # An on-demand helper launches as an ordinary endpoint and takes its own tunables (for example one helper's
+        # device-policy off-switch); the DEBUG static relay launch carries none, so naming it there would test nothing.
+        helpers = case.get("relays", case.get("relay")) if case.get("relay_shape") == "on_demand" else None
+        helpers = [helpers] if isinstance(helpers, str) else list(helpers or [])
+        if not set(per_phone) <= set(participants) | set(helpers):
             raise ValueError("Per-phone call tunables must name call endpoints")
         for value in per_phone.values():
             tunable_extras(value)
@@ -327,7 +331,10 @@ def discovery_gate(case, manifest, phone, rows, peer_rows, node_prefix, limit, c
     availabilities is also reported (diagnostic, with the bracket uncertainty).
     """
     available = first_row(rows, "BENCHMARK call available:")
-    offer = first_row(rows, f"BENCHMARK call discovered: node={node_prefix}")
+    # `node_prefix` is the peer's registry prefix, or that prefix plus every rotating ID the peer's own log announced
+    # (a rotating peer is scanned under its discovery ID, never its fixed prefix).
+    names = [node_prefix] if isinstance(node_prefix, str) else [item for item in (node_prefix or ()) if item]
+    offer = next((row for row in rows if any(f"BENCHMARK call discovered: node={name}" in row["message"] for name in names)), None)
     value = (offer["at"] - available["at"]) * 1000 if available and offer else None
     if phone == launch_order(case, manifest)[1]:
         result = gate(value, limit)

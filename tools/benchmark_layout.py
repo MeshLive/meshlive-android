@@ -109,6 +109,9 @@ def output_path(path, group, root=ROOT):
         raise ValueError("Unknown benchmark output group")
     root, path = Path(root).resolve(), Path(path)
     candidate = Path(os.path.abspath(path if path.is_absolute() else root / path))
+    group_dir = root / "benchmarks" / group
+    if candidate.is_relative_to(group_dir) and os.path.isjunction(group_dir) and not os.path.exists(group_dir):
+        raise ValueError(f"benchmarks/{group} lives on the external evidence SSD ({os.readlink(group_dir)}); plug it in")
     DebugImages._guard(candidate)
     if any(":" in part for part in candidate.parts[1:]):
         raise ValueError("Benchmark output cannot use an alternate data stream")

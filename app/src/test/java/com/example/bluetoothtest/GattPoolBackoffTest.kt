@@ -146,6 +146,11 @@ class GattPoolBackoffTest {
     @Test
     fun theControlArmNeverHolds() {
         GattSwitches.applyExtras({ key, d -> if (key == "test_gatt_pool_backoff") false else d }, { _, d -> d }, { null })
+        if (!BuildConfig.DEBUG) {
+            // =false is a DEBUG control arm: a release build keeps the back-off on.
+            assertTrue(GattSwitches.poolBackoff)
+            return
+        }
         assertFalse(GattSwitches.poolBackoff)
         assertTrue(GattSwitches.describeNonDefaults().contains("pool_backoff=off"))
         GattPoolBackoff.noteConnectFailure("GATT video connection failed (status 257)", "gatt-video-client")

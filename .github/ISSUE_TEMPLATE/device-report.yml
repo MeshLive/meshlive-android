@@ -44,7 +44,7 @@ body:
     attributes:
       label: App version and signing fingerprint
       description: From the app's About screen. If the fingerprint does not match the release notes, say so.
-      placeholder: "0.1.0-beta (1), 2E:EF:C0:5A:..."
+      placeholder: "0.2.0-beta (2), 2E:EF:C0:5A:..."
     validations:
       required: true
   - type: input

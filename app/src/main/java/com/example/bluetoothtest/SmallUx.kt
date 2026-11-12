@@ -85,6 +85,19 @@ internal object CallsQuiet {
 
     fun emptyHintVisible(searchingForMs: Long): Boolean = searchingForMs >= EMPTY_HINT_AFTER_MS
 
+    /**
+     * `test_calls_indicator_settles` (promoted on mechanism 2026-11-12, default on; `false` is the DEBUG control arm): the
+     * searching indicator spins only for the first [INDICATOR_FOR_MS] of a search, the way Android's Bluetooth settings stops
+     * its indicator when a discovery round ends; discovery keeps running and the list keeps updating. An indeterminate
+     * indicator redraws the window every frame: a phone left on Calls > Nearby drew 60 frames a second for as long as it
+     * waited (B18, 10 s windows after 12 s on Nearby: M31 608 -> 2 frames, A15s 607 -> 2).
+     */
+    const val INDICATOR_FOR_MS = 12_000L
+
+    /** Whether the searching indicator shows: on Nearby while discovery runs, and with [settles] only early in the search. */
+    fun indicatorVisible(nearby: Boolean, discovering: Boolean, searchingForMs: Long, settles: Boolean): Boolean =
+        nearby && discovering && (!settles || searchingForMs < INDICATOR_FOR_MS)
+
     /** The status line: an actionable state or nothing. */
     fun line(actionableNotice: String?): String = actionableNotice?.takeIf { it.isNotBlank() }.orEmpty()
 }
@@ -93,7 +106,14 @@ internal object CallsQuiet {
  * "Missed call from <name>" with a Call back action (UX fix 2026-10-21) for an incoming call that was never answered: the
  * caller cancelled or the ring timed out. The lock screen shows only "Missed call" unless names are allowed there
  * ([NotificationPrivacy]); nothing is posted without POST_NOTIFICATIONS. The Call back action carries a one-time token kept
- * in app-private preferences, so no other app can make this one dial.
+ * in app-private storage, so no other app can make this one dial.
+ *
+ * Audit 2026-11-10 (beside SEC-05): the token and the missed-call count are kept per caller under the caller's node prefix,
+ * which earlier builds wrote into the plain `missed_call` preferences and never removed when a notification was dismissed.
+ * They are sealed now ([SealedRecords]): only the callers whose notification is still showing are kept (checked when the
+ * app starts, at each new missed call and at a Call back), nothing older than [MAX_AGE_MS] (deleted from the file, not
+ * only ignored), at most [MAX_RECORDS]. The plain file is moved once (only callers whose notification still shows, with
+ * that notification's time) and deleted.
  */
 internal object MissedCallNotification {
     const val CHANNEL_ID = "missed_calls"
@@ -103,9 +123,61 @@ internal object MissedCallNotification {
     const val EXTRA_NAME = "missed_call_back_name"
     const val EXTRA_TOKEN = "missed_call_back_token"
     const val EXTRA_VIDEO = "missed_call_back_video"
+    /** The plain preferences of earlier builds (`token:<tag>`, `count:<tag>`): moved once into [FILE] and deleted. */
     private const val PREFS = "missed_call"
     private const val KEY_TOKEN = "token"
     private const val KEY_COUNT = "count"
+    internal const val FILE = "missed-calls.bin"
+    /** A Call back on a notification older than this does nothing (its token is gone). */
+    internal const val MAX_AGE_MS = 7L * 24 * 60 * 60 * 1000
+    internal const val MAX_RECORDS = 64
+
+    /** `tag -> "token,count"` (an empty token when the caller is unknown and the notification has no Call back). */
+    private val records = SealedRecordsSlot(FILE, MAX_RECORDS, MAX_AGE_MS) { app -> plainTokens(app) }
+
+    /** Opens the memory at process start and drops callers whose notification is gone (dismissed, or a reboot). */
+    fun open(context: Context) {
+        val app = context.applicationContext
+        val sealed = records.get(app)
+        SealedRecordsWorker.execute {
+            shownTags(app)?.let { shown -> sealed.retain { it in shown.keys } }
+        }
+    }
+
+    /** The missed-call notifications showing now, tag -> posted time; null when the system cannot say. */
+    private fun shownTags(app: Context): Map<String, Long>? = runCatching {
+        app.getSystemService(NotificationManager::class.java)?.activeNotifications
+            ?.filter { it.id == NOTIFICATION_ID && it.tag != null }
+            ?.associate { it.tag to it.postTime }
+    }.getOrNull()
+
+    /** An earlier build's tokens: those whose notification still shows, sealed; the plain file is deleted in any case. */
+    private fun plainTokens(app: Context) = object : LegacyPlain {
+        override fun read(): Map<String, SealedRecords.Record> {
+            val all = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE).all
+            if (all.isEmpty()) return emptyMap()
+            return plainRecords(all, shownTags(app).orEmpty())
+        }
+
+        override fun clean() = PlainPreferences.deleteFile(app, PREFS)
+
+        override val cache = true
+    }
+
+    /**
+     * An earlier build's `token:<tag>` and `count:<tag>` preferences as records, only for callers whose notification is in
+     * [shown] (tag -> posted time), dated by that notification.
+     */
+    internal fun plainRecords(all: Map<String, *>, shown: Map<String, Long>): Map<String, SealedRecords.Record> {
+        val tags = all.keys.mapNotNull { key ->
+            key.removePrefix("$KEY_TOKEN:").takeIf { it != key } ?: key.removePrefix("$KEY_COUNT:").takeIf { it != key }
+        }.toSet()
+        return tags.filter { it in shown && it.isNotEmpty() && '\t' !in it && '\n' !in it }.associateWith { tag ->
+            val token = all["$KEY_TOKEN:$tag"] as? String ?: ""
+            val count = all["$KEY_COUNT:$tag"] as? Int ?: 1
+            SealedRecords.Record("$token,$count", shown.getValue(tag))
+        }
+    }
 
     fun isMissed(message: String): Boolean =
         message == CallRingTimeout.MISSED_MESSAGE || message == CallRingTimeout.CALLER_CANCELLED_MESSAGE
@@ -149,10 +221,14 @@ internal object MissedCallNotification {
             NotificationChannel(CHANNEL_ID, app.getString(R.string.missed_call_channel), NotificationManager.IMPORTANCE_DEFAULT),
         )
         val tag = tag(prefix)
-        val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val showing = runCatching { manager.activeNotifications.any { it.tag == tag && it.id == NOTIFICATION_ID } }.getOrDefault(false)
-        val count = nextCount(showing, prefs.getInt("$KEY_COUNT:$tag", 0))
-        prefs.edit().putInt("$KEY_COUNT:$tag", count).apply()
+        val sealed = records.get(app)
+        val shown = shownTags(app)?.keys
+        // Only a caller whose notification still shows needs its token and count.
+        if (shown != null) sealed.retain { it == tag || it in shown }
+        val showing = shown?.contains(tag) == true
+        val count = nextCount(showing, sealed.get(tag)?.value?.substringAfter(',')?.toIntOrNull() ?: 0)
+        val token = if (prefix != null) UUID.randomUUID().toString() else ""
+        sealed.put(tag, "$token,$count")
         val requestBase = REQUEST_CODE + 2 * ((tag.hashCode() and 0x7fffffff) % 10_000)
         val open = PendingIntent.getActivity(
             app, requestBase,
@@ -168,8 +244,6 @@ internal object MissedCallNotification {
             .setAutoCancel(true)
             .setContentIntent(open)
         if (prefix != null) {
-            val token = UUID.randomUUID().toString()
-            prefs.edit().putString("$KEY_TOKEN:$tag", token).apply()
             val callBack = Intent(app, MainActivity::class.java)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
                 .putExtra(EXTRA_PREFIX, prefix)
@@ -194,14 +268,25 @@ internal object MissedCallNotification {
             .onFailure { Log.w("BluetoothVideo", "Missed call notification could not be posted", it) }
     }
 
+    /** True when [intent] is a Call back action (whether or not its token is still valid). */
+    fun isCallBack(intent: Intent): Boolean = intent.hasExtra(EXTRA_PREFIX) && intent.hasExtra(EXTRA_TOKEN)
+
+    /** False until the sealed tokens are read: a Call back then waits ([whenLoaded], re-review S3). */
+    fun isLoaded(context: Context): Boolean = records.get(context).isLoaded()
+
+    /** Runs [action] once the tokens are read (at once if they are; else on the sealed-memory worker). */
+    fun whenLoaded(context: Context, action: () -> Unit) = records.get(context).whenLoaded(action)
+
     /** The Call back action's target, once: null when the intent has none or its token is not the one this app posted. */
     fun takeCallBack(context: Context, intent: Intent): CallBack? {
         val prefix = intent.getStringExtra(EXTRA_PREFIX) ?: return null
         val token = intent.getStringExtra(EXTRA_TOKEN) ?: return null
         val tag = tag(prefix)
-        val prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        if (!tokenMatches(prefs.getString("$KEY_TOKEN:$tag", null), token)) return null
-        prefs.edit().remove("$KEY_TOKEN:$tag").remove("$KEY_COUNT:$tag").apply()
+        val sealed = records.get(context)
+        val stored = sealed.get(tag)?.value?.substringBefore(',')?.takeIf { it.isNotEmpty() }
+        if (!tokenMatches(stored, token)) return null
+        sealed.remove(listOf(tag))
+        shownTags(context.applicationContext)?.let { shown -> sealed.retain { it in shown.keys && it != tag } }
         context.applicationContext.getSystemService(NotificationManager::class.java)?.cancel(tag, NOTIFICATION_ID)
         return CallBack(prefix, intent.getStringExtra(EXTRA_NAME) ?: "", intent.getBooleanExtra(EXTRA_VIDEO, true))
     }

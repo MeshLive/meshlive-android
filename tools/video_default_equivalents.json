@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "purpose": "Per phone, the size its stored Settings hold after the app's own mode picker mapped the shipped default size to the camera's nearest mode. tools/user_launch.py video_state treats a stored size equal to the shipped default (426x240) or to this equivalent (the pair, both dimensions) as the default; any other size still blocks an app_default case (video_setting_not_default). A phone without an entry keeps the strict check.",
+  "shipped_default": {"video_width": 426, "video_height": 240},
+  "mechanism": "MainActivity mode pickers replace the stored size with the camera's nearest mode and log 'BENCHMARK mode_mapping: requested=426x240 effective=WxH | reason=nearest_camera_mode'; the next persistVideoSettings (for example the bitrate clamp in a person's launch) stores the mapped size (app integration commit 0983c1f2, MainActivity.kt about lines 7252 and 7590-7610).",
+  "phones": {
+    "s24": {
+      "video_width": 352,
+      "video_height": 288,
+      "source": {
+        "line": "BENCHMARK mode_mapping: requested=426x240 effective=352x288 | reason=nearest_camera_mode | encoder=c2.exynos.vp9.encoder",
+        "run": "u7ad-20261110u-st-gatt-realme-calls-s24-r1",
+        "log": "benchmarks/runs/u7ad-20261110u-st-gatt-realme-calls-s24-r1/0001-b4d76cbd5939/physical/s24-21589.log"
+      }
+    },
+    "realme": {
+      "video_width": 352,
+      "video_height": 288,
+      "source": {
+        "line": "BENCHMARK mode_mapping: requested=426x240 effective=352x288 | reason=nearest_camera_mode | encoder=c2.mtk.hevc.encoder",
+        "run": "u7ad-20261110u-st-gatt-realme-calls-s24-r1",
+        "log": "benchmarks/runs/u7ad-20261110u-st-gatt-realme-calls-s24-r1/0001-b4d76cbd5939/physical/realme-18370.log"
+      }
+    },
+    "asus": {
+      "video_width": 352,
+      "video_height": 288,
+      "source": {
+        "line": "BENCHMARK mode_mapping: requested=426x240 effective=352x288 | reason=nearest_camera_mode | encoder=OMX.qcom.video.encoder.hevc",
+        "run": "u7bd-20261110u2",
+        "log": "benchmarks/runs/u7bd-20261110u2/0001-a25e6e1b17a3/physical/asus-25979.log"
+      }
+    },
+    "a15s": {
+      "video_width": 352,
+      "video_height": 288,
+      "source": {
+        "line": "BENCHMARK mode_mapping: requested=426x240 effective=352x288 | reason=nearest_camera_mode | encoder=libvpx-vp9",
+        "run": "u7bd-20261110u2",
+        "log": "benchmarks/runs/u7bd-20261110u2/0001-a25e6e1b17a3/physical/a15s-27017.log"
+      }
+    }
+  },
+  "unset": {
+    "s22": "no mode_mapping line for requested=426x240 found in saved runs (see the report); strict check kept",
+    "m31": "no mode_mapping line for requested=426x240 found in saved runs (see the report); strict check kept"
+  }
+}

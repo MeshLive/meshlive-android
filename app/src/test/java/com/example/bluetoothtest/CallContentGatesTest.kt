@@ -7,6 +7,7 @@ import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -161,5 +162,75 @@ class CallContentGatesTest {
         assertFalse(held.onAccepted())
         assertTrue(held.held)
         assertTrue(held.onRevealAdmitted())
+    }
+
+    /**
+     * AB3/AP3 step 2b: a blocked call must not carry into the next call on the same endpoint object. The call resets its
+     * per-call latch at every new connection (`establish`); with the latch clear, the next call's name plan, media gate
+     * and presence eligibility are those of an unblocked peer.
+     */
+    @Test
+    fun aBlockedCallCannotCarryIntoTheNextCall() {
+        val latch = BlockedCallLatch()
+        latch.block()
+        assertTrue("the first call is blocked", latch.active)
+        latch.reset() // what establish does when a new connection starts
+        assertFalse("the next call starts clear", latch.active)
+        val plan = CallLabelPolicy.callerPlan(
+            CallerLabelContext(
+                labelsNegotiated = true,
+                hasName = true,
+                audience = NamesAudience.EVERYONE,
+                nameBeforeAnswer = false,
+                calleeAwaitsReveal = true,
+                relayedAwaitsOpening = false,
+                calleeIsVerifiedContact = false,
+            ),
+        )
+        assertEquals(LabelSendMoment.AFTER_REVEAL, plan.name)
+        assertEquals(CallMediaGate.Decision.ALLOW, CallMediaGate.decide(PrivateCallPhase.ACTIVE, peerRevealPending = false))
+        assertNull(PresenceEligibility.reason(
+            vaultPresent = true,
+            persistent = true,
+            peerState = VerificationState.VERIFIED,
+            visibleToThem = true,
+            blocked = latch.active,
+        ))
+    }
+
+    /**
+     * JT2 (`test_call_camera_first`): the camera-first order changes only what runs after the gate. The media start is entered
+     * through [CalleeMediaStart] exactly as before, so with the switch on nothing (no camera, route or microphone step) runs
+     * before Accept and, when the caller's reveal is required, before it is admitted, and a blocked caller opens no camera.
+     */
+    @Test
+    fun cameraFirstStartsNothingBeforeAcceptAndAnAdmittedRevealAndNeverOpensACameraForABlockedCaller() {
+        fun enter(decided: Boolean, ran: MutableList<CallMediaStartOrder.Step>) {
+            if (decided) CallMediaStartOrder.run(cameraFirst = true, video = true) { ran += it; true }
+        }
+
+        val ran = mutableListOf<CallMediaStartOrder.Step>()
+        val gate = CalleeMediaStart(revealRequired = true)
+        assertTrue("ringing: nothing has started", ran.isEmpty())
+        enter(gate.onAccepted(), ran)
+        assertTrue("accepted, the caller's reveal still pending: nothing has started", ran.isEmpty())
+        enter(gate.onRevealAdmitted(), ran)
+        assertEquals(CallMediaStartOrder.plan(cameraFirst = true, video = true), ran)
+        enter(gate.onRevealAdmitted(), ran) // a repeated signal does not start the media again
+        assertEquals(CallMediaStartOrder.plan(cameraFirst = true, video = true).size, ran.size)
+
+        val blockedRan = mutableListOf<CallMediaStartOrder.Step>()
+        val blocked = CalleeMediaStart(revealRequired = true)
+        blocked.onBlocked()
+        enter(blocked.onAccepted(), blockedRan)
+        enter(blocked.onRevealAdmitted(), blockedRan)
+        assertFalse(CallMediaStartOrder.Step.CAMERA_START in blockedRan)
+        assertTrue("a blocked caller gets no camera, route or microphone", blockedRan.isEmpty())
+
+        val answeredFirst = CalleeMediaStart(revealRequired = false)
+        val plainRan = mutableListOf<CallMediaStartOrder.Step>()
+        enter(answeredFirst.onAccepted(), plainRan)
+        assertTrue("no reveal required: Accept alone starts it", CallMediaStartOrder.Step.CAMERA_START in plainRan)
+        assertTrue(plainRan.indexOf(CallMediaStartOrder.Step.CAMERA_START) < plainRan.indexOf(CallMediaStartOrder.Step.AUDIO_SESSION))
     }
 }

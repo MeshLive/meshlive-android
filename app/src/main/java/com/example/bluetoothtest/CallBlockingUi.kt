@@ -34,15 +34,76 @@ internal object CallBlockingUi {
         activity.findViewById<View>(R.id.blockedPeopleButton).setOnClickListener {
             activity.startActivity(Intent(activity, BlockedPeopleActivity::class.java))
         }
+        activity.findViewById<View>(R.id.blockedPeopleResetButton).setOnClickListener {
+            confirmResetBlockList(activity) { refreshBlockListNote(activity) }
+        }
+        refreshBlockListNote(activity)
     }
 
-    fun report(activity: Activity, fingerprint: IdentityFingerprint?, streamToken: Int? = null, onDone: () -> Unit = {}) {
+    /**
+     * Design decision 2026-11-06: an unreadable block list stays fail-open (calls ring) but is never silent. Settings shows
+     * "Block list can't be read" with Reset under "Blocked people". Checked off the main thread here and on every resume.
+     */
+    fun refreshBlockListNote(activity: Activity) {
+        val context = activity.applicationContext
+        Thread {
+            val unreadable = runCatching { BlockedPeople.isUnreadable(context) }.getOrDefault(true)
+            activity.runOnUiThread {
+                if (activity.isDestroyed) return@runOnUiThread
+                val row = activity.findViewById<View>(R.id.blockedPeopleProblemRow) ?: return@runOnUiThread
+                row.visibility = if (BlockListView.of(emptyList(), unreadable).showUnreadableNote) View.VISIBLE else View.GONE
+            }
+        }.start()
+    }
+
+    /** "Reset the block list?": everyone is unblocked (the only recovery for an unreadable list). Settings and Blocked people. */
+    fun confirmResetBlockList(activity: Activity, onDone: () -> Unit = {}) {
+        if (activity.isFinishing || activity.isDestroyed) return
+        MaterialAlertDialogBuilder(activity)
+            .setIcon(R.drawable.ic_warning)
+            .setTitle(R.string.blocked_people_reset_title)
+            .setMessage(R.string.blocked_people_reset_message)
+            .setPositiveButton(R.string.blocked_people_reset_action) { _, _ -> resetBlockList(activity, onDone) }
+            .setNegativeButton(R.string.action_cancel, null)
+            .show()
+    }
+
+    /** A Block could not be saved because the list cannot be read: say so and offer Reset (this dialog is the confirmation). */
+    fun showBlockListUnreadable(activity: Activity, onDone: () -> Unit = {}) {
+        if (activity.isFinishing || activity.isDestroyed) return
+        MaterialAlertDialogBuilder(activity)
+            .setIcon(R.drawable.ic_warning)
+            .setTitle(R.string.block_list_unreadable_title)
+            .setMessage(R.string.block_failed_unreadable)
+            .setPositiveButton(R.string.blocked_people_reset_action) { _, _ -> resetBlockList(activity, onDone) }
+            .setNegativeButton(R.string.action_cancel, null)
+            .show()
+    }
+
+    private fun resetBlockList(activity: Activity, onDone: () -> Unit) {
+        val context = activity.applicationContext
+        Thread {
+            val reset = BlockedPeople.reset(context)
+            activity.runOnUiThread {
+                if (activity.isDestroyed) return@runOnUiThread
+                Toast.makeText(
+                    activity,
+                    if (reset) R.string.block_list_reset_done else R.string.block_list_reset_failed,
+                    Toast.LENGTH_LONG,
+                ).show()
+                onDone()
+            }
+        }.start()
+    }
+
+    /** AB3: a report keeps hiding the person, never the stream that was playing (its token is chosen by its sender). */
+    fun report(activity: Activity, fingerprint: IdentityFingerprint?, onDone: () -> Unit = {}) {
         if (fingerprint == null) {
             afterDeclineAndBlock(activity, null)
             return
         }
         Thread {
-            val success = runCatching { LocalReporting.report(activity, fingerprint, streamToken) }.getOrDefault(false)
+            val success = runCatching { LocalReporting.report(activity, fingerprint) }.getOrDefault(false)
             if (success) ConversationNotifier.opened(activity.applicationContext, fingerprint.nodeId.toString())
             activity.runOnUiThread {
                 if (activity.isDestroyed) return@runOnUiThread
@@ -82,6 +143,11 @@ internal object CallBlockingUi {
             val result = BlockedPeople.block(context, fingerprint)
             activity.runOnUiThread {
                 if (activity.isDestroyed) return@runOnUiThread
+                if (BlockOutcome.of(result) == BlockOutcome.LIST_UNREADABLE) {
+                    showBlockListUnreadable(activity)
+                    onDone()
+                    return@runOnUiThread
+                }
                 val message = when (result) {
                     BlockResult.BLOCKED -> activity.getString(R.string.block_done, name)
                     BlockResult.ALREADY_BLOCKED -> activity.getString(R.string.block_already, name)
@@ -159,6 +225,10 @@ internal object CallBlockingUi {
             val result = BlockedPeople.block(context, fingerprint)
             activity.runOnUiThread {
                 if (activity.isDestroyed) return@runOnUiThread
+                if (BlockOutcome.of(result) == BlockOutcome.LIST_UNREADABLE) {
+                    showBlockListUnreadable(activity)
+                    return@runOnUiThread
+                }
                 val message = when (result) {
                     BlockResult.BLOCKED, BlockResult.ALREADY_BLOCKED -> activity.getString(R.string.block_declined_and_blocked, name)
                     BlockResult.FULL -> activity.getString(R.string.block_full)

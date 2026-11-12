@@ -304,6 +304,8 @@ internal class CallFragmentWriter<A : Any>(
     private val writeAudio: (A) -> Long,
     private val flushBetween: () -> Unit,
     private val afterFragment: () -> Unit = {},
+    /** Wi-Fi upgrade cutover: true stops the frame after the fragment already written (`ResetSendFragments`). */
+    private val abandon: () -> Boolean = { false },
 ) {
     /** Writes [packetPlaintext] (an encoded `BTV3` media packet); returns the call audio payload bytes written between fragments. */
     fun writeFrame(packetPlaintext: ByteArray, flags: Int): Long {
@@ -314,6 +316,7 @@ internal class CallFragmentWriter<A : Any>(
         var audioBytes = 0L
         var offset = 0
         while (offset < packetPlaintext.size) {
+            if (offset > 0 && abandon()) break
             if (airtime) audioBytes += writeQueuedAudio()
             val current = if (airtime) rate() else FragmentRate.UNKNOWN
             val remaining = packetPlaintext.size - offset

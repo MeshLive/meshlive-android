@@ -5,6 +5,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 
 /** One pacer seed policy and one per-child queue policy (switch audit F4: B3, B12). */
@@ -149,6 +150,8 @@ class PacerSeedPolicyTest {
 
     @Test
     fun theOldKnobStillSetsBothBudgetsAndTheNewOneOnlyThePlayout() {
+        // The time queue and playout target are Experimental DEBUG arms; a release build keeps both off.
+        assumeTrue("DEBUG arm", BuildConfig.DEBUG)
         DebugTunables.relayTimeQueue = true
         DebugTunables.playoutTimeTarget = true
         DebugTunables.timeQueueBudgetMs = 1_200L

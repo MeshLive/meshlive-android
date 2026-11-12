@@ -94,6 +94,26 @@ class IntercomCallTest {
     }
 
     @Test
+    fun aCalleeAtCriticalHeatAnswersAVideoCallAsVoice() {
+        // Calls at critical heat (DECISIONS 2026-11-06): the answer is the voice answer, whatever this phone's switch.
+        for (voiceCalls in listOf(true, false)) {
+            val callee = VoiceCallNegotiation.incoming(enabled = voiceCalls)
+            assertEquals(CallType.VIDEO, callee.localType)
+            callee.answerWithoutVideo()
+            assertEquals(CallType.VOICE, callee.localType)
+            assertEquals(listOf(PrivateCallSignal.ACCEPT, PrivateCallSignal.CAMERA_OFF), callee.acceptSignals())
+            callee.onRemoteCameraSignal(PrivateCallPhase.INCOMING_RINGING, enabled = true)
+            assertEquals("The caller's camera state does not bring this camera back", CallType.VOICE, callee.localType)
+        }
+    }
+
+    @Test
+    fun onlyACalleeCanAnswerWithoutVideo() {
+        val caller = VoiceCallNegotiation.outgoing(enabled = true, requested = CallType.VIDEO)
+        assertThrows(IllegalStateException::class.java) { caller.answerWithoutVideo() }
+    }
+
+    @Test
     fun cameraOnWhileRingingWithdrawsTheVoiceOffer() {
         val callee = VoiceCallNegotiation.incoming(enabled = true)
         callee.onRemoteCameraSignal(PrivateCallPhase.INCOMING_RINGING, enabled = false)

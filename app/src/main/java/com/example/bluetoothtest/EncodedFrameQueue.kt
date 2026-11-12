@@ -14,6 +14,17 @@ data class EncodedFrameQueueStats(
 )
 
 /**
+ * The decoder stopped taking frames: the queue's wait for room ran out, or the decoder watchdog reported a stall
+ * ([EncodedFrameQueue.reportStall]). An [IllegalStateException] with the earlier message, so a caller that does not
+ * look for it handles it exactly as before.
+ */
+class DecoderStalledException(message: String = STOPPED_CONSUMING) : IllegalStateException(message) {
+    companion object {
+        const val STOPPED_CONSUMING = "Video decoder stopped consuming frames"
+    }
+}
+
+/**
  * Encoded frames waiting for the decoder. Sized for the playback profile's whole adaptive delay;
  * when it is full the receive loop waits for the decoder (backpressure travels back over the link
  * to the sender's rate control) instead of discarding queued frames and waiting for a keyframe
@@ -46,9 +57,14 @@ class EncodedFrameQueue(
     private var droppedFrames = 0L
     private var thinnedFrames = 0L
     private var waitingForKeyFrame = requireInitialKeyFrame
+    private var stalled: DecoderStalledException? = null
 
-    /** Returns false only for a frame that cannot be decoded yet (before a keyframe). */
+    /**
+     * Returns false only for a frame that cannot be decoded yet (before a keyframe). Throws [DecoderStalledException]
+     * when the decoder stopped taking frames: no room within the backpressure timeout, or a reported stall.
+     */
     fun offer(packet: StreamProtocol.Packet, nowNs: Long = System.nanoTime()): Boolean = synchronized(lock) {
+        stalled?.let { throw it }
         val isConfiguration = packet.flags and StreamProtocol.FLAG_CODEC_CONFIG != 0
         val isKeyFrame = packet.flags and StreamProtocol.FLAG_KEY_FRAME != 0
 
@@ -73,8 +89,15 @@ class EncodedFrameQueue(
         val deadlineNs = System.nanoTime() + backpressureTimeoutNs
         while (entries.size >= capacity) {
             val remainingNs = deadlineNs - System.nanoTime()
-            check(remainingNs > 0) { "Video decoder stopped consuming frames" }
+            if (remainingNs <= 0) throw DecoderStalledException()
             lock.wait(maxOf(1L, remainingNs / 1_000_000L))
+            stalled?.let { throw it }
+        }
+        // A reset (stall recovery, discontinuity) during the wait restarts decoding at a keyframe: the
+        // gate above ran before it, so check again rather than queue this frame ahead of the keyframe.
+        if (waitingForKeyFrame && !isConfiguration && !isKeyFrame) {
+            droppedFrames++
+            return false
         }
         if (isKeyFrame) waitingForKeyFrame = false
         entries.addLast(Entry(packet, nowNs))
@@ -111,6 +134,23 @@ class EncodedFrameQueue(
         lock.notifyAll()
     }
 
+    /**
+     * Experimental `test_call_video_restart` only: the decoder watchdog found the decoder stalled. Queued frames are
+     * dropped, and a receiver waiting for room (and every later offer) gets [error] at once instead of waiting out the
+     * backpressure timeout, so the call can replace the decoder.
+     */
+    fun reportStall(error: DecoderStalledException) = synchronized(lock) {
+        if (stalled != null) return
+        stalled = error
+        droppedFrames += entries.count { queued ->
+            queued.packet.flags and StreamProtocol.FLAG_CODEC_CONFIG == 0
+        }
+        entries.clear()
+        queuedBytes = 0
+        waitingForKeyFrame = true
+        lock.notifyAll()
+    }
+
     fun stats(nowNs: Long = System.nanoTime()): EncodedFrameQueueStats = synchronized(lock) {
         val oldestAgeMs = entries.peekFirst()?.let { entry ->
             ((nowNs - entry.queuedAtNs).coerceAtLeast(0) / 1_000_000L)
@@ -134,7 +174,8 @@ class EncodedFrameQueue(
         lock.notifyAll()
     }
 
-    private companion object {
+    companion object {
+        /** How long a full queue waits for the decoder before [DecoderStalledException]. */
         const val BACKPRESSURE_TIMEOUT_NS = 5_000_000_000L
     }
 }

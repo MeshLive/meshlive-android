@@ -71,6 +71,12 @@ class AdvertisingPolicyTest {
         assertTrue(AdvertisingPolicy.watchdogOn())
         assertTrue(AdvertisingPolicy.stuckReportOn())
 
+        if (!BuildConfig.DEBUG) {
+            // test_device_policy_off is DEBUG-only: a release build always keeps every entry.
+            DebugTunables.devicePolicyOff = setOf("all")
+            assertTrue(AdvertisingPolicy.watchdogOn() && AdvertisingPolicy.budgetOn() && AdvertisingPolicy.nonThrowingStart())
+            return
+        }
         DebugTunables.devicePolicyOff = setOf(AdvertisingPolicy.ID_WATCHDOG)
         assertFalse(AdvertisingPolicy.watchdogOn())
         assertTrue("only the named entry", AdvertisingPolicy.budgetOn())
@@ -110,6 +116,13 @@ class AdvertisingPolicyTest {
         extras["test_adv_budget_cap"] = 1
         extras["test_adv_quiesce_stop"] = true
         AdvertisingSwitches.applyExtras(bool, int)
+        if (!BuildConfig.DEBUG) {
+            // A release build ignores launch extras: the shipped arms stay on and the experiments stay off.
+            assertTrue(AdvertisingPolicy.watchdogOn() && AdvertisingPolicy.preemptOn() && AdvertisingPolicy.stopSettleOn())
+            assertEquals(0, AdvertisingSwitches.budgetCap)
+            assertFalse(AdvertisingSwitches.quiesceStop)
+            return
+        }
         assertFalse(AdvertisingPolicy.watchdogOn())
         assertFalse(AdvertisingPolicy.preemptOn())
         assertFalse(AdvertisingPolicy.stopSettleOn())

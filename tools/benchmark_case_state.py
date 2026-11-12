@@ -1,5 +1,6 @@
 """Track exact benchmark requests and declared retest obligations without operating phones."""
 import argparse
+import collections
 import copy
 import datetime as dt
 import hashlib
@@ -8,6 +9,7 @@ from pathlib import Path
 import re
 import acceptance_profiles as acceptance
 from benchmark_layout import resolve
+from benchmark_state_io import STATE_V2, iter_state_rows as iter_state_rows_file, write_state
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +20,7 @@ METADATA = {"id", "state", "family", "load_tier", "environment", "planned_enviro
 REAL_ORIGINS = {"LIVE_ATTEMPT", "RECORDED_EXECUTION_ANALYSIS"}
 RESULT_STATES = {"NOT RUN", "PASS", "FAIL", "BLOCKED", "INTERRUPTED", "UNMEASURED",
                  "RUNNING", "ANALYZING", "PENDING_ANALYSIS"}
+NO_CASES = "none"  # `affects: "none"`: the change touches no measured behaviour (see _validate_changes)
 PRIORITY = {"FAIL": 0, "NEEDS RETEST": 0, "NOT RUN": 1, "UNMEASURED": 1, "INTERRUPTED": 1}
 
 
@@ -217,7 +220,14 @@ def _validate_changes(changes):
             raise ValueError("Each change needs a unique ID and an evidence-based reason")
         seen.add(change["id"])
         selectors = change.get("affects", {})
-        if not isinstance(selectors, dict) or set(selectors) - {"transports", "phones", "encoders"}:
+        if selectors == NO_CASES:
+            # Declared to change no measured behaviour (documentation, tests, logging that only reports): it is
+            # recorded, but retests nothing. The reason must say why, so a behaviour change cannot hide here.
+            if not str(change.get("affects_none_reason", "")).strip() or change.get("acceptance_profile") is not None:
+                raise ValueError("A change declared to affect no case needs an explicit affects_none_reason and no acceptance profile")
+            _time(change.get("at"))
+            continue
+        if not isinstance(selectors, dict) or set(selectors) - {"transports", "phones", "encoders", "carriers"}:
             raise ValueError("Unknown change impact selector")
         profile = change.get("acceptance_profile")
         if profile is not None:
@@ -230,14 +240,69 @@ def _validate_changes(changes):
 
 def _affected(job, change):
     case, selectors = job["case"], change.get("affects", {})
+    if selectors == NO_CASES:
+        return False
     encoders = {profile["codec"] for profile in case.get("profiles", {"source": case.get("profile", {})}).values()
                 if "codec" in profile}
-    values = {"transports": {case.get("transport")}, "phones": set(job["phones"]), "encoders": encoders}
+    values = {"transports": {case.get("transport")}, "carriers": {case.get("carrier", "bluetooth")}, "phones": set(job["phones"]), "encoders": encoders}
     return all(values[name].intersection(selected) for name, selected in selectors.items())
 
 
-def build_state(jobs, reports, changes=(), expected_apk=None):
-    """Keep latest real exact-case results; only independently verified PASS completes a case."""
+class ChangeSets:
+    """Interns each row's (affecting changes, needs_retest) outcome so the state stores it once, not per row."""
+
+    def __init__(self):
+        self.table, self._index = [], {}
+
+    def intern(self, applied):
+        key = (tuple(identity for identity, _ in applied), tuple(identity for identity, needs in applied if needs))
+        if key not in self._index:
+            self._index[key] = len(self.table)
+            self.table.append({"changes": list(key[0]), "needs_retest": list(key[1])})
+        return self._index[key]
+
+
+STATE_SCOPE = "Exact-case state only; old APK results retain their build labels. Availability is separate from applicability."
+
+
+def build_state(jobs, reports, changes=(), expected_apk=None, row_hook=None):
+    """Keep latest real exact-case results; only independently verified PASS completes a case.
+
+    The result is a benchmark-case-state-v2 state in memory: change definitions once in ``changes``, the distinct
+    per-row outcomes in ``change_sets`` and ``change_set`` on every row (see benchmark_state_io).
+    """
+    sets = ChangeSets()
+    rows = list(iter_state_rows(jobs, reports, changes, expected_apk, sets, row_hook))
+    return {"schema": STATE_V2, "candidate_apk_sha256": expected_apk.lower() if expected_apk is not None else None,
+            "cases": rows, "changes": copy.deepcopy(list(changes)), "change_sets": sets.table,
+            "summary": {state: sum(row["state"] == state for row in rows)
+                        for state in sorted({row["state"] for row in rows})},
+            "scope": STATE_SCOPE}
+
+
+def stream_state(path, jobs, reports, changes=(), expected_apk=None, row_hook=None):
+    """Build the same state as build_state but write it row by row; returns its summary."""
+    sets, counts = ChangeSets(), collections.Counter()
+
+    def rows():
+        for row in iter_state_rows(jobs, reports, changes, expected_apk, sets, row_hook):
+            counts[row["state"]] += 1
+            yield row
+
+    header = {"schema": STATE_V2, "candidate_apk_sha256": expected_apk.lower() if expected_apk is not None else None,
+              "changes": copy.deepcopy(list(changes))}
+    partial = Path(str(path) + ".partial")  # a failed build never leaves a plausible state file behind
+    try:
+        write_state(partial, header, rows(), lambda: {"change_sets": sets.table,
+                                                      "summary": {state: counts[state] for state in sorted(counts)},
+                                                      "scope": STATE_SCOPE})
+        partial.replace(path)
+    finally:
+        partial.unlink(missing_ok=True)
+    return {state: counts[state] for state in sorted(counts)}
+
+
+def iter_state_rows(jobs, reports, changes, expected_apk, sets, row_hook=None):
     if expected_apk is not None and not _hash(expected_apk):
         raise ValueError("Candidate APK must be a valid SHA256")
     expected_apk = expected_apk.lower() if expected_apk is not None else None
@@ -281,7 +346,7 @@ def build_state(jobs, reports, changes=(), expected_apk=None):
                "availability": "UNMEASURED", "state": result["status"] if result else "NOT RUN",
                "last_result": copy.deepcopy(result), "last_verified_apk": None,
                "last_verified_apk_evidence": None, "last_measured_result": None,
-               "candidate_apk_sha256": expected_apk, "freshness": "NOT RUN", "changes": []}
+               "candidate_apk_sha256": expected_apk, "freshness": "NOT RUN"}
         measured, measured_manifest, measured_end = None, None, None
         if result:
             manifest, error = _manifest(result, job)
@@ -349,6 +414,7 @@ def build_state(jobs, reports, changes=(), expected_apk=None):
                 row.update(freshness="NEEDS RETEST", reason=input_error)
                 if row["state"] != "BLOCKED":
                     row["state"] = "NEEDS RETEST"
+        applied = []
         for change in changes:
             if not _affected(job, change):
                 continue
@@ -359,7 +425,7 @@ def build_state(jobs, reports, changes=(), expected_apk=None):
                 # An acceptance-profile change is resolved by a result scored under that profile (an offline
                 # re-analysis of the same exact manifest is enough); execution time does not matter.
                 needs = measured is not None and row.get("last_measured_thresholds_version") != profile
-            row["changes"].append({**copy.deepcopy(change), "needs_retest": needs})
+            applied.append((change["id"], needs))
             if needs:
                 row.update(freshness="NEEDS RETEST", reason="A declared change affects this earlier measured execution"
                            if profile is None else f"Last result was scored under "
@@ -367,21 +433,21 @@ def build_state(jobs, reports, changes=(), expected_apk=None):
                            f"re-analyze the same exact manifest under {profile} or rerun")
                 if row["state"] != "BLOCKED":
                     row["state"] = "NEEDS RETEST"
-        rows.append(row)
-    return {"schema": "benchmark-case-state-v1", "candidate_apk_sha256": expected_apk, "cases": rows,
-            "changes": copy.deepcopy(list(changes)),
-            "summary": {state: sum(row["state"] == state for row in rows)
-                        for state in sorted({row["state"] for row in rows})},
-            "scope": "Exact-case state only; old APK results retain their build labels. Availability is separate from applicability."}
+        row["change_set"] = sets.intern(applied)
+        if row_hook is not None:
+            row_hook(row)
+        yield row
 
 
 def select_remaining(state, available_phones):
     """Select unfinished cases whose entire participant group is available; preflight still applies."""
     available = set(available_phones)
-    for row in state["cases"]:
+    rows = []
+    for row in state["cases"]:  # a single pass, so a streamed row iterator works too
         if row.get("state") not in {*PRIORITY, "PASS", "BLOCKED"}:
             raise ValueError(f"Unknown or unfinished checkpoint state for {row.get('case_id')}: {row.get('state')}; regenerate case state")
-    rows = [row for row in state["cases"] if row["state"] in PRIORITY and set(row["phones"]) <= available]
+        if row["state"] in PRIORITY and set(row["phones"]) <= available:
+            rows.append(row)
     return sorted(rows, key=lambda row: PRIORITY[row["state"]])
 
 
@@ -405,22 +471,27 @@ def main(argv=None):
         parser.error(f"Unknown available aliases: {sorted(phones - set(registry))}")
     jobs = load_jobs(args.suite, registry)
     changes = [change for path in args.changes for change in read(resolve(path))["changes"]]
-    state = build_state(jobs, [read(resolve(path)) for path in args.reports], changes, expected_apk=args.apk_sha256)
-    for row in state["cases"]:
+    _validate_changes(changes)  # before any output is created
+
+    def availability(row):
         row["availability"] = {"all_participants_available": set(row["phones"]) <= phones,
                                "missing_phones": sorted(set(row["phones"]) - phones),
                                "preflight": "UNMEASURED"}
+
     from benchmark_layout import output_path
     output = output_path(args.output, "catalog", root=ROOT)
     if any((output / name).exists() for name in ("state.json", "remaining.json")):
         raise FileExistsError("State outputs already exist; refresh through the indexed checkpoint or prepare in OS temporary scratch")
     output.mkdir(parents=True, exist_ok=True)
-    write(output / "state.json", state)
-    ready = select_remaining(state, phones)
+    summary = stream_state(output / "state.json", jobs, [read(resolve(path)) for path in args.reports], changes,
+                           expected_apk=args.apk_sha256, row_hook=availability)
+    ready = select_remaining({"cases": iter_state_rows_file(output / "state.json")}, phones)
+    blocked = [row["case_id"] for row in iter_state_rows_file(output / "state.json") if row["state"] == "BLOCKED"]
     write(output / "remaining.json", {"state": "NOT RUN", "case_ids": [row["case_id"] for row in ready],
                                      "available_owned_phones": sorted(phones),
-                                     "blocked_cases": [row["case_id"] for row in state["cases"] if row["state"] == "BLOCKED"],
+                                     "blocked_cases": blocked,
                                      "reason": "Selection is not execution; BLOCKED cases require a newly proved prerequisite."})
+    state = {"summary": summary}
     print(json.dumps({"summary": state["summary"], "selected": len(ready), "output": str(output)}))
     return 0
 

@@ -21,8 +21,10 @@ import math
 from pathlib import Path
 
 from benchmark_layout import original, output_path, resolve as resolve_input
+from stage_trace_lines import stage_records
 
-PREFIX = "BENCHMARK stage v1 "
+PREFIX = "BENCHMARK stage v1 "  # the v1 marker; v2 batch lines are read too (stage_trace_lines)
+
 IDENTITY = ("run_id", "phone", "session", "pid", "clock", "source", "direction", "stream_generation")
 CLOCK = ("run_id", "phone", "pid", "clock")
 STAGES = {"raw_capture", "encode_input", "encode_output", "send_enqueue", "write_begin", "write_end",
@@ -130,7 +132,7 @@ def load_traces(spec, base, retained):
         fmt = declaration.get("format")
         if fmt == "logcat":
             with path.open(encoding="utf-8-sig") as source:
-                raw = [json.loads(line.split(PREFIX, 1)[1]) for line in source if PREFIX in line]
+                raw = [record for line in source for record in stage_records(line)]
         elif fmt == "json":
             doc = json.loads(path.read_text(encoding="utf-8-sig"))
             if doc.get("schema") != "benchmark-stage-events-v1":

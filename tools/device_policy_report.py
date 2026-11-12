@@ -25,7 +25,7 @@ DEFAULT_REGISTRY = ROOT / "tools" / "device_policy_registry.json"
 SOC_FAMILIES = {"QUALCOMM", "EXYNOS", "MEDIATEK", "TENSOR", "UNISOC", "UNKNOWN"}
 SOURCE_STATUSES = {"OFFICIAL", "PARTIAL", "EVIDENCE_ONLY"}
 CONFIDENCES = {"HIGH", "MEDIUM", "LOW"}
-AREAS = {"CODEC", "YUV", "BLUETOOTH_TRANSPORT", "GRAPHICS", "BACKGROUND", "MEMORY_THERMAL", "NATIVE", "CAMERA", "AUDIO"}
+AREAS = {"CODEC", "YUV", "BLUETOOTH_TRANSPORT", "GRAPHICS", "BACKGROUND", "MEMORY_THERMAL", "NATIVE", "CAMERA", "AUDIO", "WIFI"}
 VALIDATIONS = {"UPSTREAM_DOCUMENTED", "LOCALLY_REPRODUCED", "EXPERIMENTAL"}
 LINE_RE = re.compile(r"BENCHMARK device_policy: (?P<body>.*)$")
 
@@ -150,7 +150,8 @@ def resolve(registry: dict, traits: dict, disabled: set[str] | None = None, arms
 
     As in Kotlin (DeviceFamilyPolicy.resolve, switch audit A10): a proposal replaced by an implemented entry
     (`superseded_by`) is never a matching proposal, and an entry whose effect waits for a default-off Experimental arm
-    (`arm`, the arm's launch extra) is listed under `arm_off`, not `active`, unless that arm is in [arms_on]."""
+    (`arm`, the arm's launch extra) is listed under `arm_off`, not `active`, unless that arm is in [arms_on] or the arm
+    is on by default (`arm_on_by_default`: a promoted switch whose launch extra now names its control arm's opposite)."""
     disabled = disabled or set()
     arms_on = arms_on or set()
     all_off = "all" in disabled
@@ -169,7 +170,7 @@ def resolve(registry: dict, traits: dict, disabled: set[str] | None = None, arms
             switched_off.append(entry["id"])
             continue
         if entry["component"] is None:
-            if entry.get("arm") and entry["arm"] not in arms_on:
+            if entry.get("arm") and entry["arm"] not in arms_on and not entry.get("arm_on_by_default"):
                 arm_off.append(entry["id"])
             else:
                 active.append(entry["id"])

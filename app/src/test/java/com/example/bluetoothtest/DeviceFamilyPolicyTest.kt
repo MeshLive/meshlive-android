@@ -39,7 +39,8 @@ class DeviceFamilyPolicyTest {
         val line = DeviceFamilyPolicy.benchmarkLine(DeviceFamilyPolicy.resolve(DeviceTraits("qcom", "msmnile", 30), emptySet()))
         val unconfirmed = line.substringAfter("unconfirmed=").substringBefore(" |").split(',')
         assertTrue(line, "app-bluetooth-toggle-allowed" in unconfirmed) // upstream-documented only
-        assertTrue(line, "qcom-legacy-call-relay-gatt-acknowledged-writes" in unconfirmed) // experimental
+        // Experimental and waiting for its default-off arm: reported under armOff, not as something the phone runs.
+        assertFalse(line, "qcom-legacy-call-relay-gatt-acknowledged-writes" in unconfirmed)
         assertFalse(line, "qcom-msmnile-call" in unconfirmed) // locally reproduced
     }
 
@@ -50,6 +51,7 @@ class DeviceFamilyPolicyTest {
             "s22" to emptyList(),
             "a55" to emptyList(),
             "xiaomi" to emptyList(),
+            "realme" to emptyList(),
             "m31" to listOf("le-coc-eatt-stranded-channels", "app-bluetooth-toggle-allowed"),
             "a15s" to listOf("gatt-context-map-race", "le-coc-server-leak", "app-bluetooth-toggle-allowed"),
             "asus" to listOf(
@@ -120,6 +122,12 @@ class DeviceFamilyPolicyTest {
 
         val selected = VideoSettings(VideoResolution(640, 480, "480p"), 30, 1_000_000, 250)
         DebugTunables.devicePolicyOff = setOf("all")
+        if (!BuildConfig.DEBUG) {
+            // test_device_policy_off is DEBUG-only: a release build always keeps every entry.
+            assertTrue(GattClientTeardown.deferredFor(DeviceTraits("", "", 29), null))
+            assertEquals(0, encoderTieBreakRank("c2.exynos.vp9.encoder"))
+            return
+        }
         assertEquals(
             privateCallVideoSettings(selected, BluetoothTransportOption.BLE_GATT, null),
             privateCallVideoSettings(selected, BluetoothTransportOption.BLE_GATT, asus),

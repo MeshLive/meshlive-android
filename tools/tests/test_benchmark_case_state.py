@@ -16,7 +16,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 SPEC = importlib.util.spec_from_file_location("benchmark_case_state", Path(__file__).parents[1] / "benchmark_case_state.py")
 state = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(state)
+from benchmark_state_io import ChangeTable, iter_state_rows, state_header  # noqa: E402
 APK = "a" * 64
+
+
+def changes_of(built_state, row):
+    return ChangeTable(built_state).expand(row)
 
 
 def job(identifier, phones=("a", "b"), transport="gatt"):
@@ -75,7 +80,7 @@ class CaseStateTest(unittest.TestCase):
                          {name: row["state"] for name, row in rows.items()})
         self.assertEqual("PASS", rows["first"]["last_result"]["status"])
         self.assertEqual({"a": APK, "b": APK}, rows["classic"]["last_verified_apk"])
-        self.assertFalse(rows["untested"]["changes"][0]["needs_retest"])
+        self.assertFalse(changes_of(built, rows["untested"])[0]["needs_retest"])
         self.assertEqual(before, inputs)
 
     def test_case_pending_analysis_is_not_finalized_and_keeps_prior_result(self):
@@ -487,8 +492,9 @@ class CaseStateTest(unittest.TestCase):
                    "origin": "LIVE_ATTEMPT", "host_end_ns": instant + 1, "reason": "Phone is unavailable"}
         change = {"id": "decoder-fix", "reason": "A decoder-stage fix affects earlier playback measurements",
                   "files": ["Decoder.kt"], "at": "2026-10-04T01:00:00+05:30"}
-        built = state.build_state([item], [report(measured, blocked)], [change])["cases"][0]
-        self.assertTrue(built["changes"][0]["needs_retest"])
+        whole = state.build_state([item], [report(measured, blocked)], [change])
+        built = whole["cases"][0]
+        self.assertTrue(changes_of(whole, built)[0]["needs_retest"])
         self.assertEqual("BLOCKED", built["state"])
         self.assertEqual("NEEDS RETEST", built["freshness"])
         self.assertEqual(measured, built["last_measured_result"])
@@ -501,11 +507,12 @@ class CaseStateTest(unittest.TestCase):
                    "origin": "LIVE_ATTEMPT", "host_end_ns": 1}
         change = {"id": "decoder-fix", "reason": "Decoder change affects every eligible playback case",
                   "files": ["Decoder.kt"]}
-        built = state.build_state([item], [report(blocked)], [change])["cases"][0]
+        whole = state.build_state([item], [report(blocked)], [change])
+        built = whole["cases"][0]
         self.assertEqual("BLOCKED", built["state"])
         self.assertEqual("NOT RUN", built["freshness"])
         self.assertIsNone(built["last_measured_result"])
-        self.assertFalse(built["changes"][0]["needs_retest"])
+        self.assertFalse(changes_of(whole, built)[0]["needs_retest"])
 
     def test_unknown_or_transient_state_cannot_silently_hide_remaining_cases(self):
         for invalid in ("COMPLETE", "SKIPPED", "RUNNING", "ANALYZING", None):
@@ -601,13 +608,55 @@ class CaseStateTest(unittest.TestCase):
              patch("subprocess.run", side_effect=AssertionError("Device I/O is forbidden")), \
              patch("subprocess.Popen", side_effect=AssertionError("Device process is forbidden")):
             self.assertEqual(0, state.main([*args, "--output", str(self.folder / "combined")]))
-            rows = json.loads((self.folder / "combined/state.json").read_text())["cases"]
+            stored = state_header(self.folder / "combined/state.json")
+            rows = list(iter_state_rows(self.folder / "combined/state.json"))
             self.assertEqual(["NEEDS RETEST", "NEEDS RETEST"], [row["state"] for row in rows])
-            self.assertEqual([["gatt"], ["classic"]], [[change["id"] for change in row["changes"]] for row in rows])
+            self.assertEqual([["gatt"], ["classic"]],
+                             [[change["id"] for change in changes_of(stored, row)] for row in rows])
             with self.assertRaises(ValueError):
                 state.main([*args, "--changes", str(self.folder / "gatt-change.json"),
                             "--output", str(self.folder / "duplicate")])
         self.assertFalse((self.folder / "duplicate").exists())
+
+    def test_a_change_declared_to_affect_no_case_is_recorded_but_retests_nothing(self):
+        item = job("standard")
+        inputs = [report(self.execution(item))]
+        logging = {"id": "debug-log-only", "reason": "Adds a DEBUG log line", "files": ["Log.kt"], "affects": "none",
+                   "affects_none_reason": "DEBUG logging only; no release or measured behaviour changes"}
+        behaviour = {"id": "decoder-fix", "reason": "Decoder stage fix", "files": ["Decoder.kt"]}
+        quiet = state.build_state([item], inputs, [logging])
+        self.assertEqual(["PASS"], [row["state"] for row in quiet["cases"]])
+        self.assertEqual([], changes_of(quiet, quiet["cases"][0]))
+        self.assertEqual([logging], quiet["changes"])  # still recorded, so a later checkpoint keeps its definition
+        mixed = state.build_state([item], inputs, [logging, behaviour])
+        self.assertEqual(["NEEDS RETEST"], [row["state"] for row in mixed["cases"]])
+        self.assertEqual(["decoder-fix"], [c["id"] for c in changes_of(mixed, mixed["cases"][0])])
+
+    def test_affects_none_needs_a_stated_reason_and_cannot_hide_a_gate_change(self):
+        item = job("standard")
+        base = {"id": "docs", "reason": "Documentation", "affects": "none"}
+        for bad in (base, {**base, "affects_none_reason": " "},
+                    {**base, "affects_none_reason": "Docs", "acceptance_profile": "device-run-v4-user"}):
+            with self.subTest(change=bad), self.assertRaisesRegex(ValueError, "affects_none_reason"):
+                state.build_state([item], [], [bad])
+        with self.assertRaises(ValueError):
+            state.build_state([item], [], [{**base, "affects": "nothing", "affects_none_reason": "Docs"}])
+
+    def test_carrier_change_retests_only_carrier_cases(self):
+        carrier, bluetooth = job("carrier"), job("bluetooth")
+        carrier["case"]["carrier"] = "wifi_aware"
+        inputs = [report(*(self.execution(item) for item in (carrier, bluetooth)))]
+        wifi_change = {"id": "wifi-aware-change", "reason": "Wi-Fi Aware path changed", "files": ["Wifi.kt"],
+                       "affects": {"carriers": ["wifi_aware"]}}
+        rows = {row["case_id"]: row for row in state.build_state([carrier, bluetooth], inputs, [wifi_change])["cases"]}
+        self.assertEqual("NEEDS RETEST", rows["carrier"]["state"])
+        self.assertEqual("PASS", rows["bluetooth"]["state"])
+
+        bluetooth_change = {"id": "bluetooth-change", "reason": "Bluetooth path changed", "files": ["Bt.kt"],
+                            "affects": {"carriers": ["bluetooth"]}}
+        rows = {row["case_id"]: row for row in state.build_state([carrier, bluetooth], inputs, [bluetooth_change])["cases"]}
+        self.assertEqual("PASS", rows["carrier"]["state"])
+        self.assertEqual("NEEDS RETEST", rows["bluetooth"]["state"])
 
 
 if __name__ == "__main__":

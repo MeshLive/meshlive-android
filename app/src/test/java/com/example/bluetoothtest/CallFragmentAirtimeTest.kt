@@ -85,6 +85,11 @@ class CallFragmentAirtimeTest {
         assertEquals(40, CallFragmentAirtime.clampTargetMs(40))
         assertEquals(CallFragmentAirtime.MAX_TARGET_MS, CallFragmentAirtime.clampTargetMs(100_000))
         DebugTunables.callFragmentAirtimeMs = 100_000
+        if (!BuildConfig.DEBUG) {
+            // A release build ignores the launch extra: the experiment stays off (0, the fixed 2 KB fragments).
+            assertEquals(0, DebugTunables.callFragmentAirtimeMs)
+            return
+        }
         assertEquals(CallFragmentAirtime.MAX_TARGET_MS, DebugTunables.callFragmentAirtimeMs)
         DebugTunables.callFragmentAirtimeMs = -1
         assertEquals(0, DebugTunables.callFragmentAirtimeMs)
@@ -378,6 +383,33 @@ class CallFragmentAirtimeTest {
         assertTrue(link.events.none { it.startsWith("A") || it == "flush" })
         assertTrue(link.events.count { it.startsWith("F") } >= 4)
         assertArrayEquals(link.lastPacket, link.reassemble())
+    }
+
+    @Test
+    fun anAbandonedFrameStopsAfterTheCurrentFragment() {
+        val link = FakeLink(300)
+        var fragments = 0
+        val writer = CallFragmentWriter<FakeAudio>(
+            targetMs = 0,
+            rate = { FragmentRate.UNKNOWN },
+            stats = CallFragmentStats { link.nowNs },
+            nanoTime = { link.nowNs },
+            running = { true },
+            writeFragment = { flags, fragment ->
+                fragments++
+                link.writeFragment(flags, fragment)
+            },
+            takeAudio = { link.takeAudio() },
+            audioQueuedAtNs = FakeAudio::queuedAtNs,
+            writeAudio = { link.writeAudio(it) },
+            flushBetween = { link.flush() },
+            abandon = { fragments >= 2 },
+        )
+        val packet = link.packet(20_000)
+        writer.writeFrame(packet, 0)
+        // The cutover dropped the rest of this frame: the next frame starts at offset 0.
+        assertEquals(2, fragments)
+        assertTrue(fragments < CallVideoFragments.split(packet).size)
     }
 
     // ---- helpers -----------------------------------------------------------------------------

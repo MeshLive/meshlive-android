@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import java.io.Closeable
+import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -210,7 +211,7 @@ class BluetoothVideoBroadcaster(
         val linkBudget = if (GattSwitches.linkBudgetAdmission) runCatching { GattLinkBudget.shared(context) }.getOrNull() else null
         val budgetRefused = mutableSetOf<String>()
         val gattCandidates = if (pool != null) {
-            newPeers.filter { it.announcement.transportOption() == BluetoothTransportOption.BLE_GATT }
+            newPeers.filter { !it.wifiOnly && it.announcement.transportOption() == BluetoothTransportOption.BLE_GATT }
         } else {
             emptyList()
         }
@@ -252,7 +253,7 @@ class BluetoothVideoBroadcaster(
         val connectingAttempts = mutableMapOf<String, BluetoothVideoSender>()
         admittedPeers.forEach { peer ->
             val peerKey = peerIdentityKey(peer)
-            val gattChild = peerKey in gattPoolKeys
+            val gattChild = peerKey in gattPoolKeys && !peer.wifiOnly
             lateinit var sender: BluetoothVideoSender
             sender = BluetoothVideoSender(
                 queueCapacity = queueCapacity,
@@ -314,6 +315,14 @@ class BluetoothVideoBroadcaster(
                 debugTraceSession = debugTraceSession,
                 selectedRotatingRequest = peer.announcement.takeIf { it.rotating },
                 audioLiveConfig = audioLiveConfig,
+                wifiDial = if (peer.wifiOnly) {
+                    ({
+                        (WifiDiscovery.nativeLink() ?: throw IOException("native_fail:not_started"))
+                            .dial(WifiSighting.keyOf(peer.announcement), "viewer", WifiLimits.WIDER_VIEWER_DIAL_MS)
+                    })
+                } else {
+                    null
+                },
             ) {
                 handleAuthenticatedPeer(peer, peerKey, sender, maximumChildren)
             }
@@ -794,7 +803,10 @@ class BluetoothVideoBroadcaster(
  * else's advert from another address is a separate, failing attempt and cannot starve the real viewer.
  */
 private fun peerIdentityKey(peer: BleL2capPeer): String =
-    if (peer.announcement.rotating) {
+    if (peer.wifiOnly) {
+        // A placeholder device has one shared address: keys must not collide (A8 step 12.3.3).
+        "w:" + nodePrefixKey(peer.announcement.nodeIdPrefix)
+    } else if (peer.announcement.rotating) {
         "r:" + nodePrefixKey(peer.announcement.nodeIdPrefix) + "@" + peer.device.address
     } else {
         nodePrefixKey(peer.announcement.nodeIdPrefix)

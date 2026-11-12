@@ -51,6 +51,7 @@ internal fun privateCallVideoSettings(
     transport: BluetoothTransportOption,
     fingerprint: BluetoothStackFingerprint? = null,
     preserveSelectedBitrate: Boolean = false,
+    ignoreFamilyRateCap: Boolean = false,
 ): VideoSettings {
     val perDirectionKbps = when (transport) {
         BluetoothTransportOption.CLASSIC_RFCOMM -> 250
@@ -66,7 +67,8 @@ internal fun privateCallVideoSettings(
     val maxResolution = caps.mapNotNull(CallVideoCap::maxResolution)
         .minByOrNull { it.width.toLong() * it.height }
     val maxFps = caps.mapNotNull(CallVideoCap::maxFps).minOrNull()
-    val maxKbps = caps.mapNotNull(CallVideoCap::maxVideoKbps).minOrNull()
+    // [A5 Am 16] the exact-rate DEBUG arm treats the family rate cap as absent; geometry and FPS caps still apply.
+    val maxKbps = if (ignoreFamilyRateCap) null else caps.mapNotNull(CallVideoCap::maxVideoKbps).minOrNull()
     return transportLimited.copy(
         resolution = if (
             maxResolution != null &&
@@ -363,10 +365,16 @@ internal fun privateCallMediaFlushIntervalMs(
     transport: BluetoothTransportOption,
     fingerprint: BluetoothStackFingerprint,
     peerMaxBitrateKbps: Int?,
-): Long = maxOf(
-    DeviceFamilyPolicy.resolve(fingerprint).callMediaFlushIntervalMs(transport) ?: 0L,
-    if (peerCallLinkConstrained(transport, peerMaxBitrateKbps)) 20L else 0L,
-)
+    /** A Wi-Fi carrier flushes after every record (a socket write does not block for its air time). */
+    carrier: CarrierKind = CarrierKind.BLUETOOTH,
+): Long = if (carrier.isWifi) {
+    0L
+} else {
+    maxOf(
+        DeviceFamilyPolicy.resolve(fingerprint).callMediaFlushIntervalMs(transport) ?: 0L,
+        if (peerCallLinkConstrained(transport, peerMaxBitrateKbps)) 20L else 0L,
+    )
+}
 
 internal fun privateCallPlaybackDelayProfile(
     selected: PlaybackDelayProfile,
@@ -474,13 +482,31 @@ internal class PrivateCallMediaReceiver(
     private val audioConfig = mutableListOf<ByteArray>()
     private var decoder: VideoStreamDecoder? = null
     private var videoDecoderRecoveryAttempts = 0
+    /** DEBUG call join stages: the first call video packet offered here. */
+    private var firstVideoMarked = false
+    /** Experimental call pre-warm ([CallPrewarm]): the decoder component allocated when the peer's header arrived. */
+    private var preparedDecoder: PreparedDecoderComponent<MediaCodec>? = null
     private var debugPriorDecoderDrops = 0L
     private var awaitingVideoRecoveryKeyFrame = false
+    /** Experimental `test_call_video_restart` (default off): a stalled video decoder is replaced, not the call ended. */
+    private val videoStallRestart = CallVideoStallRestart(
+        enabled = DebugTunables.callVideoRestart,
+        onStatus = { status -> onStatus(status) },
+        onKeyFrameNeeded = { onKeyFrameNeeded() },
+        onRemoteVideoActive = { active -> onRemoteVideoActive(active) },
+        log = { line -> Log.w("BluetoothVideo", (if (BuildConfig.DEBUG) "BENCHMARK " else "") + line) },
+    )
     private val surfaceWait = VideoSurfaceWait()
     private var audioDecoder: OpusAudioDecoder? = null
     private var playoutClock: MediaPlayoutClock? = null
     /** Experimental (`test_call_audio_own_clock`): audio's own delay, grown only by late audio. */
     private var audioPlayoutClock: MediaPlayoutClock? = null
+    /** Experimental `test_call_stale_audio_drop`: after a stall, audio older than the playout budget ([CallStaleAudio]). */
+    private val staleAudio = CallStaleAudio(
+        enabled = DebugTunables.callStaleAudioDrop,
+        budgetMs = playbackDelayProfile.adaptiveMaxDelayMs,
+        log = { line -> Log.i("BluetoothVideo", line) },
+    )
     private var videoPackets = 0L
     private var audioPackets = 0L
     private var bytes = 0L
@@ -513,13 +539,44 @@ internal class PrivateCallMediaReceiver(
     fun setHeader(value: StreamProtocol.Header) {
         require(header == null) { "The peer sent more than one call stream header" }
         header = value
-        playoutClock = playbackDelayProfile.newPlayoutClock()
-        audioPlayoutClock = if (DebugTunables.callAudioOwnClock) playbackDelayProfile.newPlayoutClock() else null
+        // Experimental test_call_fast_recovery: attached to the clock audio follows, since audio does the catching up.
+        val fastRecovery = CallFastRecovery.forProfile(playbackDelayProfile, DebugTunables.callFastRecovery) { line ->
+            if (BuildConfig.DEBUG) Log.i("BluetoothVideo", line)
+        }
+        playoutClock = playbackDelayProfile.newPlayoutClock(
+            fastRecovery = fastRecovery.takeUnless { DebugTunables.callAudioOwnClock },
+        )
+        audioPlayoutClock = if (DebugTunables.callAudioOwnClock) {
+            playbackDelayProfile.newPlayoutClock(fastRecovery = fastRecovery)
+        } else {
+            null
+        }
         onVideoFormat(value)
+        if (DebugTunables.callPrewarm) prepareDecoderComponent(value)
         onStatus(
             "Remote ${VideoCodecMap.label(value.codecId)} " +
                 "${value.displayWidth}x${value.displayHeight}/${value.fps} with Opus audio",
         )
+    }
+
+    /**
+     * Experimental call pre-warm: the peer named its codec and size (it sends the header at its Accept, ahead of its
+     * camera start), so the decoder component the first key frame will configure is allocated now, off this thread.
+     */
+    private fun prepareDecoderComponent(value: StreamProtocol.Header) {
+        val mime = videoDecoderMime(value.codecId) ?: return
+        preparedDecoder = PreparedDecoderComponent<MediaCodec>(
+            runAsync = { task -> Thread(task, "CallDecoderPrewarm").start() },
+            allocate = {
+                val chosen = privateCallPreferredDecoderName(value.codecId, privateCallStackFingerprint())
+                    ?: android.media.MediaCodecList(android.media.MediaCodecList.ALL_CODECS).findDecoderForFormat(
+                        android.media.MediaFormat.createVideoFormat(mime, value.width, value.height),
+                    )
+                chosen?.let { name -> name to MediaCodec.createByCodecName(name) }
+            },
+            release = { codec -> codec.release() },
+            log = { line -> Log.i("BluetoothVideo", line) },
+        ).also { it.prepare() }
     }
 
     @Synchronized
@@ -560,6 +617,8 @@ internal class PrivateCallMediaReceiver(
     }
 
     fun setRemoteCameraEnabled(enabled: Boolean) {
+        // Experimental test_call_video_restart: video stopped on this phone; the peer's camera choice cannot restart it.
+        if (videoStallRestart.videoStopped) return
         onRemoteVideoActive(enabled)
         if (enabled) onKeyFrameNeeded()
     }
@@ -575,8 +634,19 @@ internal class PrivateCallMediaReceiver(
         }
         // Experimental own audio clock: video bursts no longer hold speech back for lip sync.
         val clock = audioPlayoutClock ?: requireNotNull(playoutClock)
-        clock.timing(packet.presentationTimeUs)
+        val timing = clock.timing(packet.presentationTimeUs)
+        // Experimental test_call_stale_audio_drop: after a stall, audio older than the playout budget is not played.
+        val decision = staleAudio.onAudio(System.nanoTime() / 1_000_000L, packet.presentationTimeUs, timing.latenessMs)
+        if (decision == CallStaleAudio.Decision.DROP) {
+            bytes += packet.payload.size
+            return
+        }
         val activeDecoder = audioDecoder ?: inLocalMediaStage(LocalMediaStage.AUDIO_DECODER_SETUP) {
+            // JT2 camera-first (off by default): the AudioTrack (voice-communication usage) is created only after this call's
+            // queued audio open set the communication mode; nothing is queued, so nothing waits, with the switch off.
+            if (DebugTunables.callCameraFirst && !CallAudioOpenGate.shared.await(CallAudioOpenGate.WAIT_MS)) {
+                Log.i("BluetoothVideo", "BENCHMARK call_audio_open_wait: event=timeout | waitedMs=${CallAudioOpenGate.WAIT_MS}")
+            }
             OpusAudioDecoder(
                 activeHeader,
                 audioConfig,
@@ -597,8 +667,13 @@ internal class PrivateCallMediaReceiver(
         activeHeader: StreamProtocol.Header,
         packet: StreamProtocol.Packet,
     ) {
+        if (videoStallRestart.videoStopped) return
         if (awaitingVideoRecoveryKeyFrame && packet.flags and StreamProtocol.FLAG_KEY_FRAME == 0) return
         awaitingVideoRecoveryKeyFrame = false
+        if (!firstVideoMarked) {
+            firstVideoMarked = true
+            CallJoinStages.mark(CallJoinStage.FIRST_FRAME_RECEIVED, "keyFrame=${packet.flags and StreamProtocol.FLAG_KEY_FRAME != 0}")
+        }
         val clock = requireNotNull(playoutClock)
         val arrivalNs = System.nanoTime()
         val arrivalTiming = videoPacketPlayoutTiming(packet, clock, arrivalNs, videoGrowthLimitMs)
@@ -655,8 +730,14 @@ internal class PrivateCallMediaReceiver(
                         privateCallStackFingerprint(),
                     ),
                     presentFirstFrameImmediately = DebugTunables.callFirstFrameNow,
+                    firstFrameRamp = DebugTunables.callFirstFrameRamp,
                     firstPacket = packet,
                     onCodedSizeChanged = { width, height -> followCodedSize(width, height) },
+                    onFirstDecoded = { CallJoinStages.mark(CallJoinStage.FIRST_FRAME_DECODED) },
+                    preallocated = preparedDecoder?.let { prepared -> { name: String -> prepared.take(name) } },
+                    stallRestartsCaller = videoStallRestart.enabled,
+                    queueWaitNs = videoStallRestart.queueWaitNs,
+                    stallExcludedDecoders = videoStallRestart.excludedDecoders,
                 )
             }.also {
                 decoder = it
@@ -679,6 +760,16 @@ internal class PrivateCallMediaReceiver(
         }
         try {
             activeDecoder.offer(packet)
+        } catch (stall: DecoderStalledException) {
+            // Off (the default): the call ends as before. On: this decoder is replaced at the next keyframe.
+            if (!videoStallRestart.handles(stall)) throw LocalMediaPipelineException(LocalMediaStage.VIDEO_DECODER, stall)
+            if (BuildConfig.DEBUG) debugPriorDecoderDrops += activeDecoder.stats().queue.droppedFrames
+            decoder = null
+            videoConfig.clear()
+            videoConfig += activeDecoder.currentCodecSpecificData()
+            awaitingVideoRecoveryKeyFrame = videoStallRestart.onStall(
+                stall, activeDecoder.decoderName, activeDecoder.renderedFrames, activeDecoder::closeWithoutWaiting,
+            )
         } catch (error: IllegalStateException) {
             val codecError = error.cause as? MediaCodec.CodecException
             if (codecError == null ||
@@ -793,10 +884,12 @@ internal class PrivateCallMediaReceiver(
         closed = true
         if (BuildConfig.DEBUG) reportIfDue(force = true)
         debugMediaTrace?.close()
+        preparedDecoder?.close()
         decoder?.close()
         decoder = null
         audioDecoder?.close()
         audioDecoder = null
+        staleAudio.close()
     }
 
     private companion object {

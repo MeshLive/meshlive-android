@@ -83,11 +83,24 @@ class VoiceCallNegotiation private constructor(
     /** What this phone sends when its media starts: no camera, encoder or video packet for VOICE. */
     val localType: CallType
         get() = when {
+            answeringWithoutVideo -> CallType.VOICE
             !enabled -> CallType.VIDEO
             role == PrivateCallRole.CALLER -> requested
             peerOfferedVoice -> CallType.VOICE
             else -> CallType.VIDEO
         }
+
+    /**
+     * Set by a callee that answers without its camera (critical heat, DECISIONS 2026-11-06): the answer is
+     * `ACCEPT, CAMERA_OFF`, the existing voice answer, which every peer accepts whatever its own switches.
+     */
+    @Volatile var answeringWithoutVideo = false
+        private set
+
+    fun answerWithoutVideo() {
+        check(role == PrivateCallRole.CALLEE) { "Only a callee answers" }
+        answeringWithoutVideo = true
+    }
 
     fun inviteSignals(): List<PrivateCallSignal> {
         check(role == PrivateCallRole.CALLER) { "Only a caller invites" }

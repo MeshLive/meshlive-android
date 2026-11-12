@@ -19,6 +19,20 @@ internal object LinkChangeEvents {
     fun phyChanged() {
         counter.incrementAndGet()
     }
+
+    /** A hop's media moved to another carrier (Bluetooth to Wi-Fi or back): same epoch as a PHY change (master 4.4). */
+    fun carrierChanged() {
+        counter.incrementAndGet()
+    }
+
+    /**
+     * A call's send carrier changed for [reason]. "attach" is the call's first carrier at establishment: no link of a
+     * running stream or call changed, so the epoch stays (review A3 P2-1: under the auto ladder every call start had
+     * restarted the climb of every running rate controller).
+     */
+    fun sendCarrierChanged(reason: String) {
+        if (reason != "attach") carrierChanged()
+    }
 }
 
 /** Tells a real PHY change (a different transmit PHY than the one before) from the first report. */

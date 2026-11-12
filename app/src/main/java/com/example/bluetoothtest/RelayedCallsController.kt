@@ -45,8 +45,11 @@ internal class RelayedCallsController(
     private val onRelayNotification: (relaying: Boolean, relays: Int) -> Unit,
     /** The helper state or table changed in a way Settings or the call list shows. */
     private val onChanged: () -> Unit,
-    /** The call offer on air no longer matches the helper/consent state: restart the idle endpoint. */
-    private val onOfferStale: () -> Unit,
+    /**
+     * The call offer on air no longer matches the helper/consent state: restart the idle endpoint. True when the
+     * endpoint was really stopped for a rebuild; false when it was busy (asked again at the next tick).
+     */
+    private val onOfferStale: () -> Boolean,
 ) : RelayHelperHost {
     private val handler = Handler(Looper.getMainLooper())
     private val localNodeId = AndroidNodeIdentityStore().getOrCreate().nodeId
@@ -82,8 +85,8 @@ internal class RelayedCallsController(
         private set
     @Volatile private var relaying = false
 
-    /** The bits of the call offer currently on air (helping, consent); null when none is known. */
-    @Volatile private var advertised: Pair<Boolean, Boolean>? = null
+    /** The call offer on air and its staleness check (RelayedOfferRestart). */
+    private val offer = RelayedOfferTracker()
     private var scanner: BleL2capDiscovery? = null
     private var scannerMode: HelperScan? = null
     private var scannerStartedMs = 0L
@@ -157,13 +160,13 @@ internal class RelayedCallsController(
         }
         // The offer on air carries the helper flag and the consent bit from when it opened. If the policy or the
         // user's choice changed since, a restart makes callers see the truth (an idle endpoint only).
-        val onAir = advertised
-        if (onAir != null && state.callReady && !relaying &&
-            (onAir.first != liveHelping(state) || onAir.second != consentOn())
-        ) {
-            advertised = null
-            onOfferStale()
-        }
+        offer.check(
+            callReady = state.callReady,
+            relaying = relaying,
+            liveHelping = { liveHelping(state) },
+            consent = ::consentOn,
+            restart = onOfferStale,
+        )
         if (plan.helping && RelaySeekFeature.tablesOff()) {
             // Design OR arm O: no reach-table scan and no reach pages; searches arrive over the call listener.
             stopScanner()
@@ -184,6 +187,19 @@ internal class RelayedCallsController(
             )
         }
         if (previous.pause != plan.pause) onChanged()
+    }
+
+    /**
+     * A new call endpoint is about to be created (main thread): the helper bits its offer and hellos sign are read from
+     * the device state now, with this endpoint's own transport, instead of a cached snapshot up to 5 s old. A snapshot
+     * from before the endpoint existed (no transport) or from during the call that just ended (own activity) made the
+     * offer disagree with the first tick, and that tick rebuilt the endpoint under an incoming link (rc-ctl-20261106).
+     * Off with the restart guard's control arm.
+     */
+    fun endpointStarting(transport: BluetoothTransportOption) {
+        if (!DebugTunables.relayedRestartGuard) return
+        // Every reader of the snapshot until the next tick is this endpoint, which is call-ready once it listens.
+        snapshot = deviceState().copy(callReady = true, transport = transport)
     }
 
     fun statusLine(): String = RelayHelperPolicy.statusLine(plan, snapshot?.batteryPercent ?: -1)
@@ -317,7 +333,7 @@ internal class RelayedCallsController(
             !(RelaySeekFeature.active() && RelaySeekHelperState.budgets.exhaustedFor(RelaySeekBudgets.FLAG_WITHDRAW_AFTER_MS))
 
     override fun offerOpened(helperActive: Boolean, consent: Boolean) {
-        advertised = helperActive to consent
+        offer.opened(helperActive, consent)
     }
 
     override fun admit(
@@ -344,7 +360,7 @@ internal class RelayedCallsController(
         }
         val accept = { offer: DiscoveryAnnouncement -> offer.transportOption() == transport }
         val route = if (featureOn && !paused && budget in 1..RelayedCallsFeature.maxRelays) {
-            activeTable.setupRoute(target, budget, accept)
+            activeTable.setupRoute(target, budget, accept, RelayedCallsFeature.nextHopPin)
         } else {
             null
         }
@@ -370,7 +386,10 @@ internal class RelayedCallsController(
                 routeAvailable = route != null,
             ),
         )
-        if (refusal == RelaySetupFailure.NO_ROUTE && rotating && RelaySeekFeature.active()) {
+        // AP8: a pinned helper never searches for another next hop; a missing pinned route is the existing NO_ROUTE FAIL.
+        if (refusal == RelaySetupFailure.NO_ROUTE && rotating && RelaySeekFeature.active() &&
+            RelayedCallsFeature.nextHopPin == null
+        ) {
             // Design OR: a plain SETUP without a table route is handled as a search for its one ID (budget clamped to 2).
             return RelayAdmission.Search(target.copyOf(), budget.coerceAtMost(RelaySeek.MAX_BUDGET))
         }

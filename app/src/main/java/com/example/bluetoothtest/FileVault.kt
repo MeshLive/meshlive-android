@@ -247,7 +247,7 @@ class FileVault(private val root: File, private val cipher: AtRestCipher, privat
                 write(bitmap)
             }
         }.toByteArray()
-        atomicWrite(File(dir, META), cipher.seal(bytes))
+        WipeGuard.guardedWrite("file vault") { atomicWrite(File(dir, META), cipher.seal(bytes)) }
     }
 
     private fun loadMeta(dir: File): Info {

@@ -34,13 +34,14 @@ object AudioSwitches {
         }
 
     /**
-     * `test_audio_off_main` (Experimental, default off): AudioRecord/AudioTrack/AudioManager teardown (and the
+     * `test_audio_off_main` (default on since 2026-11-09; false is the control arm): AudioRecord/AudioTrack/AudioManager teardown (and the
      * opt-in [MicrophoneOpusEncoder.startOffMain]) run on the serialized [AudioCommandQueue] instead of the
      * caller's main thread. Aimed at the M31/Exynos 9611 audio ANR class (Oboe #1216/#1474).
      */
-    @Volatile var offMainThread: Boolean = false
+    @Volatile var offMainThread: Boolean = true
         set(value) {
-            field = value && BuildConfig.DEBUG
+            // Default on: a release build keeps it on; a DEBUG launch can pass false as the control arm.
+            field = value || !BuildConfig.DEBUG
         }
 
     /**
@@ -90,7 +91,7 @@ object AudioSwitches {
     fun applyExtras(boolExtra: (String, Boolean) -> Boolean) {
         captureSourceFallback = boolExtra("test_capture_source_fallback", false)
         captureSilenceEvidence = boolExtra("test_capture_silence_evidence", true)
-        offMainThread = boolExtra("test_audio_off_main", false)
+        offMainThread = boolExtra("test_audio_off_main", true)
         modeChangeWait = boolExtra("test_audio_mode_change_wait", false)
         usbHeadsetModeNormal = boolExtra("test_audio_usb_headset_mode_normal", false)
         complexityGovernor = boolExtra("test_audio_complexity_governor", false)

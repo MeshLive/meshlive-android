@@ -103,6 +103,7 @@ internal object Bmh3Wiring {
         relayEdges: Boolean = false,
         relayHop: DiscoveryAnnouncement? = null,
         contactHelper: DiscoveryAnnouncement? = null,
+        wifiMarker: Boolean = false,
     ): Bmh3AttemptPlan {
         if (qrScan == null && !Bmh3Feature.enabled) return Bmh3AttemptPlan.OFF
         val pins = Bmh3Android.pins(context)
@@ -120,6 +121,7 @@ internal object Bmh3Wiring {
             leaseSource = if (rotatingIds) PresenceLeaseSource else null,
             log = Bmh3Android::log,
             relayRoute = Bmh3AttemptPlan.RelayRoute(relayEdges, relayHop, contactHelper),
+            wifiMarker = wifiMarker,
         )
     }
 
@@ -134,23 +136,31 @@ internal object Bmh3Wiring {
         relayEdges: Boolean = false,
         relayHop: DiscoveryAnnouncement? = null,
         contactHelper: DiscoveryAnnouncement? = null,
+        wifiMarker: Boolean = false,
     ): Bmh3InitiatorOptions? =
-        plan(context, selected, rotatingIds, pseudonyms, relayEdges = relayEdges, relayHop = relayHop, contactHelper = contactHelper)
-            .initiator(layer)
+        plan(
+            context, selected, rotatingIds, pseudonyms, relayEdges = relayEdges, relayHop = relayHop,
+            contactHelper = contactHelper, wifiMarker = wifiMarker,
+        ).initiator(layer)
 
     /**
      * Amendment CP: the options factory of a helper's onward relay edge toward [hop] (BMH3, a declared throwaway fresh per
      * connection), or null for BMH2, which is chosen only while pseudonym mode is off and the direct-call choice allows it.
      * Decided once per duty, so a retry never falls back from BMH3 to BMH2.
      */
-    fun relayHop(context: Context, hop: DiscoveryAnnouncement, rotatingIds: Boolean): (() -> Bmh3InitiatorOptions)? {
+    fun relayHop(
+        context: Context,
+        hop: DiscoveryAnnouncement,
+        rotatingIds: Boolean,
+        wifiMarker: Boolean = false,
+    ): (() -> Bmh3InitiatorOptions)? {
         if (!Bmh3Feature.enabled) return null
         val pseudonymMode = Bmh3PseudonymFeature.active(rotatingIds)
         val pinned = runCatching { Bmh3Android.pins(context).pinState(hop.nodeIdPrefix) != Bmh3Pins.PinState.UNPINNED }.getOrDefault(true)
         val bmh3 = Bmh3Policy.relayHopUsesBmh3(true, Bmh3Feature.only, pseudonymMode, hop, pinned)
         Bmh3Android.log("bmh3: event=relay_hop | version=${if (bmh3) 3 else 2} | pseudonymMode=$pseudonymMode")
         if (!bmh3) return null
-        return { Bmh3Policy.relayHopOptions(hop, log = Bmh3Android::log) }
+        return { Bmh3Policy.relayHopOptions(hop, log = Bmh3Android::log).withWifiMarker(wifiMarker) }
     }
 
     /**

@@ -149,9 +149,14 @@ class MessagingV2EngineTest {
         bob.engine.sendText(alice.nodeId, "reply")
         rig.clockMs.addAndGet(1_000)
         alice.engine.sendText(bob.nodeId, "two")
-        val result = rig.sync(alice, bob)
-        assertEquals(2, result.responder.v2Messages.size)
-        assertEquals(1, result.initiator.v2Messages.size)
+        val logs = ArrayList<String>()
+        val result = rig.sync(alice, bob, logs = logs)
+        // The outcomes first, with both sessions' lines: a count alone does not say how an exchange ended.
+        val sessions = synchronized(logs) { logs.filter { "store_forward session" in it || "deadline" in it } }
+        assertEquals("initiator: $sessions", StoreForwardSyncOutcome.COMPLETE, result.initiator.outcome)
+        assertEquals("responder: $sessions", StoreForwardSyncOutcome.COMPLETE, result.responder.outcome)
+        assertEquals("responder: $sessions", 2, result.responder.v2Messages.size)
+        assertEquals("initiator: $sessions", 1, result.initiator.v2Messages.size)
         assertEquals(listOf("one", "reply", "two"), alice.engine.threads.forPeer(bob.nodeId.toString()).map { it.text })
         assertEquals(listOf("one", "reply", "two"), bob.engine.threads.forPeer(alice.nodeId.toString()).map { it.text })
     }

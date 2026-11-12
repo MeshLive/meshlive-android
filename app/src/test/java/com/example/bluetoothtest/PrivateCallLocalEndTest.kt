@@ -41,6 +41,30 @@ class PrivateCallLocalEndTest {
     }
 
     @Test
+    fun aCarrierEofRacingMyHangUpStillEndsAsCallEnded() {
+        // The user pressed End (phase ENDED by this phone); the last carrier then ended with no loss error recorded.
+        val ended = PrivateCallState(call, PrivateCallRole.CALLER, PrivateCallPhase.ACTIVE).transition(PrivateCallEvent.LOCAL_HANG_UP)
+        assertEquals(
+            EndSessionAction.FINISH_LOCAL_END,
+            privateCallEndSessionAction(hasLossError = false, callRunning = true, phase = ended.phase, callId = call, localEndCallId = call),
+        )
+        // The same with a recorded error: still the ordinary local end.
+        assertEquals(
+            EndSessionAction.FINISH_LOCAL_END,
+            privateCallEndSessionAction(true, true, ended.phase, call, call),
+        )
+        assertEquals("Call ended", CALL_ENDED_MESSAGE)
+    }
+
+    @Test
+    fun aLostLastCarrierWithoutALocalEndStillFailsAsCallLinkLost() {
+        assertEquals(EndSessionAction.FAIL, privateCallEndSessionAction(false, true, PrivateCallPhase.ACTIVE, call, null))
+        assertEquals(EndSessionAction.FAIL, privateCallEndSessionAction(false, true, PrivateCallPhase.ENDED, call, null))
+        assertEquals(EndSessionAction.FAIL, privateCallEndSessionAction(false, true, PrivateCallPhase.ENDED, call, UUID.randomUUID()))
+        assertEquals(EndSessionAction.LINK_ERROR, privateCallEndSessionAction(true, true, PrivateCallPhase.ACTIVE, call, null))
+    }
+
+    @Test
     fun cancelAfterTheCalleeAnsweredHangsUp() {
         assertEquals(CallCancelStep.CANCEL, privateCallCancelStep(PrivateCallPhase.OUTGOING_INVITE))
         assertEquals(CallCancelStep.CANCEL, privateCallCancelStep(PrivateCallPhase.OUTGOING_RINGING))

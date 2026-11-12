@@ -146,13 +146,23 @@ internal class AdaptivePhyLink(
      * default applies the plan only where the `android13-phy-update-callback-backstop` entry applies.
      */
     private val waitPlan: PhyWaitPlan? = defaultBackstopPlan(),
+    /**
+     * Experimental `test_phy_direction_split`: ms since the peer's last data on this link, -1 before any
+     * ([GattBytePipe.quietMs]); the receive-silence signal of [PhyDirectionSplit].
+     */
+    private val peerQuietMs: () -> Long = { -1L },
+    /** Experimental `test_phy_direction_split`: the split this link asked for at setup (remembered for the peer), or null. */
+    private val startSplit: GattPhySplit? = null,
 ) {
     private var policy = AdaptivePhyPolicy()
     @Volatile private var txPhy = 0
     @Volatile private var moved = false
 
     /** Experimental adaptive split ([adaptiveSplitFor]): the split this link was moved to, or null (not tried). */
-    @Volatile private var splitApplied: GattPhySplit? = null
+    @Volatile private var splitApplied: GattPhySplit? = startSplit
+
+    /** Experimental `test_phy_direction_split`: which direction of this link moved, step by step. */
+    private val direction = PhyDirectionSplit().also { it.startedSplit(startSplit) }
     @Volatile private var splitMover: PhyMoveRequester? = null
     private var reanchors = 0
 
@@ -246,12 +256,29 @@ internal class AdaptivePhyLink(
             return
         }
         if (!DebugTunables.adaptivePhy) return
+        // Experimental test_phy_direction_split: the peer went silent while this phone's own writes still complete.
+        if (directionSplitOn() && !(RelayUpstream.active && DebugTunables.relayPhyGuard)) {
+            val tick = direction.onTick(
+                clock(),
+                onTwoM = txPhy == LePhy.TWO_M && splitApplied == null,
+                writerFlowing = blockedMs < PhyDirectionSplit.FLOWING_WRITE_BLOCK_MS,
+                quietMs = peerQuietMs(),
+            )
+            if (applyDirection(tick, intervalMs, oneEvent)) return
+        }
         when (verdict) {
             AdaptivePhyPolicy.Verdict.NONE -> Unit
-            AdaptivePhyPolicy.Verdict.KEEP -> log("from=2M to=2M", "kept", intervalMs, oneEvent)
+            AdaptivePhyPolicy.Verdict.KEEP -> {
+                log("from=2M to=2M", "kept", intervalMs, oneEvent)
+                if (directionSplitOn()) applyDirection(direction.onVerdict(writerFailed = false, reason = "kept"), intervalMs, oneEvent)
+            }
             AdaptivePhyPolicy.Verdict.STALLED -> if (
                 stalledTwoMShouldMove(DebugTunables.stalledTwoMMove, RelayUpstream.active && DebugTunables.relayPhyGuard, peerHeard())
             ) {
+                if (directionSplitOn()) {
+                    applyDirection(direction.onVerdict(writerFailed = true, reason = "stalled_one_way"), intervalMs, oneEvent)
+                    return
+                }
                 if (trySplit("stalled_one_way", intervalMs, oneEvent)) return
                 moved = true
                 val queued = moveTo1M()
@@ -278,6 +305,10 @@ internal class AdaptivePhyLink(
                     log("from=2M to=2M", "relay_scheduling | action=none", intervalMs, oneEvent)
                 }
             } else {
+                if (directionSplitOn()) {
+                    applyDirection(direction.onVerdict(writerFailed = true, reason = "one_pdu_per_event"), intervalMs, oneEvent)
+                    return
+                }
                 if (trySplit("one_pdu_per_event", intervalMs, oneEvent)) return
                 moved = true
                 val queued = moveTo1M()
@@ -309,6 +340,16 @@ internal class AdaptivePhyLink(
         val split = adaptiveSplitFor(
             DebugTunables.adaptivePhySplit, link, DebugTunables.experimentalPhySplit, DebugTunables.experimentalBlePhy, splitApplied != null,
         ) ?: return false
+        return queueSplit(split, "$verdict | queued=true | memory=none", intervalMs, oneEvent)
+    }
+
+    /**
+     * Asks this central for [split]. Once queued: logged (`from=` the previous split, or 2M), the decision re-armed and the
+     * stream sender's backlog skip run; false when the request could not be queued (nothing changed).
+     */
+    @SuppressLint("MissingPermission")
+    private fun queueSplit(split: GattPhySplit, reason: String, intervalMs: Double, oneEvent: Int): Boolean {
+        val from = splitApplied?.let(::adaptiveSplitLabel) ?: "2M"
         val requester = PhyMoveRequester(
             link = link,
             requestPhy = {
@@ -327,10 +368,50 @@ internal class AdaptivePhyLink(
         if (!queued) return false
         splitMover = requester
         splitApplied = split
-        log("from=2M to=${adaptiveSplitLabel(split)}", "$verdict | queued=true | memory=none", intervalMs, oneEvent)
+        log("from=$from to=${adaptiveSplitLabel(split)}", reason, intervalMs, oneEvent)
         policy = AdaptivePhyPolicy()
         runCatching { onMovedTo1M() }
         return true
+    }
+
+    /** Experimental `test_phy_direction_split` runs on this link ([phyDirectionSplitFor]). */
+    private fun directionSplitOn(): Boolean = phyDirectionSplitFor(
+        DebugTunables.phyDirectionSplit, link, DebugTunables.experimentalPhySplit, DebugTunables.experimentalBlePhy,
+    )
+
+    /** Carries out one [PhyDirectionSplit] action on this link; true when it did something. */
+    private fun applyDirection(action: PhyDirectionSplit.Action, intervalMs: Double, oneEvent: Int): Boolean {
+        val split = action.split
+        when (action.kind) {
+            PhyDirectionSplit.Kind.NONE -> return false
+            PhyDirectionSplit.Kind.SPLIT -> {
+                if (split == null) return false
+                val reason = "${action.reason} | direction=${phySplitDirectionLabel(split)} | step=${action.step} | " +
+                    "queued=true | memory=pending"
+                if (!queueSplit(split, reason, intervalMs, oneEvent)) directionFullMove(action.reason, intervalMs, oneEvent)
+            }
+            PhyDirectionSplit.Kind.FULL -> directionFullMove(action.reason, intervalMs, oneEvent)
+            PhyDirectionSplit.Kind.REMEMBER -> {
+                if (split == null) return false
+                AdaptivePhyMemory.recordSplitForAddress(address, split, action.reason)
+            }
+            PhyDirectionSplit.Kind.UNPROVEN -> {
+                val label = split?.let(::adaptiveSplitLabel) ?: "2M"
+                log("from=$label to=$label", "${action.reason} | proven=false | memory=none", intervalMs, oneEvent)
+            }
+        }
+        return true
+    }
+
+    /** The full move after the direction steps (or when a split could not be queued): the old full move, memory and all. */
+    @SuppressLint("MissingPermission")
+    private fun directionFullMove(reason: String, intervalMs: Double, oneEvent: Int) {
+        moved = true
+        val queued = moveTo1M()
+        val from = splitApplied?.let(::adaptiveSplitLabel) ?: "2M"
+        log("from=$from to=1M", "$reason | queued=$queued$afterSplit", intervalMs, oneEvent)
+        AdaptivePhyMemory.recordBadForAddress(address, reason)
+        if (queued) runCatching { onMovedTo1M() }
     }
 
     /** Asks for 1M: through the LL procedure gate when there is one (and it is on), else straight to the stack. */
@@ -381,86 +462,53 @@ internal object AdaptivePhyRegistry {
 }
 
 /**
- * The bad-2M marks of [AdaptivePhyMemory]: `key -> epoch ms` (purge flags are marks with the value 1), held in memory
- * and written sealed ([SealedTextFile]) off the caller's thread after each change. Review 2026-10-27 (finding 6): the
- * keys carry the node labels of peers this phone met, which were plain preferences before.
+ * The bad-2M marks of [AdaptivePhyMemory]: `key -> epoch ms` (purge flags are marks with the value 1). Review 2026-10-27
+ * (finding 6): the keys carry the node labels of peers this phone met, which were plain preferences before. PRIV1
+ * re-review S4: the marks are a [SealedRecords] store (one per process, read and written on the sealed-memory worker,
+ * which the emergency wipe drains), no longer their own thread and a decrypt on the caller's thread at every attach.
  */
-internal class AdaptivePhyMarks(private val file: SealedTextFile?, private val writeAsync: Boolean = true) {
-    private val values = ConcurrentHashMap<String, Long>()
-    private val writer = java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "AdaptivePhyMarks").apply { isDaemon = true }
-    }
-
-    /** False while the sealed file could not be read (a passing failure): it is never written over then. */
-    @Volatile private var loadedFromFile = file == null
-
-    init {
-        reloadIfNeeded()
-    }
-
-    /** Reads the stored marks once they can be read; marks recorded meanwhile in this process win. */
-    @Synchronized
-    private fun reloadIfNeeded(): Boolean {
-        if (loadedFromFile) return true
-        val sealed = file ?: return true
-        val text = try {
-            sealed.read()
-        } catch (unavailable: SealedTextUnavailable) {
-            return false
-        } catch (other: Exception) {
-            null
-        }
-        val recent = HashMap(values)
-        text?.let(::decodeInto)
-        values.putAll(recent)
-        loadedFromFile = true
-        return true
-    }
-
-    fun get(key: String): Long? = values[key]
+internal class AdaptivePhyMarks(private val records: SealedRecords) {
+    fun get(key: String): Long? = records.get(key)?.value?.toLongOrNull()
 
     fun put(key: String, value: Long) {
-        values[key] = value
-        persist()
+        records.put(key, value.toString())
     }
 
-    fun flag(key: String): Boolean = (values[key] ?: 0L) != 0L
+    fun flag(key: String): Boolean = (get(key) ?: 0L) != 0L
 
-    fun keys(): Set<String> = values.keys.toSet()
+    fun keys(): Set<String> = records.keys()
 
-    fun all(): Map<String, Long> = HashMap(values)
+    fun all(): Map<String, Long> = records.all().mapNotNull { (key, record) -> record.value.toLongOrNull()?.let { key to it } }.toMap()
 
     fun remove(keys: Collection<String>, setFlag: String? = null) {
-        keys.forEach { values.remove(it) }
-        setFlag?.let { values[it] = 1L }
-        if (keys.isNotEmpty() || setFlag != null) persist()
+        if (keys.isNotEmpty()) records.remove(keys)
+        setFlag?.let { records.put(it, "1") }
     }
 
-    /** The plain preferences of an earlier build: Long marks and Boolean purge flags. */
-    fun importLegacy(entries: Map<String, *>) {
-        entries.forEach { (key, value) ->
-            when (value) {
-                is Long -> values[key] = value
-                is Boolean -> if (value) values[key] = 1L
-            }
-        }
-        persist()
+    /** Keeps only the marks [keep] accepts, also those not read yet (replayed onto the file once it loads). */
+    fun retain(keep: (String) -> Boolean) {
+        records.retain(keep)
     }
 
-    fun encode(): String = values.entries.sortedBy { it.key }.joinToString("\n") { "${it.key}=${it.value}" }
+    fun isLoaded(): Boolean = records.isLoaded()
 
-    private fun decodeInto(text: String) {
-        text.lineSequence().forEach { line ->
+    fun whenLoaded(action: () -> Unit) = records.whenLoaded(action)
+
+    companion object {
+        /** The `key=value` text of the sealed file the marks used until PRIV1. */
+        fun decodeOld(text: String): Map<String, Long> = text.lineSequence().mapNotNull { line ->
             val at = line.lastIndexOf('=')
-            if (at <= 0) return@forEach
-            line.substring(at + 1).toLongOrNull()?.let { values[line.substring(0, at)] = it }
-        }
-    }
+            if (at <= 0) null else line.substring(at + 1).toLongOrNull()?.let { line.substring(0, at) to it }
+        }.toMap()
 
-    private fun persist() {
-        val sealed = file ?: return
-        val write = Runnable { if (reloadIfNeeded()) runCatching { sealed.write(encode()) } }
-        if (writeAsync) writer.execute(write) else write.run()
+        /** Plain preferences of builds before 2026-10-27: Long marks and Boolean purge flags. */
+        fun fromPreferences(entries: Map<String, *>): Map<String, Long> = entries.mapNotNull { (key, value) ->
+            when (value) {
+                is Long -> key to value
+                is Boolean -> if (value) key to 1L else null
+                else -> null
+            }
+        }.toMap()
     }
 }
 
@@ -502,29 +550,56 @@ internal object AdaptivePhyMemory {
     const val REDISCOVER_MS = 8_000L
     private const val PREFS = "adaptive_phy_memory"
 
-    /** The marks (node labels of peers this phone met) in a sealed file since 2026-10-27 (review finding 6). */
-    @Volatile private var prefs: AdaptivePhyMarks? = null
+    /** The marks (node labels of peers this phone met), sealed since 2026-10-27 (review finding 6). */
+    @Volatile private var marksContext: Context? = null
+
+    /** Looked up per use: one store per process, and a fresh one after a wipe resumed in this process. */
+    private val prefs: AdaptivePhyMarks?
+        get() = marksContext?.let { AdaptivePhyMarks(marksSlot.get(it)) }
     private val addressHops = ConcurrentHashMap<String, Pair<BluetoothTransportOption, String>>()
-    private const val SEALED_FILE = "adaptive-phy-memory.bin"
+    /** The sealed `key=value` file of 2026-10-27 to PRIV1; moved into [MARKS_FILE] and deleted. */
+    private const val OLD_SEALED_FILE = "adaptive-phy-memory.bin"
+    internal const val MARKS_FILE = "adaptive-phy-marks.bin"
+    /** A bound only: one mark or split per peer, transport and direction. */
+    private const val MARKS_MAX = 1024
+    private val marksSlot = SealedRecordsSlot(MARKS_FILE, MARKS_MAX) { app -> legacyMarks(app) }
+
+    /** The marks of earlier builds: the plain preferences and the old sealed file (a cache, deleted after the move). */
+    internal fun legacyMarks(app: Context) = object : LegacyPlain {
+        private val oldFile = File(app.noBackupFilesDir, OLD_SEALED_FILE)
+
+        override fun read(): Map<String, SealedRecords.Record> {
+            val now = System.currentTimeMillis()
+            val plain = runCatching { app.getSharedPreferences(PREFS, Context.MODE_PRIVATE).all }.getOrDefault(emptyMap<String, Any?>())
+            // A busy Keystore throws here: the move is retried, the old file is never deleted unread.
+            val sealed = SealedTextFile(oldFile, { SealedRecords.cipher() }).read()
+            val marks = AdaptivePhyMarks.fromPreferences(plain) + sealed?.let(AdaptivePhyMarks::decodeOld).orEmpty()
+            return marks.mapValues { (_, value) -> SealedRecords.Record(value.toString(), now) }
+        }
+
+        override fun clean(): Boolean {
+            SealedTextFile(oldFile, { SealedRecords.cipher() }).delete()
+            return PlainPreferences.deleteFile(app, PREFS) && !oldFile.exists()
+        }
+
+        override val cache = true
+    }
 
     fun attach(context: Context) {
         // The persistent link-change rollback memory (Experimental test_link_change_rollback) and the learned
         // child-link limit share this startup hook.
         runCatching { LinkChangeRollbacks.attach(context) }
         runCatching { DualRoleProbes.attach(context) }
-        val app = context.applicationContext
-        val marks = AdaptivePhyMarks(SealedTextFile(File(app.noBackupFilesDir, SEALED_FILE), { IdentityVerification.atRestCipher() }))
-        // Earlier builds kept the marks in plain preferences: moved once into the sealed file, then deleted.
-        runCatching {
-            val legacy = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            if (legacy.all.isNotEmpty()) {
-                marks.importLegacy(legacy.all)
-                legacy.edit().clear().commit()
-            }
-            app.deleteSharedPreferences(PREFS)
-        }
-        prefs = marks
-        val store = marks
+        marksContext = context.applicationContext
+        val marks = prefs ?: return
+        // The purges read the stored marks, so they run once those are loaded (on the worker, or here if already loaded).
+        marks.whenLoaded { purge(marks) }
+    }
+
+    /** The one-time purges, and the marks no TTL reads any more (deleted from the file, not only ignored). */
+    private fun purge(store: AdaptivePhyMarks, nowMs: Long = System.currentTimeMillis()) {
+        val expired = store.all().filter { (key, at) -> isMark(key) && !fresh(at, nowMs, TTL_MS) }.keys
+        if (expired.isNotEmpty()) store.remove(expired)
         val stale = store.keys().filter { it.startsWith("bad2m.") }
         if (stale.isNotEmpty()) {
             store.remove(stale)
@@ -589,18 +664,25 @@ internal object AdaptivePhyMemory {
     internal fun ttlMs(recovery: Boolean = DebugTunables.ceilingProbeRecovery): Long =
         if (recovery) RECOVERY_TTL_MS else TTL_MS
 
-    /** DEBUG: removes every bad-2M mark (direct and via); returns how many. */
-    fun clearAll(): Int {
-        val store = prefs ?: return 0
-        val keys = store.keys().filter { it.startsWith("bad2m") }
-        if (keys.isNotEmpty()) store.remove(keys)
-        return keys.size
+    /**
+     * DEBUG: removes every bad-2M mark (direct and via), every remembered split and the own-controller 2M memory ([isMark]);
+     * returns how many, or
+     * `pending` while the marks are still loading (the removal is replayed onto them).
+     */
+    fun clearAll(): String {
+        ownTwoMOverride?.let(OwnControllerTwoM::clear)
+        val store = prefs ?: return "0"
+        val loaded = store.isLoaded()
+        val known = store.keys().count { isMark(it) }
+        store.retain { !isMark(it) }
+        return if (loaded) "$known" else "pending"
     }
 
     /** DEBUG launch record: every bad-2M mark with its age in hours and whether it is still fresh. */
     fun summary(nowMs: Long = System.currentTimeMillis()): String {
         val store = prefs ?: return "unavailable"
-        val marks = store.all().filterKeys { it.startsWith("bad2m") }
+        if (!store.isLoaded()) return "loading"
+        val marks = store.all().filterKeys { isMark(it) }
         if (marks.isEmpty()) return "none"
         return marks.entries.sortedBy { it.key }.joinToString(" | ") { (key, value) ->
             val at = value
@@ -650,6 +732,91 @@ internal object AdaptivePhyMemory {
     }
 
     /**
+     * Experimental `test_phy_direction_split` ([PhyDirectionSplit]): the split that kept a GATT link to a peer working, per
+     * transport and authenticated hop node, beside the bad-2M marks (the same sealed store, [TTL_MS], reset and summary).
+     */
+    internal fun splitKey(transport: BluetoothTransportOption, split: GattPhySplit, node: String) =
+        "split$FORMAT.${split.debugValue}.${transport.name}.$node"
+
+    /**
+     * A learned mark of this memory (bad on 2M, a remembered split, or the own-controller 2M memory [OwnControllerTwoM]): what a
+     * reset clears and the launch line lists.
+     */
+    internal fun isMark(key: String): Boolean =
+        key.startsWith("bad2m") || key.startsWith("split$FORMAT.") || key.startsWith(OwnControllerTwoM.PREFIX)
+
+    /** The fresh split remembered for [node] on [transport] in [marks] (the newer of the two directions), or null. */
+    internal fun rememberedSplit(
+        marks: Map<String, Long>,
+        transport: BluetoothTransportOption,
+        node: String,
+        nowMs: Long,
+        ttlMs: Long = ttlMs(),
+    ): GattPhySplit? = GattPhySplit.entries
+        .mapNotNull { split -> marks[splitKey(transport, split, node)]?.takeIf { fresh(it, nowMs, ttlMs) }?.let { split to it } }
+        .maxByOrNull { it.second }
+        ?.first
+
+    /**
+     * The split a new GATT link to [node] asks for at setup, or null (switch off, memory off, not GATT, no fresh mark, or the
+     * peer is remembered bad on 2M, where the full 1M wins). Line: `adaptive_phy: link=<link> ... reason=remembered_split`.
+     */
+    fun splitFor(
+        transport: BluetoothTransportOption,
+        node: String,
+        link: String,
+        nowMs: Long = System.currentTimeMillis(),
+    ): GattPhySplit? {
+        if (!DebugTunables.phyDirectionSplit || !enabled || transport != BluetoothTransportOption.BLE_GATT || node.isEmpty()) {
+            return null
+        }
+        if (isBad(transport, node, nowMs)) return null
+        val store = prefs ?: return null
+        val split = rememberedSplit(store.all(), transport, node, nowMs) ?: return null
+        Log.i(
+            "BluetoothVideo",
+            "BENCHMARK adaptive_phy: link=$link | node=${logLabel(node)} | from=2M to=${adaptiveSplitLabel(split)} | " +
+                "reason=remembered_split | at=connect",
+        )
+        return split
+    }
+
+    /** Remembers [split] for [node] (replacing the other direction); not while this phone relays a stream upstream. */
+    fun recordSplit(transport: BluetoothTransportOption, node: String, split: GattPhySplit, reason: String) {
+        if (!enabled || transport != BluetoothTransportOption.BLE_GATT || node.isEmpty()) return
+        if (RelayUpstream.active && DebugTunables.relayPhyGuard) {
+            Log.i(
+                "BluetoothVideo",
+                "BENCHMARK adaptive_phy: link=memory | node=${logLabel(node)} | split=${split.debugValue} | recorded=false | " +
+                    "reason=$reason | relay_upstream=true",
+            )
+            return
+        }
+        val store = prefs ?: return
+        store.remove(GattPhySplit.entries.filter { it != split }.map { splitKey(transport, it, node) })
+        store.put(splitKey(transport, split, node), System.currentTimeMillis())
+        Log.i(
+            "BluetoothVideo",
+            "BENCHMARK adaptive_phy: link=memory | node=${logLabel(node)} | transport=${transport.name} | " +
+                "split=${split.debugValue} | recorded=true | reason=$reason",
+        )
+    }
+
+    /** [recordSplit] for the hop node authenticated on the link to [address]; a relaying hop is no evidence. */
+    fun recordSplitForAddress(address: String?, split: GattPhySplit, reason: String) {
+        val (transport, node) = address?.let(addressHops::get) ?: return
+        if (skipsRelayingHop(address in relayingHops, DebugTunables.relayPhyGuard)) {
+            Log.i(
+                "BluetoothVideo",
+                "BENCHMARK adaptive_phy: link=memory | node=${logLabel(node)} | split=${split.debugValue} | recorded=false | " +
+                    "reason=$reason | hop_relays=true",
+            )
+            return
+        }
+        recordSplit(transport, node, split, reason)
+    }
+
+    /**
      * A link to a hop that is itself relaying shares that relay's radio with its other hop, so its
      * one-PDU windows are not evidence about the pair's 2M. relaycall-f40e9f42 0002: the ASUS caller
      * moved its link to the S24 call relay at 122 kbps and remembered the S24 as bad-2M; mesh streams
@@ -695,7 +862,8 @@ internal object AdaptivePhyMemory {
      * PHY to request for a new link to the direct peer advertising [nodePrefix] on [transport]:
      * 1M while that peer is remembered bad on 2M, otherwise [default]. [memoryNode] is the direct peer's memory key
      * ([offerMemoryNode]: the advertised prefix, or a recognised rotating offer's contact node); null means none (an
-     * unrecognised rotating offer), so the memories are not consulted.
+     * unrecognised rotating offer), so the peer memories are not consulted; only the Experimental own-controller mark
+     * ([ownControllerPhy]) can then move it to 1M.
      */
     fun phyFor(
         transport: BluetoothTransportOption,
@@ -706,7 +874,7 @@ internal object AdaptivePhyMemory {
         memoryNode: String? = prefixLabel(nodePrefix),
     ): BlePhyPreference {
         val advertised = prefixLabel(nodePrefix)
-        val node = if (relayedOffer) advertised else memoryNode ?: return default
+        val node = if (relayedOffer) advertised else memoryNode ?: return ownControllerPhy(transport, default, link)
         val keySource = if (node == advertised) "prefix" else "contact"
         // A relayed offer is advertised by the hop relay with the far callee's prefix, so the hop's own
         // node is unknown before connecting; its entry is kept under that advertised prefix instead.
@@ -735,6 +903,88 @@ internal object AdaptivePhyMemory {
     }
 
     internal fun prefixLabel(nodePrefix: ByteArray): String = nodePrefix.joinToString("") { "%02x".format(it) }
+
+    /** Tests only: a map-backed store for [OwnControllerTwoM] in place of the sealed marks (null: the marks). */
+    @Volatile internal var ownTwoMOverride: OwnControllerTwoM.Store? = null
+
+    private val ownTwoMStore: OwnControllerTwoM.Store?
+        get() = ownTwoMOverride ?: prefs?.let { marks ->
+            object : OwnControllerTwoM.Store {
+                override fun get(key: String) = marks.get(key)
+                override fun put(key: String, value: Long) = marks.put(key, value)
+                override fun remove(keys: Collection<String>) = marks.remove(keys)
+            }
+        }
+
+    private val ownTwoMEnabled: Boolean
+        get() = PhySwitches.own2mMemory && enabled
+
+    /**
+     * Experimental `test_own_2m_memory` ([OwnControllerTwoM]): [default] for a link to a peer with no memory key, or full 1M
+     * while this phone's own-controller mark is fresh. Only the 2M default on an LE transport moves; a `test_ble_phy` arm keeps
+     * its PHY. Line: `adaptive_phy: link=<link> | node=none | from=2M to=1M | reason=own_controller_2m | at=connect`.
+     */
+    internal fun ownControllerPhy(
+        transport: BluetoothTransportOption,
+        default: BlePhyPreference,
+        link: String,
+        nowMs: Long = System.currentTimeMillis(),
+    ): BlePhyPreference {
+        if (!ownTwoMEnabled || transport == BluetoothTransportOption.CLASSIC_RFCOMM || default != BlePhyPreference.TWO_M ||
+            DebugTunables.experimentalBlePhy != null
+        ) {
+            return default
+        }
+        val store = ownTwoMStore ?: return default
+        if (!OwnControllerTwoM.marked(store, nowMs, ttlMs())) return default
+        runCatching {
+            Log.i(
+                "BluetoothVideo",
+                "BENCHMARK adaptive_phy: link=$link | node=none | from=2M to=1M | reason=own_controller_2m | at=connect | key=none",
+            )
+        }
+        return BlePhyPreference.ONE_M_ADAPTIVE
+    }
+
+    /**
+     * A symmetric 2M setup this phone dialed as central stalled ([OwnControllerTwoM.symmetricTwoMSetup]); not while this phone
+     * relays a stream upstream (its radio is shared then). Lines: `adaptive_phy: link=memory | own_controller_2m=pending|marked|
+     * refreshed | stalls=<n>/<needed> | windowH=24 | ttlH=<h> | reason=<reason>`.
+     */
+    fun recordOwnTwoMStall(reason: String, nowMs: Long = System.currentTimeMillis()) {
+        if (!ownTwoMEnabled) return
+        if (RelayUpstream.active && DebugTunables.relayPhyGuard) return
+        val store = ownTwoMStore ?: return
+        val ttl = ttlMs()
+        val result = OwnControllerTwoM.recordStall(store, nowMs, ttl)
+        val state = when {
+            result.refreshed -> "refreshed"
+            result.marked -> "marked"
+            else -> "pending"
+        }
+        runCatching {
+            Log.i(
+                "BluetoothVideo",
+                "BENCHMARK adaptive_phy: link=memory | own_controller_2m=$state | stalls=${result.stalls}/${OwnControllerTwoM.STALLS_TO_MARK} | " +
+                    "windowH=${OwnControllerTwoM.STALL_WINDOW_MS / 3_600_000L} | ttlH=${ttl / 3_600_000L} | reason=$reason",
+            )
+        }
+    }
+
+    /** A symmetric 2M setup this phone dialed as central authenticated within the stall guard: counts toward clearing the mark. */
+    fun recordOwnTwoMSuccess(nowMs: Long = System.currentTimeMillis()) {
+        if (!ownTwoMEnabled) return
+        val store = ownTwoMStore ?: return
+        val result = OwnControllerTwoM.recordSuccess(store, nowMs, ttlMs())
+        if (result == OwnControllerTwoM.SuccessResult.NOT_MARKED) return
+        runCatching {
+            Log.i(
+                "BluetoothVideo",
+                "BENCHMARK adaptive_phy: link=memory | own_controller_2m=${if (result == OwnControllerTwoM.SuccessResult.CLEARED) "cleared" else "clean_setup"} | " +
+                    "needed=${OwnControllerTwoM.SUCCESSES_TO_CLEAR} | reason=symmetric_2m_setup",
+            )
+        }
+    }
 
     /**
      * A peer's node label in a log line: DEBUG builds keep it for the benchmark tools; a release log names no peer
@@ -962,10 +1212,52 @@ internal object StallRediscover {
         return if (stalled && arm > DEFAULT_MS) arm else earlyLossRemainingMs.coerceIn(0L, DEFAULT_MS)
     }
 
+    /**
+     * LE supervision timeout of a call link: AOSP's default LE connection parameters (BTM_BLE_CONN_TIMEOUT_DEF,
+     * 500 x 10 ms) and every measured link of a15s-rootcause-20261104 (ASUS/S22/M31 HCI: Disconnection_Complete 0x08
+     * 4.95-5.01 s after the peer went quiet).
+     */
+    const val LE_SUPERVISION_TIMEOUT_MS = 5_000L
+
+    /**
+     * Time for the callee's next advertisement to reach a running scan (measured 0.06-0.08 s; scan duty cycle) plus the
+     * spread of release-window-ab-20261104 (the two on-arm misses re-advertised 0.05 s and 0.92 s after the scan ended).
+     */
+    const val SCAN_SLACK_MS = 2_000L
+
+    /** The GATT callee's pause before it advertises again (the private MainActivity.GATT_CALL_RESTART_DELAY_MS; keep equal). */
+    const val CALLEE_GATT_RESTART_MS = 1_500L
+
+    /** The release window never exceeds this, so an absent callee is reported within a bounded time. */
+    const val RELEASE_CAP_MS = 20_000L
+
+    /**
+     * `test_rediscover_release_window` (on by default since 2026-11-04; `false` is the DEBUG control arm): how long the callee can take to release a link this
+     * phone could not close, derived from the link's own timers instead of a fixed clock. After our own stall close
+     * the peer may never receive LL_TERMINATE (A15s -> ASUS on 2M: no ACL packet acknowledged after the PHY update),
+     * so it releases only one supervision timeout after this phone's controller goes quiet, which itself took 1.6-11.5 s
+     * after the close in release-window-ab-20261104 (A15s, Android 10): 3 x. After a loss this phone observed (status 8) the peer is at most one
+     * supervision timeout behind. A GATT callee then waits [calleeRestartMs] before advertising again
+     * (MainActivity.GATT_CALL_RESTART_DELAY_MS), a CoC callee 0. Measured worst cases: GATT 12.62 s, CoC 16.60 s after
+     * the close (release-window-ab-20261104); 6.53 s after a status 8 loss.
+     */
+    fun releaseWindowMs(stalled: Boolean, calleeRestartMs: Long): Long =
+        ((if (stalled) 3 else 1) * LE_SUPERVISION_TIMEOUT_MS + calleeRestartMs.coerceAtLeast(0L) + SCAN_SLACK_MS)
+            .coerceAtMost(RELEASE_CAP_MS)
+
+    /** With the release window on, the scan lasts at least that window (a larger configured stall arm still wins). */
+    fun budgetMs(armMs: Long, stalled: Boolean, earlyLossRemainingMs: Long, releaseWindow: Boolean, calleeRestartMs: Long): Long {
+        val earlier = budgetMs(armMs, stalled, earlyLossRemainingMs)
+        return if (releaseWindow) maxOf(earlier, releaseWindowMs(stalled, calleeRestartMs)) else earlier
+    }
+
     /** Which address the retry dials: the fresh advertisement when one arrived within the budget, else the stale one. */
     fun dialsFresh(budgetMs: Long, foundAfterMs: Long?): Boolean = foundAfterMs != null && foundAfterMs in 0..budgetMs
 
     fun line(budgetMs: Long, waitedMs: Long, found: Boolean, sameAddress: Boolean, stalled: Boolean, armMs: Long): String =
         "BENCHMARK call_rediscover: budgetMs=$budgetMs | waitedMs=$waitedMs | found=$found | sameAddress=$sameAddress | " +
             "dialed=${if (found) "fresh" else "stale"} | stalled=$stalled | armMs=${normalize(armMs)}"
+
+    fun line(budgetMs: Long, waitedMs: Long, found: Boolean, sameAddress: Boolean, stalled: Boolean, armMs: Long, releaseWindow: Boolean): String =
+        line(budgetMs, waitedMs, found, sameAddress, stalled, armMs) + (if (releaseWindow) " | releaseWindow=on" else "")
 }

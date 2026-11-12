@@ -78,6 +78,15 @@ internal class AudioCommandQueue(
         }
     }
 
+    /**
+     * [block] with its result delivered to [onResult] on the audio command thread, always queued (never inline, whatever the
+     * off-main switch says), behind every command already queued. JT2 camera-first: the microphone start must follow the call's
+     * queued `call_audio_open`, so the order of the two is the queue's, not the callers'.
+     */
+    fun <T> postForResult(name: String, block: () -> T, onResult: (Result<T>) -> Unit) {
+        post(name) { onResult(runCatching(block)) }
+    }
+
     fun shutdown() {
         worker.shutdown()
         watchdog.shutdownNow()

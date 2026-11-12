@@ -38,6 +38,7 @@ internal class UpdatesHome(
         val release = UpdateRuntime.release(b)
         val tag = if (nearbyOn && release in 1..ReleaseNumber.MAX) BuildTag(release, UpdateRuntime.hasReleaseKey(b)) else null
         LinkBuildTags.local = tag
+        LinkBuildTags.build = if (release in 1..ReleaseNumber.MAX) BuildTag(release, UpdateRuntime.hasReleaseKey(b)) else null
         sink?.let { if (LinkBuildTags.sink === it) LinkBuildTags.sink = null }
         sink = if (nearbyOn) ({ peer: BuildTag -> observe(peer) }) else null
         LinkBuildTags.sink = sink

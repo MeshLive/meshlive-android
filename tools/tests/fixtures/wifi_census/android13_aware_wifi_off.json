@@ -1,0 +1,17 @@
+{
+  "description": "Anonymised real-format Android 13 dump used for the Wi-Fi toggle path: Aware supported, Wi-Fi initially off, no mGroups section.",
+  "model": "SM-A556E",
+  "sdk": 33,
+  "soc": "Exynos 1480",
+  "features": {
+    "aware": true,
+    "direct": true,
+    "rtt": true
+  },
+  "wifi_initially_enabled": false,
+  "wifi_status_on": "Wifi is enabled\nWifi scanning is always available\n==== Primary ClientModeManager instance ====\nWifi is connected to \"LabNet-6G\"\nWifiInfo: SSID: \"LabNet-6G\", BSSID: 3c:5a:b4:11:22:33, MAC: 9a:11:22:33:44:55, Supplicant state: COMPLETED, Wi-Fi standard: 11, RSSI: -48, Link speed: 866Mbps, Tx Link speed: 780Mbps, Frequency: 5180MHz, Net ID: 12, Metered hint: false, score: 60\nsuccessfulTxPackets: 100\nsuccessfulTxPacketsPerSecond: 5\n",
+  "wifi_status_off": "Wifi is disabled\nWifi scanning is only available when wifi is enabled\n",
+  "wifiaware": "Wi-Fi Aware Service\n  mUsageEnabled: true\n  mClients: {0=com.android.server.wifi.aware.WifiAwareClientState@cc33}\n  mCapabilities: [Capabilities [maxPublishes=4, maxSubscribes=8, maxNdiInterfaces=1, maxNdpSessions=2, supportedCipherSuites=3, isInstantCommunicationModeSupported=true, isNanPairingSupported=false, isSuspensionSupported=false, is6gSupported=false, isHeSupported=true]]\n",
+  "wifip2p": "WifiP2pService\nWifiP2pStateMachine:\n  currentState=InactiveState\n  mWifiP2pInfo groupFormed=false, isGroupOwner=false, groupOwnerAddress=/0.0.0.0\n  mGroup null\nmDetailedState disconnected\n",
+  "wifi": "Dump of WifiService\nDump of HalDeviceManager:\nWifiChipInfo {chipId=0, availableModes=[{id=3, availableCombinations=[{limits=[{maxIfaces=1, types=[0]}, {maxIfaces=1, types=[3, 4]}]}, {limits=[{maxIfaces=2, types=[0]}]}]}], currentModeIdValid=true, currentModeId=3}\nmDebugChipsInfo: [{chipId=0, availableModes=[{id=3, availableCombinations=[{limits=[{maxIfaces=1, types=[0]}, {maxIfaces=1, types=[3, 4]}]}]}]}]\n"
+}

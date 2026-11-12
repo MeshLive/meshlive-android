@@ -493,17 +493,17 @@ class DualListeningTest {
         val spec = ConnectivityFeatures.dualListening
         assertEquals("dual_listening", spec.id)
         assertEquals("test_dual_listening", spec.benchmarkExtra)
-        assertEquals("experimental_dual_listening", spec.prefKey)
+        assertTrue("no Settings switch since 2026-11-04", spec.constant)
         assertEquals(ConnectivityFeatures.GROUP, spec.group)
         assertEquals("T12", spec.phoneTest)
         assertFalse(ConnectivityFeatureDefaults.DUAL_LISTENING)
         assertEquals(ConnectivityFeatureDefaults.DUAL_LISTENING, spec.defaultEnabled)
         assertTrue(ConnectivityFeatures.all.contains(spec))
-        // A benchmark launch reads only its extra; an ordinary launch the stored choice, else the default.
+        // A benchmark launch reads only its extra; an ordinary launch the default (a stored choice is ignored).
         assertFalse(FeatureCatalog.resolve(spec, true, { false }) { true })
         assertTrue(FeatureCatalog.resolve(spec, true, { it == "test_dual_listening" }) { false })
         assertFalse(FeatureCatalog.resolve(spec, false, { true }) { null })
-        assertTrue(FeatureCatalog.resolve(spec, false, { false }) { true })
+        assertEquals(ConnectivityFeatureDefaults.DUAL_LISTENING, FeatureCatalog.resolve(spec, false, { false }) { true })
     }
 
     @Test

@@ -18,22 +18,24 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from android_tools import default_adb  # noqa: E402
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from android_tools import default_adb  # noqa: E402
-
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
-from run_device_benchmark import PACKAGE, Runner, replay_fixture_metadata, validate_case
+from run_device_benchmark import PACKAGE, Runner, apply_log_loss, phone_tunables, replay_fixture_metadata, tunable_extras, validate_case
 from run_private_call_benchmark import CallRunner, call_relays, relay_chain_limit, score_call_manifest, validate_call_case
+import user_launch
 import acceptance_profiles as acceptance
+import applied_arms
+import release_join
 import score_intercom_call as intercom
 from score_device_run import DEFAULT_THRESHOLDS, aggregate_status, as_diagnostic, gate, limits_for, score_manifest
 from score_media_delivery import score_phase_delivery
 from score_motion_timing import score_motion
 from benchmark_case_state import PRIORITY, request_key, select_remaining, verify_result
+from benchmark_state_io import iter_state_rows
 from debug_image_lifecycle import DebugImages
 from evidence_relocation import logical as project_path
-from benchmark_layout import resolve as locate, original, output_path, CATALOG
+from benchmark_layout import resolve as locate, original, output_path, CATALOG, RUNS
+import bt_stack_health as stack_health
 import benchmark_measurements
 import hci_snoop
 from capture_benchmark_observation import ObservationRecorder, RecorderStillRunning, prepare as prepare_observation, validate_directions
@@ -108,10 +110,19 @@ def participants(case, devices):
 
 def load_jobs(path, devices, selected=()):
     """A bundle references authoritative suites; it does not copy or rewrite their cases."""
+    return list(iter_jobs(path, devices, selected))
+
+
+def iter_jobs(path, devices, selected=()):
+    """Yield the jobs one suite group at a time, so a large inventory is never fully resident.
+
+    The bundle-wide checks (duplicate IDs, absent selected cases, an empty selection, participating phones
+    sharing a physical identity) run as the generator advances and when it is exhausted.
+    """
     path = resolve(path)
     data = read(path)
     groups = data.get("suites", [{"path": str(path)}])
-    jobs = []
+    ids, used = set(), set()
     for group in groups:
         source = resolve(group["path"])
         suite = data if source == path else read(source)
@@ -142,7 +153,11 @@ def load_jobs(path, devices, selected=()):
             case_required = [name for name in required if not (voice and name in intercom.VIDEO_ONLY_FAMILIES)]
             if not case_required:
                 raise ValueError(f"{case['id']}: a voice call has no applicable required family")
-            jobs.append({"case": case, "phones": sorted(phones), "mode": mode(case),
+            if case["id"] in ids:
+                raise ValueError("Duplicate case IDs must be separated into explicit suite executions")
+            ids.add(case["id"])
+            used.update(phones)
+            yield {"case": case, "phones": sorted(phones), "mode": mode(case),
                          "devices": {phone: {key: devices[phone][key] for key in ("serial", "node_prefix")}
                                      for phone in sorted(phones)},
                          "execution": execution, "required_families": case_required,
@@ -150,20 +165,17 @@ def load_jobs(path, devices, selected=()):
                             if voice and case_required != required else {}),
                          **({"acceptance_profile": profile} if profile != acceptance.V3 else {}),
                          "suite": str(source), "suite_sha256": suite_sha256,
-                         **({"observation_capture": observation, "capture_resources": observation["resources"]} if observation else {})})
-    ids = [job["case"]["id"] for job in jobs]
-    if len(set(ids)) != len(ids):
-        raise ValueError("Duplicate case IDs must be separated into explicit suite executions")
-    if set(selected) - set(ids):
-        raise ValueError(f"Selected cases absent: {sorted(set(selected) - set(ids))}")
-    if not jobs:
+                         **({"observation_capture": observation, "capture_resources": observation["resources"]} if observation else {})}
+        del suite, cases, available
+    if set(selected) - ids:
+        raise ValueError(f"Selected cases absent: {sorted(set(selected) - ids)}")
+    if not ids:
         raise ValueError("No cases selected")
-    used = sorted({phone for job in jobs for phone in job["phones"]})
+    used = sorted(used)
     for field in ("serial", "node_prefix"):
         identities = [devices[phone][field] for phone in used]
         if len(set(identities)) != len(identities):
             raise ValueError(f"Participating aliases share a physical {field}; correct ownership before scheduling")
-    return jobs
 
 
 def batches(jobs, parallel):
@@ -223,6 +235,19 @@ class PrerequisiteError(RuntimeError):
     pass
 
 
+class ThermalBlocked(PrerequisiteError):
+    """A participant stayed hot (thermal status MODERATE or higher) for the whole cool-down wait: the case is BLOCKED
+    with reason `thermal`, kept visible, never silently skipped."""
+    reason_code = "thermal"
+
+
+class BatterySaverBlocked(PrerequisiteError):
+    """A participant has Battery Saver on while the case asks for Wi-Fi: the app withholds Wi-Fi then
+    (WifiEligibility.batteryOrThermalBlocks), so the call would run on Bluetooth. BLOCKED with reason `battery_saver_on`
+    before any phone is touched; Battery Saver is the owner's setting and is never changed here."""
+    reason_code = "battery_saver_on"
+
+
 def check_cancelled(job):
     event = job.get("_cancel_event")
     if event is not None and event.is_set():
@@ -231,20 +256,34 @@ def check_cancelled(job):
 
 def validate_capabilities(case, capabilities):
     """Validate the exact offered settings, never substitute a similar profile."""
+    if mode(case) == "private_call":
+        # A user-launch request that cannot work (tools/user_launch.py) is BLOCKED here, before any phone is touched.
+        found = user_launch.blockers(case, [case["caller"], case["callee"], *call_relays(case)])
+        if found:
+            raise PrerequisiteError(f"case: {found[0][0]}: " + "; ".join(detail for _, detail in found))
     replay = replay_fixture_metadata(case) if case.get("replay_file") else None
     profiles = case["profiles"] if mode(case) == "private_call" else {case["source"]: case["profile"]}
     for sender, profile in profiles.items():
+        if user_launch.is_app_default(profile):
+            continue  # the app picks its encoder and profile as a person's launch does; the run records what it chose
         caps = capabilities[sender]
         encoder = next((item for item in caps.get("encoders", []) if item["name"] == profile["codec"]), None)
         if encoder is None or profile.get("rate_control", "cbr") not in encoder.get("rate_controls", []):
             raise PrerequisiteError(f"{sender}: requested encoder/allocation is not offered")
         if replay and encoder["codec"] != {"VP90": "vp9", "AV01": "av1"}[replay["codec"]]:
             raise PrerequisiteError(f"{sender}: finite replay codec differs from the requested offered encoder")
-        if not any(all(item.get(key) == profile[key] for key in ("width", "height", "bitrate_kbps"))
+        # A Wi-Fi carrier case with wifi_exact_kbps asks the encoder for exactly that rate outside the Settings ladder
+        # (SWITCHES "Exact call bitrate on Wi-Fi"): the geometry/FPS must still be an offered mode, the bitrate need not
+        # be a Settings step, and the Bluetooth transport maximum does not apply. The app logs the effective rate.
+        exact = (case.get("tunables") or {}).get("wifi_exact_kbps")
+        wifi_exact = (bool(case.get("carrier")) and isinstance(exact, int) and not isinstance(exact, bool)
+                      and exact >= profile["bitrate_kbps"])
+        keys = ("width", "height") if wifi_exact else ("width", "height", "bitrate_kbps")
+        if not any(all(item.get(key) == profile[key] for key in keys)
                    and profile["fps"] in item.get("fps", []) for item in encoder.get("modes", [])):
             raise PrerequisiteError(f"{sender}: requested geometry/FPS/bitrate is not offered")
         maximum = caps.get("transport_max_kbps", {}).get(case["transport"])
-        if maximum is not None and profile["bitrate_kbps"] > maximum:
+        if maximum is not None and profile["bitrate_kbps"] > maximum and not wifi_exact:
             raise PrerequisiteError(f"{sender}: requested bitrate exceeds the offered transport setting")
         receivers = [case["callee"] if sender == case["caller"] else case["caller"]] if mode(case) == "private_call" else [
             item["phone"] for item in case["receivers"]]
@@ -253,8 +292,31 @@ def validate_capabilities(case, capabilities):
             if encoder["codec"] not in offered.get("decoders", []):
                 raise PrerequisiteError(f"{receiver}: no offered decoder for {sender}'s {encoder['codec']}")
             playback = case["profiles"][receiver].get("playback", "balanced") if mode(case) == "private_call" else profile.get("playback", "balanced")
-            if "playback" in offered and playback not in offered["playback"]:
+            if "playback" in offered and playback not in offered["playback"] and not (
+                    mode(case) == "private_call" and user_launch.is_app_default(case["profiles"][receiver])):
                 raise PrerequisiteError(f"{receiver}: requested playback buffer is not offered")
+
+
+def process_alive(pid):
+    """True while a process with [pid] exists (a reused PID also counts: reclaiming waits rather than guesses)."""
+    if os.name == "nt":
+        import ctypes
+        kernel = ctypes.windll.kernel32
+        handle = kernel.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ctypes.GetLastError() == 5  # access denied: it exists
+        try:
+            code = ctypes.c_ulong()
+            return not kernel.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 class DeviceLease:
@@ -288,8 +350,33 @@ class DeviceLease:
         finally:
             lock.unlink()
 
+    def reclaim_dead(self):
+        """Under [guard]: drop every lease set whose owning process has ended, unless any of its files is QUARANTINED
+        (a phone or instrument left in an unconfirmed state stays blocked until a person resolves it). A killed runner
+        never reaches [release], so its leases would otherwise block every later suite on those phones."""
+        sets = {}
+        for path in self.directory.glob("*.json"):
+            try:
+                lease = read(path)
+            except (OSError, ValueError):
+                continue
+            sets.setdefault((lease.get("token"), lease.get("pid")), []).append((path, lease))
+        reclaimed = []
+        for (token, pid), files in sets.items():
+            if not token or not isinstance(pid, int) or pid == os.getpid() or process_alive(pid):
+                continue
+            if any(lease.get("status") == "QUARANTINED" for _, lease in files):
+                continue
+            for path, _ in files:
+                path.unlink()
+                reclaimed.append(path.name)
+        if reclaimed:
+            print(f"Reclaimed leases of ended processes: {', '.join(sorted(reclaimed))}", file=sys.stderr)
+        return reclaimed
+
     def __enter__(self):
         with self.guard():
+            self.reclaim_dead()
             active = list(self.directory.glob("*.json"))
             if any((self.directory / (key + ".json")).exists() for key in self.keys):
                 raise PrerequisiteError("Another suite owns a participating physical phone or recording resource")
@@ -345,25 +432,56 @@ def awake_unlocked(power, policy):
     return awake and unlocked and not locked
 
 
-def verify_phone_cleanup(adb, devices, phones, output, lease):
+CLEANUP_PROBES = 6  # a process that is still exiting right after the call gets a fresh force-stop and up to ~3 s
+CLEANUP_PROBE_DELAY_S = .5
+
+
+def verify_phone_cleanup(adb, devices, phones, output, lease, sleep=time.sleep):
     receipt = {"status": "STOPPED", "phones": {}}
+    manifest_path = output / "physical" / "manifest.json"
+    # A user-launch case rewrote the app's stored Settings choices; a phone whose file could not be proven back to the
+    # exact bytes it had would start the next (benchmark) launch with the person's choices on: it is quarantined.
+    unrestored = {item["device"] for item in (read(manifest_path) if manifest_path.is_file() else {}).get(
+        "user_settings_restored", []) if item.get("status") != "RESTORED"}
+    # A planned wifi_off leaves Wi-Fi off until the runner's own restore reads it back on; a phone left without proof
+    # would join the next case with no Wi-Fi carrier.
+    wifi_unrestored = {item["device"] for item in (read(manifest_path) if manifest_path.is_file() else {}).get(
+        "wifi_restored", []) if item.get("status") != "RESTORED"}
     for phone in phones:
         item = receipt["phones"][phone] = {}
-        try:
-            result = subprocess.run([adb, "-s", devices[phone]["serial"], "shell", "pidof", PACKAGE],
-                                    capture_output=True, encoding="utf-8", errors="replace", timeout=5)
-            item.update(pidof_returncode=result.returncode, pidof_stdout=result.stdout.strip(),
-                        pidof_stderr=result.stderr.strip())
-            stopped = result.returncode in (0, 1) and not result.stdout.strip() and not result.stderr.strip()
-        except (OSError, subprocess.TimeoutExpired) as error:
-            item["error"] = str(error)
-            stopped = False
+        serial = devices[phone]["serial"]
+        stopped = False
+        for probe in range(1, CLEANUP_PROBES + 1):
+            try:
+                result = subprocess.run([adb, "-s", serial, "shell", "pidof", PACKAGE],
+                                        capture_output=True, encoding="utf-8", errors="replace", timeout=5)
+                item.update(pidof_returncode=result.returncode, pidof_stdout=result.stdout.strip(),
+                            pidof_stderr=result.stderr.strip(), probes=probe)
+                item.pop("error", None)
+                stopped = result.returncode in (0, 1) and not result.stdout.strip() and not result.stderr.strip()
+            except (OSError, subprocess.TimeoutExpired) as error:
+                item.update(error=str(error), probes=probe)
+                stopped = False
+            if stopped or probe == CLEANUP_PROBES:
+                break
+            # A pid seen right after the call is usually the process still exiting (false quarantines on the A15s and
+            # ASUS, 2026-11-04): stop it again and look once more before declaring the phone unconfirmed.
+            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                subprocess.run([adb, "-s", serial, "shell", "am", "force-stop", PACKAGE],
+                               capture_output=True, encoding="utf-8", errors="replace", timeout=5)
+                item["force_stops"] = item.get("force_stops", 0) + 1
+            sleep(CLEANUP_PROBE_DELAY_S)
         item["status"] = "STOPPED" if stopped else "UNCONFIRMED"
-        if not stopped:
+        if phone in unrestored:
+            item.update(status="UNCONFIRMED", user_settings_restore="UNVERIFIED")
+        if phone in wifi_unrestored:
+            item.update(status="UNCONFIRMED", wifi_restore="UNVERIFIED")
+        if item["status"] != "STOPPED":
             receipt["status"] = "UNCONFIRMED"
-            lease.quarantine_phone(phone, "Phone cleanup is unconfirmed", output / "cleanup.json")
+            lease.quarantine_phone(phone, "Stored user settings could not be restored" if phone in unrestored
+                                   else "Wi-Fi could not be turned back on" if phone in wifi_unrestored
+                                   else "Phone cleanup is unconfirmed", output / "cleanup.json")
     write(output / "cleanup.json", receipt)
-    manifest_path = output / "physical" / "manifest.json"
     if manifest_path.is_file():
         manifest = read(manifest_path)
         manifest["phone_cleanup"] = {"path": "../cleanup.json", "sha256": digest(output / "cleanup.json"),
@@ -431,6 +549,47 @@ def missing_classic_bonds(identities, edges):
 VERIFIED_INSTALLS = {}
 
 
+def coc_stack_preflight(adb, serial, phone, api, runs_root=None):
+    """Read-only LE CoC stack check: the Bluetooth process must be running, not recorded as wedged by an earlier
+    execution, in manager state ON, and on Android 10 below the app-process budget. Remediation (a Bluetooth restart)
+    stays with the phone's owner. Returns (evidence, blocking reason or None)."""
+    def shell(*args, timeout=10):
+        return subprocess.run([adb, "-s", serial, "shell", *args], capture_output=True, encoding="utf-8",
+                              errors="replace", timeout=timeout)
+    evidence = {}
+    pid = None
+    for package in ("com.android.bluetooth", "com.google.android.bluetooth"):
+        found = shell("pidof", package).stdout.strip()
+        if found.isdigit():
+            pid, evidence["process"] = int(found), package
+            break
+    evidence["pid"] = pid
+    try:
+        # A wedged stack main thread can hang this dump: a timeout is itself a reason to block.
+        dump = shell("dumpsys", "bluetooth_manager", timeout=30).stdout
+    except subprocess.TimeoutExpired:
+        evidence["manager_state"] = "TIMEOUT"
+        return evidence, f"{phone}: dumpsys bluetooth_manager timed out (Bluetooth may be wedged); restart Bluetooth (owner)"
+    evidence["manager_state"] = stack_health.bluetooth_manager_state(dump)
+    since = 0.0
+    if pid:
+        age = stack_health.process_age_s(shell("cat", f"/proc/{pid}/stat").stdout, shell("cat", "/proc/uptime").stdout)
+        evidence["process_age_s"] = None if age is None else round(age, 1)
+        # Manifests older than the Bluetooth process cannot describe it (an hour of margin for clock skew).
+        since = time.time() - age - 3600 if age is not None else time.time() - 7 * 86400
+    manifests = stack_health.recent_manifests(runs_root or RUNS, since) if pid else []
+    history = stack_health.stack_history(manifests, phone, pid, read)
+    evidence.update(earlier_executions=len(history["manifests"]), wedges=history["wedges"],
+                    coc_app_processes=len(history["coc_app_processes"]))
+    return evidence, stack_health.stack_preflight(phone, api, pid, evidence["manager_state"], history)
+
+
+def wifi_client_mhz(status):
+    """The Wi-Fi client's frequency from `adb shell cmd wifi status`, or None when not connected or unreadable."""
+    match = re.search(r"Frequency:\s*(\d+)", status or "")
+    return int(match.group(1)) if match else None
+
+
 def preflight(adb, devices, job, output, expected_hash):
     """Read-only checks. Permission/identity failures block rather than modify phones."""
     check_cancelled(job)
@@ -485,12 +644,36 @@ def preflight(adb, devices, job, output, expected_hash):
             item["api"] = int(command("shell", "getprop", "ro.build.version.sdk"))
             needed = ["CAMERA", "RECORD_AUDIO"] + (["BLUETOOTH_SCAN", "BLUETOOTH_CONNECT", "BLUETOOTH_ADVERTISE"]
                       if item["api"] >= 31 else ["ACCESS_FINE_LOCATION"])
+            carrier = job["case"].get("carrier")
+            if carrier:
+                if item["api"] >= 33:
+                    needed.append("NEARBY_WIFI_DEVICES")
+                elif item["api"] >= 31:
+                    needed.append("ACCESS_FINE_LOCATION")  # API 29-30 already list it for Bluetooth scanning above
+                item["wifi_on"] = command("shell", "settings", "get", "global", "wifi_on")
+                item["location_mode"] = command("shell", "settings", "get", "secure", "location_mode")
+                if item["wifi_on"] != "1":
+                    raise PrerequisiteError(f"{phone}: Wi-Fi is off; a Wi-Fi carrier case needs it on")
+                if carrier != "wifi_aware" and 29 <= item["api"] <= 32 and item["location_mode"] == "0":
+                    raise PrerequisiteError(f"{phone}: Location is off; Android 10-12 need it for Wi-Fi discovery and Wi-Fi Direct")
+                try:
+                    status = command("shell", "cmd", "wifi", "status")  # names the network: never stored
+                except PrerequisiteError:
+                    status = ""
+                mhz = item["wifi_client_mhz"] = wifi_client_mhz(status)
+                if mhz is not None and mhz < 4900 and not job["case"].get("tunables", {}).get("wifi_allow_24ghz"):
+                    raise PrerequisiteError(f"{phone}: the Wi-Fi client is on 2.4 GHz ({mhz} MHz); a Wi-Fi carrier case needs it off or on 5 GHz")
             denied = [permission for permission in needed if not re.search(
                 rf"android\.permission\.{permission}: granted=true", item["package"])]
             if item["adb_state"] != "device" or item["bluetooth_on"] != "1" or denied:
-                raise PrerequisiteError(f"{phone}: not ready; denied permissions={denied}")
+                raise PrerequisiteError(not_ready_reason(phone, item, denied))
             if not awake_unlocked(item["power"], item["window_policy"]):
                 raise PrerequisiteError(f"{phone}: awake/unlocked state is not proved")
+            item["battery_saver"] = user_launch.battery_saver(item["power"])
+            if item["battery_saver"] and user_launch.wifi_requested(job["case"], phone):
+                raise BatterySaverBlocked(f"{phone}: battery_saver_on: dumpsys power says Battery Saver is ON, and the app "
+                                          "withholds Wi-Fi while it is on (the call would run on Bluetooth); turn it off "
+                                          "on the phone (the owner's setting) and rerun")
             remote = command("shell", "pm", "path", PACKAGE).splitlines()[0].removeprefix("package:")
             item["apk_sha256"] = command("shell", "sha256sum", remote).split()[0]
             if item["apk_sha256"].lower() != expected_hash.lower():
@@ -504,12 +687,15 @@ def preflight(adb, devices, job, output, expected_hash):
             else:
                 pulled = (output / f"verified-{phone}-base.apk").resolve()
                 pulled.relative_to(output.resolve())
-                command("pull", remote, str(pulled))
+                item["apk_pull"] = pull_apk(command, remote, pulled)
                 item["independent_apk_verification"] = {"sha256": digest(pulled), "bytes": pulled.stat().st_size}
                 if item["independent_apk_verification"]["sha256"].lower() != expected_hash.lower():
                     raise PrerequisiteError(f"{phone}: independently pulled APK differs; retained {pulled}")
+                # The extras this build can read, from the verified copy (before it is removed).
+                BUILD_TEST_EXTRAS[expected_hash.lower()] = applied_arms.scan_apk(pulled)
                 pulled.unlink()  # Verified redundant copy; the digest/size receipt is retained.
                 VERIFIED_INSTALLS[install_marker] = dict(item["independent_apk_verification"])
+            check_tunables_in_build(phone, job["case"], expected_hash, item)
             item["capabilities"] = json.loads(command("shell", "cat",
                 f"/sdcard/Android/data/{PACKAGE}/files/benchmark-capabilities.json"))
             caps = item["capabilities"]
@@ -523,6 +709,14 @@ def preflight(adb, devices, job, output, expected_hash):
                 if job["hci_snoop"] == "required" and item["bluetooth_logging"]["snoop_enabled"] != "ENABLED":
                     raise PrerequisiteError(f"{phone}: --hci-snoop required but snoop is "
                                             f"{item['bluetooth_logging']['snoop_enabled']}")
+            if job["case"].get("transport") == "ble":
+                check_cancelled(job)
+                try:
+                    item["coc_stack"], blocked = coc_stack_preflight(adb, serial, phone, item["api"])
+                except subprocess.TimeoutExpired as error:
+                    raise PrerequisiteError(f"{phone}: Bluetooth stack preflight timed out") from error
+                if blocked:
+                    raise PrerequisiteError(blocked)
         except Exception:
             write(output / "preflight.json", evidence)
             raise
@@ -530,6 +724,7 @@ def preflight(adb, devices, job, output, expected_hash):
     # every execution records each participant's Wi-Fi band as a radio condition. Read-only.
     evidence["radio_conditions"] = {phone: wifi_condition(adb, devices[phone]["serial"]) for phone in job["phones"]}
     write(output / "preflight.json", evidence)
+    thermal_gate(adb, devices, job, evidence, output)
     if job["case"].get("transport") == "classic":
         identities = {}
         for phone in job["phones"]:
@@ -555,7 +750,110 @@ def preflight(adb, devices, job, output, expected_hash):
     return evidence
 
 
+def pull_apk(command, remote, destination):
+    """`adb pull` of the installed APK. The first pull after a phone woke from Doze timed out at 30 s (S22): wake the
+    screen first (the launch path's KEYCODE_WAKEUP; never a sleep key) and retry a timed-out pull once before
+    blocking. Any other failure is not retried."""
+    record = {"attempts": 0, "woke": False}
+    try:
+        command("shell", "input", "keyevent", "KEYCODE_WAKEUP")
+        record["woke"] = True
+    except PrerequisiteError:
+        pass  # some OEMs refuse shell input; the pull is still tried
+    for attempt in (1, 2):
+        record["attempts"] = attempt
+        try:
+            command("pull", remote, str(destination))
+            return record
+        except PrerequisiteError as error:
+            if attempt == 2 or not isinstance(error.__cause__, subprocess.TimeoutExpired):
+                raise
+            record["first_timeout"] = str(error)
+            try:
+                command("shell", "input", "keyevent", "KEYCODE_WAKEUP")
+            except PrerequisiteError:
+                pass
+
+
+BUILD_TEST_EXTRAS = {}  # frozen APK sha256 -> the `test_` extra names in its dex ({} = unscannable)
+
+
+def check_tunables_in_build(phone, case, expected_hash, item):
+    """A tunable whose extra name is not in the frozen build is ignored by the app without a word, so an arm that
+    asks for it is not an arm: BLOCK with the reason, never a silent control run (TEST-14)."""
+    in_build = BUILD_TEST_EXTRAS.get(expected_hash.lower())
+    if not in_build:
+        item["tunables_in_build"] = {"status": "UNMEASURED", "reason": "the APK's dex strings could not be scanned"}
+        return
+    requested = sorted(tunable_extras(phone_tunables(case, phone)))
+    missing = applied_arms.missing_from_build(requested, in_build)
+    item["tunables_in_build"] = {"status": "FAIL" if missing else "PASS", "requested": requested, "missing": missing}
+    if missing:
+        raise PrerequisiteError(f"{phone}: tunable not in this build: {', '.join(missing)}")
+
+
+def not_ready_reason(phone, item, denied):
+    """Name every cause of a failed readiness check: the owner must know to switch Bluetooth on, not look at permissions."""
+    causes = []
+    if item.get("adb_state") != "device":
+        causes.append(f"adb state={item.get('adb_state')!r}")
+    if item.get("bluetooth_on") != "1":
+        causes.append("Bluetooth off")
+    if denied:
+        causes.append(f"denied permissions={denied}")
+    return f"{phone}: not ready; " + "; ".join(causes)
+
+
 WIFI_FREQUENCY = re.compile(r"(?:Frequency: ?|frequencyMhz: ?|freq=)(\d{4})")
+
+
+THERMAL_LIMIT = 2        # android.os.PowerManager THERMAL_STATUS_MODERATE: wait while any participant is at or above it
+THERMAL_WAIT_S = 600
+THERMAL_POLL_S = 30
+
+
+def thermal_status(dump):
+    """`Thermal Status: N` of `dumpsys thermalservice` (0 NONE ... 6 SHUTDOWN), None when the phone does not say."""
+    match = re.search(r"Thermal Status:\s*(\d+)", dump or "")
+    return int(match[1]) if match else None
+
+
+def thermal_gate(adb, devices, job, evidence, output, wait_s=THERMAL_WAIT_S, poll_s=THERMAL_POLL_S,
+                 clock=None, sleep=None):
+    """Cool-down between back-to-back cases: aw1-20261110f went NONE -> SEVERE on both phones over eight calls and the
+    last calls never tried Wi-Fi. Reads every participant's thermal status; while any is MODERATE (2) or higher it waits
+    (polling every `poll_s`, at most `wait_s`), then blocks the case with reason `thermal`. The status at the start and
+    every poll are recorded in the case's preflight.json either way. A phone that does not report a status is recorded
+    as such and never held back."""
+    clock, sleep = clock or time.monotonic, sleep or time.sleep
+
+    def read(phone):
+        try:
+            result = subprocess.run([adb, "-s", devices[phone]["serial"], "shell", "dumpsys", "thermalservice"],
+                                    capture_output=True, encoding="utf-8", errors="replace", timeout=15)
+            return thermal_status(result.stdout)
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+    started = clock()
+    now = {phone: read(phone) for phone in job["phones"]}
+    record = evidence["thermal_gate"] = {"limit": THERMAL_LIMIT, "wait_limit_s": wait_s, "poll_s": poll_s,
+                                         "at_start": dict(now), "polls": [], "waited_s": 0, "verdict": "COOL"}
+    while any(status is not None and status >= THERMAL_LIMIT for status in now.values()):
+        record["verdict"] = "WAITED"
+        if clock() - started >= wait_s:
+            record["verdict"] = "BLOCKED"
+            write(output / "preflight.json", evidence)
+            hot = {phone: status for phone, status in now.items() if status is not None and status >= THERMAL_LIMIT}
+            raise ThermalBlocked("thermal: " + ", ".join(f"{phone} status {status}" for phone, status in sorted(hot.items())) +
+                                 f" (MODERATE=2 or higher) after waiting {round(clock() - started)} s for it to cool")
+        check_cancelled(job)
+        sleep(poll_s)
+        now = {phone: read(phone) for phone in job["phones"]}
+        record["waited_s"] = round(clock() - started)
+        record["polls"].append({"after_s": record["waited_s"], "status": dict(now)})
+    record["at_end"] = dict(now)
+    write(output / "preflight.json", evidence)
+    return record
 
 
 def wifi_condition(adb, serial):
@@ -594,7 +892,8 @@ def comparison_key(manifest):
 def family_for(name):
     if name.startswith("media_age"):
         return "media_age"
-    if any(word in name for word in ("discovery", "startup", "first_surface", "recovery_ms", "setup_to_active")):
+    if any(word in name for word in ("discovery", "startup", "first_surface", "recovery_ms", "setup_to_active",
+                                     "call_phase_active", "release_join")):
         return "connection"
     if name.startswith(("surface_", "visible_fps", "unexpected_freeze", "encoder_fps", "longest_stall",
                         "frozen_time_share", "effective_profile_fps", "requested_profile_shortfall",
@@ -625,8 +924,11 @@ def _analyze(manifest_path, output, required, measurement_contract=None, profile
     manifest_base = original(manifest_path, root=ROOT).parent
     manifest = read(manifest_path)
     output.mkdir(parents=True, exist_ok=True)
-    score = (score_call_manifest if manifest.get("mode") == "private_call" else score_manifest)(
-        manifest, manifest_base, {"version": version} if user else None)
+    if manifest.get("mode") == "private_call":
+        score = score_call_manifest(manifest, manifest_base, {"version": version} if user else None)
+    else:  # A stop on a one-time line that logd confirmably dropped is UNMEASURED, never FAIL.
+        score = apply_log_loss(score_manifest(manifest, manifest_base, {"version": version} if user else None),
+                               manifest, manifest_base)
     write(output / "computed-score.json", score)
     families = {name: {**UNKNOWN, "measurements": [],
                        **({"reason": acceptance.FAMILY_REASONS[name]} if user and name in acceptance.FAMILY_REASONS else {})}
@@ -738,6 +1040,8 @@ def _analyze(manifest_path, output, required, measurement_contract=None, profile
               "source_fixture": manifest.get("source_fixture"), "source_fixtures": manifest.get("source_fixtures", {}),
               "replay_fixture": manifest.get("replay_fixture"),
               "pipeline_status": score["overall_status"], "families": families,
+              # A call case that stopped before its invite says so in the case result (never a silent skip).
+              **{key: score[key] for key in ("call_dialed", "not_dialed", "release_join") if key in score},
               "thresholds_version": version,
               "measurement_adapters": adapters,
               "required_families": list(required), "measurement_errors": errors,
@@ -803,6 +1107,14 @@ def _execute(job, devices, adb, expected_hash, output, leases):
                     collect_hci_snoop(adb, devices, job, output, started, evidence)
             if instance.cancel_event is not None and instance.cancel_event.is_set():
                 raise InterruptedError("Suite stopped; physical runner cleanup completed")
+            manifest_path = output / "physical" / "manifest.json"
+            record_battery_saver(manifest_path, evidence)
+            physical = read(manifest_path) if manifest_path.is_file() else {}
+            blocked = physical.get("runner_blocked")
+            if blocked and not physical.get("bluetooth_stack_wedges"):
+                # The phone's own Bluetooth stack kept the endpoint from starting (fail-fast, not the 30 s deadline):
+                # BLOCKED. A stack that wedged during this run's own call stays that call's FAIL (local_bt_stack_wedged).
+                raise PrerequisiteError(f"{blocked['device']}: {blocked['reason']}: {blocked['detail']}")
         return {"manifest": output / "physical" / "manifest.json", "job": job, "output": output,
                 "host_start_ns": started, "host_end_ns": time.time_ns()}
     except Exception as error:
@@ -810,6 +1122,7 @@ def _execute(job, devices, adb, expected_hash, output, leases):
                   "status": "INTERRUPTED" if isinstance(error, InterruptedError) else
                             "BLOCKED" if isinstance(error, PrerequisiteError) else "FAIL",
                   "reason": str(error), "host_start_ns": started, "host_end_ns": time.time_ns(),
+                  **({"blocked_reason": error.reason_code} if hasattr(error, "reason_code") else {}),
                   **({"cleanup_status": "UNCONFIRMED"} if cleanup_unconfirmed else {}),
                   "families": {name: dict(UNKNOWN) for name in acceptance.families_for(job.get("acceptance_profile"))}}
         if (output / "physical/manifest.json").is_file():
@@ -818,6 +1131,18 @@ def _execute(job, devices, adb, expected_hash, output, leases):
             result["hci_snoop"] = "hci-snoop.json"
         write(output / "attempt.json", result)
         return {"result": result}
+
+
+def record_battery_saver(manifest_path, evidence):
+    """`battery_saver` (true, false, or null when the preflight's power dump had no such line) on each device of the
+    manifest, from the preflight text, for every case."""
+    if not manifest_path.is_file():
+        return
+    manifest = read(manifest_path)
+    for phone, record in (manifest.get("devices") or {}).items():
+        if isinstance(record, dict) and isinstance(evidence.get(phone), dict):
+            record["battery_saver"] = evidence[phone].get("battery_saver")
+    write(manifest_path, manifest)
 
 
 def collect_hci_snoop(adb, devices, job, output, started_ns, evidence):
@@ -1182,6 +1507,56 @@ def finish_analysis(output, workers=1):
     return results
 
 
+def finalize_stopped(output, reason, resolved_cleanup=()):
+    """Finalize an output whose runner stopped before it could (killed, or its lane ended).
+
+    Cases still RUNNING or ANALYZING become INTERRUPTED with the stated reason; their partial evidence stays and
+    the retained manifest is attached when the runner got that far. Cases that never started stay NOT RUN and
+    terminal results are untouched. Ownership is then frozen exactly as a normal run does (finalize_artifacts);
+    nothing is deleted and no case is scored or passed.
+    """
+    output = output_path(output, "runs", root=ROOT)
+    DebugImages._guard(output)
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("State why the runner stopped")
+    payload = read(output / "suite-result.json")
+    if payload.get("schema") != "benchmark-suite-v1":
+        raise ValueError("Unsupported suite-result schema")
+    if payload.get("artifact_review"):
+        raise ValueError("Output is already finalized; use review for its purpose decisions")
+    results = payload["results"]
+    if any(item["status"] == DEFERRED for item in results):
+        raise ValueError("Cases are pending analysis; run finish-analysis instead")
+    stopped = []
+    resolved = set(resolved_cleanup)
+    unconfirmed = {item["case_id"] for item in results if item.get("cleanup_status") == "UNCONFIRMED"}
+    if resolved - unconfirmed:
+        raise ValueError(f"Not an unconfirmed-cleanup case in this output: {sorted(resolved - unconfirmed)}")
+    for item in results:
+        if item["case_id"] in resolved:
+            # A person verified the phone's app process stopped (the REASON states how). The unconfirmed receipt
+            # file stays as recorded; the case is INTERRUPTED rather than scored, and its earlier verdict is kept.
+            item["cleanup_resolution"] = {"previous_status": item["status"], "previous_reason": item.get("reason"),
+                "previous_cleanup_status": "UNCONFIRMED", "evidence": reason,
+                "resolved_at": dt.datetime.now().astimezone().isoformat()}
+            item.update(status="INTERRUPTED", reason=reason, cleanup_status="RESOLVED_BY_EVIDENCE")
+            stopped.append(item["case_id"])
+        elif item["status"] in {"RUNNING", "ANALYZING"}:
+            item.update(status="INTERRUPTED", reason=reason)
+            manifest = Path(item.get("evidence_directory", output / "absent")) / "physical/manifest.json"
+            if manifest.is_file():
+                item.update(manifest=str(located(manifest)), manifest_sha256=digest(manifest))
+            stopped.append(item["case_id"])
+    if stopped:
+        payload["state_counts"] = {state: sum(item["status"] == state for item in results)
+                                   for state in sorted({item["status"] for item in results})}
+        payload["stopped_before_finalization"] = {"cases": stopped, "reason": reason,
+                                                  "recorded_at": dt.datetime.now().astimezone().isoformat()}
+        write(output / "suite-result.json", payload)
+        render_report(output, payload)
+    return finalize_artifacts(output)
+
+
 def report(output, results, baseline=None):
     comparisons = {}
     for item in (baseline or {}).get("results", []):
@@ -1201,8 +1576,11 @@ def report(output, results, baseline=None):
     versions = {item["thresholds_version"] for item in results if item.get("thresholds_version")}
     thresholds = (limits_for({"version": acceptance.V4}) if versions == {acceptance.V4} else
                   {"version": "mixed", "versions": sorted(versions)} if len(versions) > 1 else DEFAULT_THRESHOLDS)
+    joins = [item for item in results if isinstance(item.get("release_join"), dict)]
     payload = {"schema": "benchmark-suite-v1", "generated_at": dt.datetime.now().astimezone().isoformat(),
                "thresholds": thresholds, "results": results,
+               # The release gate's join metric over this suite's user-launch calls (tools/release_join.py).
+               **({"release_join_gate": release_join.suite_gate(joins)} if joins else {}),
                "state_counts": {state: sum(item["status"] == state for item in results)
                                 for state in sorted({item["status"] for item in results})},
                "scope": "Automated execution/scoring; missing physical/camera/acoustic/endurance adapters stay unmeasured"}
@@ -1224,10 +1602,13 @@ def render_report(output, payload):
         details = html.escape(json.dumps(item, indent=2, ensure_ascii=False))
         rows.append(f"<tr>{cells}</tr><tr><td colspan='{len(values)}'><details><summary>Evidence and scope</summary><pre>{details}</pre></details></td></tr>")
     headings = "".join(f"<th>{html.escape(name)}</th>" for name in ("Case", "Verdict", *shown))
+    join = payload.get("release_join_gate")
+    join_note = (f"<p class='{html.escape(join['status'])}'>Release join gate: {html.escape(join['status'])} - "
+                 f"{html.escape(join['reason'])}</p>" if join else "")
     page = f"""<!doctype html><html lang="en"><meta charset="utf-8"><title>Benchmark suite report</title>
 <style>body{{font:15px system-ui;margin:24px}}table{{border-collapse:collapse}}td,th{{padding:8px;border:1px solid #bbb}}pre{{white-space:pre-wrap}}.FAIL{{background:#ffd6d6}}.PASS{{background:#d2efdc}}.UNMEASURED,.BLOCKED{{background:#fff0c7}}</style>
 <h1>Benchmark suite report</h1><p>Each family has its own verdict. Callback timing is a proxy; physical screen delay, camera, acoustic and endurance coverage require their own evidence. Job overlap does not prove media overlap.</p>
-<p>{html.escape(json.dumps(payload['state_counts']))}</p><table><thead><tr>{headings}</tr></thead><tbody>{''.join(rows)}</tbody></table></html>"""
+<p>{html.escape(json.dumps(payload['state_counts']))}</p>{join_note}<table><thead><tr>{headings}</tr></thead><tbody>{''.join(rows)}</tbody></table></html>"""
     if payload.get("artifact_review"):
         review = html.escape(json.dumps(payload["artifact_review"], indent=2))
         page = page.replace("</html>", f"<details><summary>Output purpose review: {payload['artifact_review']['status']}</summary><pre>{review}</pre></details></html>")
@@ -1237,7 +1618,7 @@ def render_report(output, payload):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("plan", "run", "analyze", "review", "finish-analysis"))
+    parser.add_argument("action", choices=("plan", "run", "analyze", "review", "finish-analysis", "finalize-stopped"))
     parser.add_argument("--suite", type=Path)
     parser.add_argument("--case", action="append", default=[])
     parser.add_argument("--manifest", type=Path, action="append", default=[])
@@ -1263,6 +1644,10 @@ def main(argv=None):
     parser.add_argument("--consume", action="append", default=[], help="Exact reviewed scratch path within a finalized output")
     parser.add_argument("--retain", action="append", default=[], help="Exact pending output with a specific remaining use")
     parser.add_argument("--purpose", help="Completed review or named remaining use; recorded in suite-result.json")
+    parser.add_argument("--reason", help="finalize-stopped: why the runner stopped before it could finalize its output")
+    parser.add_argument("--resolve-cleanup", action="append", default=[], metavar="CASE_ID",
+                        help="finalize-stopped: an UNCONFIRMED-cleanup case whose phone process a person verified stopped "
+                             "(--reason states the evidence); it becomes INTERRUPTED and keeps its earlier verdict recorded")
     parser.add_argument("--defer-analysis", action="store_true",
                         help="run: finish phone work/cleanup and release leases, then exit with cases marked "
                              f"{DEFERRED}; score later with finish-analysis on the same output")
@@ -1282,6 +1667,18 @@ def main(argv=None):
             parser.exit(2, f"Finish analysis blocked: {error}\n")
         print(f"Report: {output_path(args.output, 'runs', root=ROOT) / 'report.html'}")
         return 0 if results and all(item["status"] == "PASS" for item in results) else 2
+    if args.action == "finalize-stopped":
+        if not args.output or any((args.suite, args.case, args.manifest, args.baseline, args.measurements, args.profile,
+                                  args.state, args.phones, args.owner, args.apk_sha256, args.consume, args.retain,
+                                  args.purpose)):
+            parser.error("finalize-stopped uses only an existing --output and the --reason the runner stopped")
+        try:
+            review = finalize_stopped(args.output, args.reason, args.resolve_cleanup)
+        except (ValueError, KeyError, OSError) as error:
+            parser.exit(2, f"Finalize stopped output blocked: {error}\n")
+        print(json.dumps({"artifact_review": review["status"], "counts": {
+            state: sum(row["state"] == state for row in review["files"].values()) for state in ("PENDING", "RETAINED", "CONSUMED", "DELETED")}}))
+        return 0 if review["status"] == "COMPLETE" else 2
     if args.action == "review":
         if not args.output or any((args.suite, args.case, args.manifest, args.baseline, args.measurements,
                                   args.state, args.phones, args.owner, args.apk_sha256)):
@@ -1293,6 +1690,8 @@ def main(argv=None):
         print(json.dumps({"artifact_review": review["status"], "counts": {
             state: sum(row["state"] == state for row in review["files"].values()) for state in ("PENDING", "RETAINED", "CONSUMED", "DELETED")}}))
         return 0 if review["status"] == "COMPLETE" else 2
+    if args.reason or args.resolve_cleanup:
+        parser.error("--reason and --resolve-cleanup apply only to finalize-stopped")
     if args.consume or args.retain or args.purpose:
         parser.error("Artifact decisions belong to review after run/analysis writers have finished")
     if args.profile and args.action != "analyze":
@@ -1323,9 +1722,11 @@ def main(argv=None):
                 "missing_phones": sorted(set(job["phones"]) - assigned)} for job in jobs if not set(job["phones"]) <= assigned]
             jobs = [job for job in jobs if set(job["phones"]) <= assigned]
         if args.state:
-            state = read(resolve(args.state))
-            by_id = {row["case_id"]: row for row in state["cases"]}
-            if len(by_id) != len(state["cases"]):
+            by_id, rows_read = {}, 0  # streamed: a full-inventory state is hundreds of thousands of rows
+            for row in iter_state_rows(resolve(args.state)):
+                by_id[row["case_id"]] = row
+                rows_read += 1
+            if len(by_id) != rows_read:
                 parser.error("State contains duplicate case IDs")
             current = []
             for job in jobs:

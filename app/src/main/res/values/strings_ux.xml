@@ -16,7 +16,6 @@
     <string name="call_end_busy">Busy: they\'re in another call. Try again in a moment.</string>
     <string name="call_end_reachable">%1$s. You can get calls again.</string>
     <string name="call_end_available">%1$s. You can make another call.</string>
-    <string name="call_cannot_accept_hot">Can\'t answer: your phone is too hot.</string>
     <string name="call_status_ringing">Ringing…</string>
     <string name="call_status_starting_video">Starting video and sound…</string>
     <string name="call_status_starting_voice">Starting the voice call…</string>

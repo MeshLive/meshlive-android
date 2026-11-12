@@ -90,7 +90,11 @@ object PresenceEligibility {
  * and the per-contact switch is on. The one later change is [becomeEligible] (the user verified the peer during
  * this call). A lease is stored only after both sides offered.
  */
-class PresenceSession(private var localEligible: Boolean) {
+class PresenceSession(
+    private var localEligible: Boolean,
+    /** Design QL: a code-verification session (fixed when built, never read from the endpoint's state at send time). */
+    val verification: Boolean = false,
+) {
     sealed class Action {
         object SendOffer : Action()
         object SendLease : Action()
@@ -104,6 +108,7 @@ class PresenceSession(private var localEligible: Boolean) {
     private var sentLease = false
     private var receivedLease = false
     private var withheld = false
+    private var offerLeft = false
 
     /**
      * Nothing more can move in this session: this side does not take part, withheld its OFFER, or has sent its lease and
@@ -157,6 +162,20 @@ class PresenceSession(private var localEligible: Boolean) {
         sentLease = true
         withheld = true
     }
+
+    /** This side's OFFER was queued to the peer (its send-time check passed). */
+    @Synchronized
+    fun offerSent() {
+        if (!withheld) offerLeft = true
+    }
+
+    /**
+     * A LEASE may leave only after this side's own OFFER of this session left, never after a withheld one. The session
+     * decides when the actions are produced, but they are sent later: the LEASE answering a peer that offered first is
+     * produced together with (or right after) an OFFER that its send-time check may still withhold.
+     */
+    @Synchronized
+    fun leaseMayFollow(): Boolean = offerLeft && !withheld
 
     /** [peerVerifiedNow]: the peer's authenticated fingerprint is VERIFIED in the store at this moment. */
     @Synchronized

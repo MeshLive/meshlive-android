@@ -76,7 +76,7 @@ class ReceiverStreamForwarder(
     private val boundaryListener: (Long) -> Unit = { _ -> rotatePresence() }
     private val rotating = AtomicBoolean(false)
     private val linkLoadSaturatedByChild = AtomicBoolean(false)
-    @Volatile private var activeLinkLoad: NodeLinkLoad.Handle? = null
+    @Volatile private var activeLinkLoad: HopSendLoad? = null
 
     /** Experimental temporal layering (off by default): this relay may thin discardable frames. */
     private val thinDiscardable = DebugTunables.experimentalTemporalLayers
@@ -385,6 +385,38 @@ class ReceiverStreamForwarder(
             "BENCHMARK relay_child_stall: child=$childKey | action=holdoff | remainingMs=${decision.heldMs}"
         }
 
+    /** A7: what the child hop's carrier switch reports back to this forwarder. */
+    private fun childHopOwner(sendLoad: HopSendLoad, connection: () -> ChildConnection?): HopOwner = object : HopOwner {
+        override fun sendCarrierChanged(kind: CarrierKind) {
+            LinkChangeEvents.carrierChanged()
+            // The writer adds to this same object (A7 review P1-2): Wi-Fi bytes are never Bluetooth load.
+            sendLoad.onSendCarrier(kind)
+            connection()?.let { LinkPacerSeed.seed(it.pacer, transport, it.nodeId.shortLabel(), kind) }
+        }
+
+        override fun localKeyframeNeeded() {
+            val active = connection() ?: return
+            core.resyncChild(active.endpoint.peerNodeId)
+            if (!header.isAudioOnly) onChildKeyFrameNeeded()
+        }
+
+        override fun peerKeyframeNeeded() = Unit
+
+        override fun reassertState() = Unit
+
+        override fun hopEnded(reason: String) {
+            val active = connection() ?: return
+            // A late end of a connection that is no longer the child (A7 review P3-2): close it, keep the new child.
+            val current = child === active
+            removeChild(active)
+            if (current) restartPresence()
+        }
+
+        override fun bluetoothBudgetKbps(): Int? = LinkCapacity.measuredLinkKbps(transport, CarrierKind.BLUETOOTH)
+
+        override fun targetKbps(): Int? = streamBitrateKbps
+    }
+
     private fun connectChild(peer: BleL2capPeer) {
         val writerThread = thread(start = false, name = "ReceiverNodeChildConnect") {
             // One recovery policy for this attempt: the dial decision, the stall guard and the failure classification.
@@ -398,6 +430,8 @@ class ReceiverStreamForwarder(
             var pending: ChildConnection? = null
             var pendingSocket: BluetoothSocket? = null
             var pendingGatt: GattVideoConnection? = null
+            var pendingHop: HopLink? = null
+            var childConnection: ChildConnection? = null
             try {
                 if (closed.get() || terminalSeen.get()) return@thread
                 val childKey = AdaptivePhyMemory.prefixLabel(peer.announcement.nodeIdPrefix)
@@ -429,6 +463,7 @@ class ReceiverStreamForwarder(
                                 BufferedOutputStream(candidate.mediaOutputStream(forwarding = true), ioConfig.bufferBytes),
                                 identity,
                                 LocalNodeCapabilities.forTransport(transport, maxChildren = 1),
+                                raiseTag = true,
                             )
                         },
                         onStatus = onStatus,
@@ -519,6 +554,7 @@ class ReceiverStreamForwarder(
                     BufferedOutputStream(rawOutput, ioConfig.bufferBytes),
                     identity,
                     childLinkCapabilities,
+                    raiseTag = true,
                 )
                 if (peer.announcement.rotating) {
                     // RV15: the child's version 5 viewer request must open for the link node (role 2). This
@@ -559,6 +595,21 @@ class ReceiverStreamForwarder(
                 }
                 hopAuthenticated = true
                 recovery.onHopAuthenticated(AdaptivePhyMemory.prefixLabel(peer.announcement.nodeIdPrefix))
+                val sendLoad = HopSendLoad { NodeLinkLoad.open(transport, LinkDirection.SEND) }
+                val hop = HopLink(
+                    role = HopCapsPlan.HopRole.STREAM_PARENT,
+                    session = secure,
+                    closeRaw = {
+                        runCatching { gatt?.close() }
+                        runCatching { socket?.close() }
+                        runCatching { control?.close() }
+                    },
+                    anyLocalSwitchOn = WifiSwitchHub::anyOn,
+                    log = WifiLog::emit,
+                    owner = childHopOwner(sendLoad) { childConnection },
+                    newAgent = ::newHopAgent,
+                )
+                pendingHop = hop
                 AdaptivePhyMemory.bind(device.address, transport, secure.peerNodeId.shortLabel())
                 // test_coc_phy_after_connect (default off): PHY only now, before the end-to-end handshake.
                 control?.requestPhyAfterConnect("relay")
@@ -595,14 +646,14 @@ class ReceiverStreamForwarder(
                         ForwardedStreamGrant(sourceNodeId, streamId, mediaKey),
                     ),
                 )
-                secure.writer.write(SecureRecordType.END_TO_END_CONTENT, grant)
+                hop.writer.write(SecureRecordType.END_TO_END_CONTENT, grant)
                 forwardLabels?.takeIf {
                     LabelRecords.streamHopNegotiated(true, secure.peerNodeId, endpoint.peerNodeId, endpoint.peerCapabilities)
                 }?.let { provider ->
                     // R4: always one record (count 0 when nothing was verified upstream).
-                    LabelRecords.write(secure.writer, endpoint.sealer, provider())
+                    LabelRecords.write(hop.writer, endpoint.sealer, provider())
                 }
-                secure.writer.flush()
+                hop.writer.flush()
                 // test_relay_upstream_dck (default off): a child that can relay gets DCK instead of HIGH on this
                 // link, so its own HIGH child link has two events per event of this one.
                 val childCanRelayLink = endpoint.peerCapabilities.maxChildren > 0
@@ -643,8 +694,11 @@ class ReceiverStreamForwarder(
                     gatt,
                     secure,
                     endpoint,
+                    hop,
                 )
                 pending = connection
+                childConnection = connection
+                pendingHop = null
                 pendingSocket = null
                 pendingGatt = null
                 pendingControlConnection = null
@@ -656,10 +710,10 @@ class ReceiverStreamForwarder(
                 onChildCountChanged(1)
                 var lastSequence = -1L
                 bootstrap.forEach { envelope ->
-                    secure.writer.write(SecureRecordType.MESH_ENVELOPE, MeshEnvelopeCodec.encode(envelope))
+                    hop.writer.write(SecureRecordType.MESH_ENVELOPE, MeshEnvelopeCodec.encode(envelope))
                     lastSequence = envelope.sequence
                 }
-                secure.writer.flush()
+                hop.writer.flush()
                 // Pace the child link from join; its first arrival report replaces the seed.
                 LinkPacerSeed.seed(connection.pacer, transport, connection.nodeId.shortLabel())?.let { kbps ->
                     Log.i("BluetoothVideo", "Child link pacer seeded at $kbps kbps until the child's first report (${transport.shortLabel})")
@@ -743,7 +797,10 @@ class ReceiverStreamForwarder(
                 var paceHeldNs = 0L
                 var paceExemptWrites = 0L
                 var paceExemptWaitNs = 0L
-                val linkLoad = NodeLinkLoad.open(transport, LinkDirection.SEND).also { activeLinkLoad = it }
+                val linkLoad = sendLoad.also {
+                    it.start()
+                    activeLinkLoad = it
+                }
                 // The writer judges the child only after a write returns, and a write into a stalled
                 // link can block for many seconds (mesh4-7a6c401c 0001: ASUS -> M31 CoC at 8 kbps was
                 // withdrawn 12.7 s behind live, M31 -> A15s likewise). Judge the same policy on a
@@ -838,7 +895,7 @@ class ReceiverStreamForwarder(
                     flushPending.set(false)
                     pendingFlushBytes.set(0)
                     val startedNs = System.nanoTime()
-                    secure.writer.flush()
+                    hop.writer.flush()
                     flushLatency.recordNanos(System.nanoTime() - startedNs)
                 }
 
@@ -902,7 +959,7 @@ class ReceiverStreamForwarder(
                         if (envelope.sequence <= lastSequence) continue
                         val encodedEnvelope = MeshEnvelopeCodec.encode(envelope)
                         val writeStartedNs = System.nanoTime()
-                        val wireBytes = secure.writer.write(
+                        val wireBytes = hop.writer.write(
                             SecureRecordType.MESH_ENVELOPE,
                             encodedEnvelope,
                         )
@@ -1014,11 +1071,11 @@ class ReceiverStreamForwarder(
                     if (flushPending.get()) runCatching { flushNow() }
                 }
                 withdrawalReason?.let { reason ->
-                    secure.writer.write(
+                    hop.sendHopControl(
                         SecureRecordType.ROUTE_CONTROL,
                         StreamRouteControlProtocol.encode(reason),
                     )
-                    secure.writer.flush()
+                    hop.writer.flush()
                     if (!connection.routeWithdrawalAck.await(
                             ROUTE_WITHDRAWAL_ACK_TIMEOUT_MS,
                             TimeUnit.MILLISECONDS,
@@ -1090,6 +1147,7 @@ class ReceiverStreamForwarder(
                 stallGuard?.complete(android.os.SystemClock.elapsedRealtime())
                 reanchorClosedChild.set(false)
                 pending?.let(::removeChild)
+                runCatching { pendingHop?.close() }
                 runCatching { pendingGatt?.close() }
                 runCatching { pendingSocket?.close() }
                 pendingControlConnection?.let {
@@ -1160,7 +1218,7 @@ class ReceiverStreamForwarder(
                     (!closed.get() && child === connection) ||
                     (withdrawalReason != null && connection.routeWithdrawalAck.count > 0L)
                 ) {
-                    val record = connection.secure.reader.read()
+                    val record = connection.hop.reader.read()
                     when (record.type) {
                         SecureRecordType.LINK_HEARTBEAT -> {
                             // A delivery-only report repeats the last full report (this relay does not use delivery).
@@ -1197,12 +1255,14 @@ class ReceiverStreamForwarder(
                                 // Not backlogged: the burst is only a lower bound, so it seeds the pace and is not a measurement.
                                 if (report.arrivalKbps > 0 && joinProbe?.linkBound != false) {
                                     core.setChildDrainKbps(connection.endpoint.peerNodeId, report.arrivalKbps)
-                                    LinkCapacity.recordProbe(transport, report.arrivalKbps)
-                                    LinkCapacity.recordPeerLinkKbps(
-                                        transport,
-                                        connection.nodeId.shortLabel(),
-                                        report.arrivalKbps,
-                                    )
+                                    if (learnsBluetoothCapacity(connection.hop.acceptKind, connection.hop.sendKind)) {
+                                        LinkCapacity.recordProbe(transport, report.arrivalKbps)
+                                        LinkCapacity.recordPeerLinkKbps(
+                                            transport,
+                                            connection.nodeId.shortLabel(),
+                                            report.arrivalKbps,
+                                        )
+                                    }
                                     if (DebugTunables.linkPacing) {
                                         connection.pacer.setMeasuredLinkKbps(report.arrivalKbps)
                                     }
@@ -1307,6 +1367,7 @@ class ReceiverStreamForwarder(
         private val gatt: GattVideoConnection?,
         val secure: SecureBluetoothSession,
         val endpoint: EndToEndVideoSession,
+        val hop: HopLink,
     ) : Closeable {
         val terminalAck = CountDownLatch(1)
         val routeWithdrawalAck = CountDownLatch(1)
@@ -1323,7 +1384,7 @@ class ReceiverStreamForwarder(
             if (!closed.compareAndSet(false, true)) return
             controlThread?.interrupt()
             heartbeatThread?.interrupt()
-            runCatching { secure.close() }
+            runCatching { hop.close() }
             runCatching { endpoint.close() }
             runCatching { gatt?.close() }
             runCatching { socket?.close() }

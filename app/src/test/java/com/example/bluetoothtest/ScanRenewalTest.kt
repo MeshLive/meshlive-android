@@ -81,6 +81,11 @@ class ScanRenewalTest {
         ScanSwitches.reset()
         assertFalse(ScanSwitches.renewalLegacy)
         ScanSwitches.apply { key, default -> if (key == "test_scan_renewal_legacy") true else default }
+        if (!BuildConfig.DEBUG) {
+            // A release build ignores the launch extra: the legacy arm stays off.
+            assertFalse(ScanSwitches.renewalLegacy)
+            return
+        }
         assertTrue(ScanSwitches.renewalLegacy)
         assertEquals(20 * 60_000L, ScanRenewalPolicy.intervalMs(34))
         assertFalse(ScanSwitches.renewalAll)

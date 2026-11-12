@@ -57,7 +57,7 @@ class DeviceFamilyPolicyMigrationTest {
 
     @Test
     fun benchmarkPhonesLoadFromTheDeviceRegistryAndCapabilityFiles() {
-        assertEquals(listOf("a15s", "a55", "asus", "m31", "s22", "s24", "xiaomi"), known.map { it.alias })
+        assertEquals(listOf("a15s", "a55", "asus", "m31", "realme", "s22", "s24", "xiaomi"), known.map { it.alias })
         val asus = known.single { it.alias == "asus" }.traits
         assertEquals(30, asus.sdkInt)
         assertEquals(SocFamily.QUALCOMM, asus.socFamily)

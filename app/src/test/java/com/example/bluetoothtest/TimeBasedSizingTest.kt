@@ -392,6 +392,11 @@ class TimeBasedSizingTest {
         assertNull(PlaybackDelayProfile.AUTO.newPlayoutClock().timeTargetSummary())
         DebugTunables.playoutTimeTarget = true
         try {
+            if (!BuildConfig.DEBUG) {
+                // A release build ignores the Experimental switch: no viewer target.
+                assertNull(PlaybackDelayProfile.AUTO.newPlayoutClock().timeTargetSummary())
+                return
+            }
             assertNotNull(PlaybackDelayProfile.AUTO.newPlayoutClock().timeTargetSummary())
             assertNotNull(PlaybackDelayProfile.BALANCED.newPlayoutClock().timeTargetSummary())
             assertNull(PlaybackDelayProfile.CALL_BALANCED.newPlayoutClock().timeTargetSummary())

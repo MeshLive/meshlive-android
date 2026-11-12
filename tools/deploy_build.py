@@ -17,9 +17,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from android_tools import default_adb  # noqa: E402
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from android_tools import default_adb  # noqa: E402
-
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = os.environ.get("MESHLIVE_APP_ID", "io.github.meshlive.app")
 DEFAULT_APK = ROOT / "app/build/outputs/apk/github/debug/app-github-debug.apk"
@@ -51,7 +48,8 @@ def install(adb, phone, serial, apk):
     state = run("get-state", timeout=10)
     if state.returncode != 0 or state.stdout.strip() != "device":
         return phone, "UNAVAILABLE"
-    result = run("install", "-r", str(apk))
+    # -d: frozen debug builds of an older version (A/B comparators) must install over a newer release candidate.
+    result = run("install", "-r", "-d", str(apk))
     if result.returncode != 0 or "Success" not in result.stdout:
         return phone, f"FAILED: {(result.stdout + result.stderr).strip()[-200:]}"
     run("shell", "am", "force-stop", PACKAGE, timeout=20)

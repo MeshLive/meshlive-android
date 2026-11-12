@@ -203,7 +203,7 @@ class AudioCapturePolicyTest {
         assertEquals(BlankCaptureEvidence.Verdict.NEVER_SIGNAL, midCall.onFrame(0))
 
         AudioSwitches.captureSilenceEvidence = false
-        assertFalse("DEBUG control arm", AudioSwitches.captureSilenceEvidence)
+        assertEquals("DEBUG control arm; a release build keeps it on", !BuildConfig.DEBUG, AudioSwitches.captureSilenceEvidence)
         AudioSwitches.captureSilenceEvidence = true
     }
 

@@ -45,6 +45,11 @@ class LeTransportExperimentsTest {
     fun codedPhyExperimentRequestsCodedButInitiatesOnLe1m() {
         try {
             DebugTunables.experimentalBlePhy = ExperimentalBlePhy.CODED_S8
+            if (!BuildConfig.DEBUG) {
+                // A release build ignores the experiment: 2M stays.
+                assertEquals(BluetoothDevice.PHY_LE_2M_MASK, BlePhyPreference.TWO_M.mask)
+                return
+            }
             assertEquals(BluetoothDevice.PHY_LE_CODED_MASK, BlePhyPreference.TWO_M.mask)
             assertEquals(BluetoothDevice.PHY_OPTION_S8, BlePhyPreference.TWO_M.option)
             assertEquals("Coded S8 (experimental)", BlePhyPreference.TWO_M.label)

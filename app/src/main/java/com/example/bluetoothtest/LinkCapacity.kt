@@ -154,6 +154,24 @@ internal object LinkCapacityPolicy {
     fun relayColdStart(learned: LearnedLinkCapacity, nowMs: Long): Boolean =
         learned.provenKbps <= 0 && freshCeiling(learned, nowMs) == null
 
+    /** [relayFloor] answers: no floor, the cold start, or the Experimental no-ceiling floor. */
+    const val FLOOR_NONE = "none"
+    const val FLOOR_COLD_START = "cold_start"
+    const val FLOOR_NO_CEILING = "no_ceiling"
+
+    /**
+     * Which rule raises the relay budget to at least 2 x the per-link load ([relayBudgetKbps]): [FLOOR_COLD_START] when
+     * [coldStartOn] (`test_relay_cold_start`, default on) and [relayColdStart]; else [FLOOR_NO_CEILING] when [noCeilingOn]
+     * (Experimental `test_relay_no_ceiling_floor`, design decision 2026-11-06) and there is no fresh relay ceiling, whatever
+     * was proven, so a phone that once relayed a small stream is not refused a larger one a never-measured phone would take;
+     * else [FLOOR_NONE]. A fresh relay ceiling (a measured overload) always keeps the measured budget.
+     */
+    fun relayFloor(learned: LearnedLinkCapacity, nowMs: Long, coldStartOn: Boolean, noCeilingOn: Boolean): String = when {
+        coldStartOn && relayColdStart(learned, nowMs) -> FLOOR_COLD_START
+        noCeilingOn && freshCeiling(learned, nowMs) == null -> FLOOR_NO_CEILING
+        else -> FLOOR_NONE
+    }
+
     /**
      * Relay budget. At cold start the incoming link is already carried, so the relay may add exactly
      * one child: max(measured budget, incoming + one child link). Otherwise the measured budget.
@@ -245,10 +263,40 @@ internal fun classifyLinkWindow(
     return kind to state
 }
 
-/** Per-transport capacity this phone has learned about itself, persisted across sessions. */
+/**
+ * Per-transport capacity this phone has learned about itself, persisted across sessions. This phone's own capacity (probe,
+ * proven load, ceilings per transport) stays in the [PREFS] preferences; nothing there names a peer. What is learned per
+ * peer (the start rate a link to it sustained, the arrival rate it reported) names that peer by its 12-hex node prefix
+ * and the time: audit 2026-11-10 SEC-05 moved it into a sealed memory ([peerRecords]).
+ */
 object LinkCapacity {
     private const val PREFS = "link_capacity"
     @Volatile private var prefs: SharedPreferences? = null
+
+    /**
+     * Audit 2026-11-10 SEC-05: per-peer start rates (`<radio>.sustained2.<use>.<peer>`, value `bps` or `bps,build`) and
+     * peer link reports (`<radio>.peerlink.<peer>`, value `kbps`), sealed with the verified-contacts Keystore key. A
+     * record is dropped once older than [LinkCapacityPolicy.SUSTAINED_TTL_MS] (it is not read after that) and at most
+     * [PEER_RECORDS_MAX] are kept. Plain entries an earlier build left in [PREFS] are moved here once and deleted (the
+     * worker confirms the preferences file on the disk no longer names a peer). One store per process: a second attach
+     * gets the same one.
+     */
+    @Volatile private var peerContext: Context? = null
+
+    /** Looked up per use (re-review N3): after a wipe resumed in this process, the next use opens the new, empty store. */
+    private val peerRecords: SealedRecords?
+        get() = peerContext?.let(peerSlot::get)
+    internal const val PEER_RECORDS_FILE = "link-peers.bin"
+    internal const val PEER_RECORDS_MAX = 256
+    private val peerSlot = SealedRecordsSlot(
+        PEER_RECORDS_FILE, PEER_RECORDS_MAX, LinkCapacityPolicy.SUSTAINED_TTL_MS,
+    ) { app -> plainPeerSource(app) }
+
+    /** Opens the sealed per-peer memory (process start and [attach]); its disk work runs on the sealed-records worker. */
+    internal fun openPeerRecords(context: Context): SealedRecords {
+        peerContext = context.applicationContext
+        return peerSlot.get(context)
+    }
     @Volatile var features: PhoneRadioFeatures? = null
         private set
     /**
@@ -263,6 +311,7 @@ object LinkCapacity {
         WifiCoexistence.attach(context)
         BluetoothAudioCoexistence.attach(context)
         prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        runCatching { openPeerRecords(context) }
         AdaptivePhyMemory.attach(context)
         buildStamp = runCatching {
             context.packageManager.getPackageInfo(context.packageName, 0).lastUpdateTime
@@ -304,14 +353,24 @@ object LinkCapacity {
     }
 
     /** Capacity learned while 2.4 GHz Wi-Fi shares the radio is kept apart from clean-radio capacity. */
-    private fun radioKey(transport: BluetoothTransportOption): String =
-        transport.name + (if (WifiCoexistence.sharesBluetoothBand()) ".wifi24" else "") +
-            BluetoothAudioCoexistence.capacityKeySuffix() + // "" unless the Experimental test_bt_audio_capacity_key is on
-            phyCapacityKey(transport, DebugTunables.experimentalBlePhy)
+    private fun radioKey(transport: BluetoothTransportOption, carrier: CarrierKind = CarrierKind.BLUETOOTH): String =
+        if (carrier.isWifi) {
+            // A Wi-Fi carrier's key is its name alone: Bluetooth coexistence and PHY suffixes describe a Bluetooth link.
+            carrier.name
+        } else {
+            // AP10 (WIFI-19): a live 2.4 GHz Wi-Fi Aware data path of this app shares the radio like a 2.4 GHz access point does.
+            transport.name + (if (WifiCoexistence.sharesBluetoothBand() || WifiRadio.ledger.band24PathLive) ".wifi24" else "") +
+                BluetoothAudioCoexistence.capacityKeySuffix() + // "" unless the Experimental test_bt_audio_capacity_key is on
+                phyCapacityKey(transport, DebugTunables.experimentalBlePhy)
+        }
 
-    fun learned(transport: BluetoothTransportOption, kind: LinkLoadKind): LearnedLinkCapacity {
+    fun learned(
+        transport: BluetoothTransportOption,
+        kind: LinkLoadKind,
+        carrier: CarrierKind = CarrierKind.BLUETOOTH,
+    ): LearnedLinkCapacity {
         val store = prefs ?: return LearnedLinkCapacity()
-        val radio = radioKey(transport)
+        val radio = radioKey(transport, carrier)
         val key = "$radio.${kind.key}"
         val ceilingVersion = store.getInt("$key.ceilingVersion", 1)
         return LearnedLinkCapacity(
@@ -366,11 +425,16 @@ object LinkCapacity {
         peer: String,
         buildKeyed: Boolean = false,
     ): Int? {
-        val store = prefs ?: return null
-        val key = sustainedKey(transport, use, peer, buildKeyed)
-        val age = System.currentTimeMillis() - store.getLong("$key.at", 0L)
-        if (buildKeyed && store.getLong("$key.build", 0L) != buildStamp) return null
-        return store.getInt(key, 0).takeIf { it > 0 && age in 0 until LinkCapacityPolicy.SUSTAINED_TTL_MS }
+        val record = peerRecords?.get(sustainedKey(transport, use, peer, buildKeyed)) ?: return null
+        return sustainedBpsOf(record, buildKeyed, buildStamp, System.currentTimeMillis())
+    }
+
+    /** A stored start rate: `bps`, or `bps,build` for the build-keyed format; null when unusable now. */
+    internal fun sustainedBpsOf(record: SealedRecords.Record, buildKeyed: Boolean, build: Long, nowMs: Long): Int? {
+        val parts = record.value.split(',')
+        if (buildKeyed && parts.getOrNull(1)?.toLongOrNull() != build) return null
+        val age = nowMs - record.atMs
+        return parts[0].toIntOrNull()?.takeIf { it > 0 && age in 0 until LinkCapacityPolicy.SUSTAINED_TTL_MS }
     }
 
     fun recordSustainedVideoBps(
@@ -383,9 +447,7 @@ object LinkCapacity {
         // Review 2026-10-27 (finding 15): nothing is written once an emergency wipe started (it would recreate the file).
         if (WipeGuard.active) return
         val key = sustainedKey(transport, use, peer, buildKeyed)
-        val edit = prefs?.edit()?.putInt(key, bps)?.putLong("$key.at", System.currentTimeMillis()) ?: return
-        if (buildKeyed) edit.putLong("$key.build", buildStamp)
-        edit.apply()
+        peerRecords?.put(key, if (buildKeyed) "$bps,$buildStamp" else "$bps")
     }
 
     /**
@@ -412,22 +474,44 @@ object LinkCapacity {
      * it at its own best single-link probe (mesh4-57484598).
      */
     fun peerLinkKbps(transport: BluetoothTransportOption, peer: String): Int? {
-        val store = prefs ?: return null
-        val key = "${radioKey(transport)}.peerlink.$peer"
-        val age = System.currentTimeMillis() - store.getLong("$key.at", 0L)
-        return store.getInt(key, 0).takeIf { it > 0 && age in 0 until LinkCapacityPolicy.SUSTAINED_TTL_MS }
+        val record = peerRecords?.get("${radioKey(transport)}.peerlink.$peer") ?: return null
+        val age = System.currentTimeMillis() - record.atMs
+        return record.value.toIntOrNull()?.takeIf { it > 0 && age in 0 until LinkCapacityPolicy.SUSTAINED_TTL_MS }
     }
 
     /** Stores [peer]'s report; rewrites only on a 10% change or after [PEER_LINK_REWRITE_MS]. */
     fun recordPeerLinkKbps(transport: BluetoothTransportOption, peer: String, kbps: Int) {
-        val store = prefs ?: return
+        val store = peerRecords ?: return
         if (peer.isEmpty() || kbps <= 0 || WipeGuard.active) return
         val key = "${radioKey(transport)}.peerlink.$peer"
         val now = System.currentTimeMillis()
-        val previous = store.getInt(key, 0)
-        val age = now - store.getLong("$key.at", 0L)
+        val stored = store.get(key)
+        val previous = stored?.value?.toIntOrNull() ?: 0
+        val age = now - (stored?.atMs ?: 0L)
         if (!peerLinkNeedsRewrite(previous, kbps, age)) return
-        store.edit().putInt(key, kbps).putLong("$key.at", now).apply()
+        store.put(key, "$kbps", now)
+    }
+
+    /** A key that names a peer: a start rate (with its `.at`/`.build` companions in the old plain format) or a peer link report. */
+    internal fun isPeerKey(key: String): Boolean = isSustainedKey(key) || ".peerlink." in key
+
+    /**
+     * The plain per-peer entries an earlier build wrote into [PREFS] (`key` Int, `key.at` Long, `key.build` Long), as
+     * sealed records; entries without a time are dropped (they could never be read as fresh).
+     */
+    internal fun plainPeerRecords(all: Map<String, *>): Map<String, SealedRecords.Record> =
+        all.keys.filter { isPeerKey(it) && !it.endsWith(".at") && !it.endsWith(".build") }.mapNotNull { key ->
+            val value = all[key] as? Int ?: return@mapNotNull null
+            val at = all["$key.at"] as? Long ?: return@mapNotNull null
+            val build = all["$key.build"] as? Long
+            key to SealedRecords.Record(if (build != null) "$value,$build" else "$value", at)
+        }.toMap()
+
+    /** The plain per-peer entries of an earlier build (a cache: deleted from [PREFS] even if sealing fails). */
+    private fun plainPeerSource(app: Context) = object : LegacyPlain {
+        override fun read() = plainPeerRecords(app.getSharedPreferences(PREFS, Context.MODE_PRIVATE).all)
+        override fun clean() = PlainPreferences.removeKeys(app, PREFS) { isPeerKey(it) }
+        override val cache = true
     }
 
     internal fun peerLinkNeedsRewrite(previousKbps: Int, kbps: Int, ageMs: Long): Boolean =
@@ -468,21 +552,25 @@ object LinkCapacity {
         return "ceilings=${ceilings.joinToString(",").ifEmpty { "none" }} | bad2m=${AdaptivePhyMemory.summary(now)}"
     }
 
-    /** DEBUG A/B arms: removes every remembered sustained start rate; returns how many were removed. */
+    /**
+     * DEBUG A/B arms: removes every remembered sustained start rate; returns how many were removed, or `pending` while the
+     * sealed memory is still loading (re-review S2: the removal is replayed onto it, and on an earlier build's plain rates,
+     * once it loads; a count taken then would claim 0).
+     */
     @Synchronized
-    fun clearSustainedRates(): Int {
-        val store = prefs ?: return 0
-        val keys = store.all.keys.filter { isSustainedKey(it) }
-        if (keys.isNotEmpty()) store.edit().apply { keys.forEach(::remove) }.commit()
-        return keys.count { !it.endsWith(".at") && !it.endsWith(".build") }
+    fun clearSustainedRates(): String {
+        val store = peerRecords ?: return "0"
+        val loaded = store.isLoaded()
+        val known = store.keys().count { isSustainedKey(it) }
+        store.retain { !isSustainedKey(it) }
+        return if (loaded) "$known" else "pending"
     }
 
     /** DEBUG: every remembered sustained start rate, "radio.sustained[2].use.peer=bps", for the launch record. */
     fun sustainedRatesSummary(): String {
-        val store = prefs ?: return "unavailable"
-        val rates = store.all.filter { (key, value) ->
-            isSustainedKey(key) && !key.endsWith(".at") && !key.endsWith(".build") && value is Int
-        }
+        val store = peerRecords ?: return "unavailable"
+        if (!store.isLoaded()) return "loading"
+        val rates = store.all().filterKeys { isSustainedKey(it) }.mapValues { it.value.value.substringBefore(',') }
         return if (rates.isEmpty()) "none" else rates.entries.sortedBy { it.key }.joinToString(" | ") { "${it.key}=${it.value}" }
     }
 
@@ -505,8 +593,15 @@ object LinkCapacity {
     fun measuredLinkKbps(transport: BluetoothTransportOption): Int? =
         LinkCapacityPolicy.freshProbe(learned(transport, LinkLoadKind.FAN_OUT), System.currentTimeMillis())
 
-    fun recordProbe(transport: BluetoothTransportOption, kbps: Int) =
-        update(transport, LinkLoadKind.FAN_OUT) { LinkCapacityPolicy.withProbe(it, kbps, System.currentTimeMillis()) }
+    /** This phone's fresh measured capacity of [carrier] on [transport], or null before any measurement. */
+    fun measuredLinkKbps(transport: BluetoothTransportOption, carrier: CarrierKind): Int? =
+        LinkCapacityPolicy.freshProbe(learned(transport, LinkLoadKind.FAN_OUT, carrier), System.currentTimeMillis())
+
+    fun recordProbe(
+        transport: BluetoothTransportOption,
+        kbps: Int,
+        carrier: CarrierKind = CarrierKind.BLUETOOTH,
+    ) = update(transport, LinkLoadKind.FAN_OUT, carrier) { LinkCapacityPolicy.withProbe(it, kbps, System.currentTimeMillis()) }
 
     fun summary(transport: BluetoothTransportOption): String {
         val now = System.currentTimeMillis()
@@ -525,14 +620,15 @@ object LinkCapacity {
     private fun update(
         transport: BluetoothTransportOption,
         kind: LinkLoadKind,
+        carrier: CarrierKind = CarrierKind.BLUETOOTH,
         change: (LearnedLinkCapacity) -> LearnedLinkCapacity,
     ) {
         val store = prefs ?: return
         if (WipeGuard.active) return
-        val before = learned(transport, kind)
+        val before = learned(transport, kind, carrier)
         val after = change(before)
         if (after == before) return
-        val radio = radioKey(transport)
+        val radio = radioKey(transport, carrier)
         val key = "$radio.${kind.key}"
         val nowMs = System.currentTimeMillis()
         val failures = LinkCapacityPolicy.nextProbeFailures(
@@ -636,6 +732,12 @@ object NodeLinkLoad {
 
     /** Media links this phone is sending on [transport] right now (fan-out when two or more). */
     fun sendLinks(transport: BluetoothTransportOption): Int = loads.getValue(transport).sendLinks.get()
+
+    /** Media links this phone is receiving on [transport] right now (a stream it watches or forwards). */
+    fun receiveLinks(transport: BluetoothTransportOption): Int = loads.getValue(transport).receiveLinks.get()
+
+    /** Bytes counted on [transport] in the current window (diagnostics and JVM tests; the window evaluation resets it). */
+    internal fun windowBytes(transport: BluetoothTransportOption): Long = loads.getValue(transport).bytes.get()
 
     @Synchronized
     fun open(transport: BluetoothTransportOption, direction: LinkDirection): Handle {

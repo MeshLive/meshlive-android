@@ -67,6 +67,7 @@ class BluetoothVideoRelay(
         }
         check(running.compareAndSet(false, true)) { "Relay is already running" }
         workerThread = thread(name = "BluetoothVideoRelay") {
+            OtherBluetoothMedia.manualRelayStarted()   // AP10: a call on this phone sees this relay; paired with the finally below
             try {
                 require(children.all { it.announcement.transportOption() == transport }) {
                     "Every selected receiver must advertise ${transport.shortLabel}"
@@ -92,6 +93,7 @@ class BluetoothVideoRelay(
                     onStatus("Relay stopped: ${error.message ?: error.javaClass.simpleName}")
                 }
             } finally {
+                OtherBluetoothMedia.manualRelayStopped()
                 running.set(false)
                 closeResources()
                 workerThread = null
@@ -156,6 +158,8 @@ class BluetoothVideoRelay(
             identity,
             capabilities,
         )
+        // A7 (X4): this harness relay keeps no HopLink and never writes BWF1; its children's CAPS are skipped below.
+        session.reader.acceptWifi = session.wifiReadOptIn
         require(session.peerCapabilities.transportMask and transport.capabilityMask != 0) {
             "Next receiver did not authenticate ${transport.shortLabel} support"
         }
@@ -213,6 +217,8 @@ class BluetoothVideoRelay(
         )
         downstreamSocket = connected.socket
         val session = connected.session
+        // A7 (X4): a child's CAPS is skipped by readSkippingBwf1, never an error.
+        session.reader.acceptWifi = session.wifiReadOptIn
         downstreamSession = session
         downstreamSessions += session
         // test_coc_phy_after_connect (default off): PHY only now, before media (no-op off CoC).
@@ -347,7 +353,7 @@ class BluetoothVideoRelay(
         child.writer.write(SecureRecordType.END_TO_END_HANDSHAKE, sourceHelloRecord.payload)
         child.writer.flush()
 
-        val viewerHelloRecord = child.reader.read()
+        val viewerHelloRecord = readSkippingBwf1(child.reader)
         require(viewerHelloRecord.type == SecureRecordType.END_TO_END_HANDSHAKE) {
             "Final receiver did not answer the end-to-end handshake"
         }
@@ -561,7 +567,7 @@ class BluetoothVideoRelay(
         child.writer.write(SecureRecordType.END_TO_END_HANDSHAKE, sourceHello.payload)
         child.writer.flush()
 
-        val receiverHello = child.reader.read()
+        val receiverHello = readSkippingBwf1(child.reader)
         require(receiverHello.type == SecureRecordType.END_TO_END_HANDSHAKE) {
             "Group receiver did not answer the endpoint handshake"
         }
@@ -624,7 +630,7 @@ class BluetoothVideoRelay(
         groupControlThreads += thread(name = "BluetoothGroupRelayControl-${child.peerNodeId.shortLabel()}") {
             try {
                 while (running.get() && activeChildren.containsKey(child.peerNodeId)) {
-                    val record = child.reader.read()
+                    val record = readSkippingBwf1(child.reader)
                     when (record.type) {
                         SecureRecordType.LINK_HEARTBEAT ->
                             SecureLinkControlProtocol.requireHeartbeat(record)
@@ -822,7 +828,7 @@ class BluetoothVideoRelay(
         childControlThread = thread(name = "BluetoothRelayChildControl") {
             try {
                 while (running.get()) {
-                    val downstream = child.reader.read()
+                    val downstream = readSkippingBwf1(child.reader)
                     when (downstream.type) {
                         SecureRecordType.LINK_HEARTBEAT ->
                             SecureLinkControlProtocol.requireHeartbeat(downstream)

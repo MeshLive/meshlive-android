@@ -5,9 +5,10 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, mock_open, patch
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
+import run_device_benchmark as device_runner
 import run_private_call_benchmark as runner
 
 
@@ -323,6 +324,22 @@ class PrivateCallBenchmarkTest(unittest.TestCase):
                             self.assertEqual(argv[argv.index("test_call_pipeline_timing") + 1], "true")
                         else:
                             self.assertNotIn("test_call_pipeline_timing", argv)
+
+    def test_names_before_answer_for_one_endpoint_reaches_only_that_endpoints_launch(self):
+        case = {**self.case, "tunables": {"bounded_media_age": True},
+                "phone_tunables": {"b": {"names_before_answer": True}}}
+        self.assertEqual({"a", "b"}, runner.validate_call_case(case, self.devices))
+        instance = runner.CallRunner("adb", self.devices, case, Path("unused"))
+        seen = {}
+        def record(phone, source=False):
+            seen[phone] = device_runner.phone_tunables(instance.case, phone)
+        with patch.object(runner.Runner, "launch", side_effect=record):
+            instance.launch("a")
+            instance.launch("b")
+        self.assertEqual({"bounded_media_age": True}, seen["a"])
+        self.assertEqual({"bounded_media_age": True, "names_before_answer": True}, seen["b"])
+        self.assertEqual({"test_bounded_media_age": True, "test_names_before_answer": True},
+                         device_runner.tunable_extras(seen["b"]))
 
     def test_broadcast_output_diagnostics_are_rejected_for_calls(self):
         for field in ("video_presentation_timing", "release_video_at_playout"):
@@ -703,6 +720,113 @@ class PrivateCallBenchmarkTest(unittest.TestCase):
             self.assertIn("frozen APK hash", manifest["runner_error"])
 
 
+class RotatingCalleeDiscoveryTest(unittest.TestCase):
+    """A stranger (rotating-ID) callee is found only through the discovery ID its own log announced."""
+
+    def setUp(self):
+        self.devices = {"a": {"serial": "a", "node_prefix": "000000000001"},
+                        "b": {"serial": "b", "node_prefix": "000000000002"}}
+        profile = {"codec": "e", "width": 640, "height": 360, "fps": 15, "bitrate_kbps": 150,
+                   "playback": "balanced", "rate_control": "cbr", "thermal_reduction": False}
+        self.case = {"id": "rot", "caller": "a", "callee": "b", "transport": "gatt", "duration_s": 60,
+                     "profiles": {"a": profile, "b": profile}, "tunables": {"rotating_ids": True},
+                     "connection_timeout_s": 3}
+        self.logs = {"a": "", "b": ""}
+
+    @staticmethod
+    def line(second, message, pid=123):
+        return f"10-03 00:00:{second:06.3f} {pid} 123 I BluetoothVideo: {message}\n"
+
+    def own(self, second, rdi, epoch=1):
+        return self.line(second, f"BENCHMARK rotid_own: role=call | epoch={epoch} | rdi={rdi}")
+
+    def seen(self, second, node):
+        return self.line(second, f"BENCHMARK call discovered: node={node} | transport=BLE_GATT")
+
+    def runner(self, case=None):
+        instance = runner.CallRunner("adb", self.devices, case or self.case, Path("rot-discovery"))
+        instance.logs = [{"device": "a"}, {"device": "b"}]
+        instance.log_text = lambda phone: self.logs[phone]
+        instance.supervise_captures = Mock()
+        return instance
+
+    def clock(self, ticks_before_deadline=50):
+        now = [0.0]
+        def monotonic():
+            return now[0]
+        def sleep(seconds):
+            now[0] += seconds
+            if self.on_poll:
+                self.on_poll()
+        return monotonic, sleep
+
+    on_poll = None
+
+    def test_a_rotating_callee_is_matched_through_its_own_advertised_id(self):
+        self.logs["b"] = self.own(1, "3c0544356ffd")
+        self.logs["a"] = self.seen(2, "3c0544356ffd")
+        instance = self.runner()
+        row = instance.discover_peer("a", "b")
+        self.assertIn("node=3c0544356ffd", row["message"])
+        self.assertEqual("3c0544356ffd", instance.dial_prefix("a", "b"))
+        self.assertEqual("rotating_peer_bound", instance.events[-1]["action"])
+
+    def test_another_phones_rotating_id_is_never_accepted(self):
+        self.logs["b"] = self.own(1, "3c0544356ffd")
+        self.logs["a"] = self.seen(2, "4f171123640a") + self.seen(3, "c3c7176b4aa7") + self.seen(4, "000000000002")
+        instance = self.runner()
+        monotonic, sleep = self.clock()
+        with patch.object(runner.time, "monotonic", monotonic), patch.object(runner.time, "sleep", sleep),              patch.object(instance, "late_evidence", return_value=None),              patch.object(instance, "dump_log_lines", return_value=([], [])),              patch.object(instance, "log_loss_error", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "a: no app evidence for .*3c0544356ffd"):
+                instance.discover_peer("a", "b")
+        self.assertEqual({}, instance.dial_ids)
+
+    def test_a_callee_that_never_logs_its_own_id_cannot_be_bound(self):
+        self.logs["a"] = self.seen(2, "4f171123640a")
+        instance = self.runner()
+        monotonic, sleep = self.clock()
+        with patch.object(runner.time, "monotonic", monotonic), patch.object(runner.time, "sleep", sleep):
+            with self.assertRaisesRegex(RuntimeError, "b: rotating IDs are on but the app logged no 'rotid_own'"):
+                instance.discover_peer("a", "b")
+
+    def test_the_wait_follows_an_epoch_rollover_to_the_new_id(self):
+        # The caller has scanned the old ID; the callee then rolls over and the caller scans the new one.
+        self.logs["b"] = self.own(1, "aaaaaaaaaaaa", epoch=1)
+        self.logs["a"] = self.seen(2, "aaaaaaaaaaaa")
+        instance = self.runner()
+        instance.dial_ids["b"] = "aaaaaaaaaaaa"
+        self.assertEqual("aaaaaaaaaaaa", instance.dial_prefix("a", "b"))
+        self.logs["b"] += self.own(5, "bbbbbbbbbbbb", epoch=2)  # boundary: the old row is stale now
+        polls = []
+        def on_poll():
+            polls.append(1)
+            if len(polls) == 3:
+                self.logs["a"] += self.seen(6, "bbbbbbbbbbbb")
+        monotonic, sleep = self.clock()
+        self.on_poll = on_poll
+        with patch.object(runner.time, "monotonic", monotonic), patch.object(runner.time, "sleep", sleep):
+            self.assertEqual("bbbbbbbbbbbb", instance.dial_prefix("a", "b"))
+        self.assertGreaterEqual(len(polls), 3)
+        self.assertEqual("bbbbbbbbbbbb", instance.events[-1]["rdi"])
+
+    def test_a_fixed_id_callee_keeps_the_registry_prefix(self):
+        case = {**self.case, "tunables": {}}
+        self.logs["a"] = self.seen(2, "000000000002")
+        instance = self.runner(case)
+        self.assertIn("node=000000000002", instance.discover_peer("a", "b")["message"])
+        self.assertEqual("000000000002", instance.dial_prefix("a", "b"))
+
+    def test_the_invite_dials_the_rotating_id(self):
+        self.logs["b"] = self.own(1, "3c0544356ffd")
+        self.logs["a"] = self.seen(2, "3c0544356ffd")
+        instance = self.runner()
+        instance.discover_peer("a", "b")
+        instance.control = Mock(return_value={"ack_time": "10-03 00:00:03.000", "time": "10-03 00:00:03.000"})
+        instance.wait_for = Mock(return_value={"time": "10-03 00:00:03.100", "message": "x"})
+        instance.invite()
+        instance.control.assert_called_once_with("a", "call:3c0544356ffd")
+
+
 class RelayedPrivateCallTest(unittest.TestCase):
     """caller a -> opaque relay r -> callee b (one middle hop, BluetoothPrivateCallRelay)."""
 
@@ -810,6 +934,17 @@ class RelayedPrivateCallTest(unittest.TestCase):
                 self.line(1, f"Encrypted private-call link to {self.devices[peer]['node_prefix']} over BLE GATT (2M)") +
                 self.line(2, "BENCHMARK call phase ACTIVE"))
 
+    HOST_START_NS = 100 * 10**9  # the host clock reading when the relay was launched (its log starts at 00:00:00.000)
+
+    def timeline(self, end_at=8.0, launched=True):
+        """The runner's record of a call whose planned End went out `end_at` seconds after the relay's launch."""
+        events = {"runner_events": [{"device": "r", "action": "launch", "time": "10-03 00:00:00.000",
+                                     "host_monotonic_ns": self.HOST_START_NS}]} if launched else {"runner_events": []}
+        events["control_events"] = [] if end_at is None else [
+            {"device": "a", "action": "end", "acknowledged": True, "time": "10-03 00:00:08.000",
+             "host_monotonic_ns": self.HOST_START_NS + int(end_at * 10**9)}]
+        return events
+
     def score(self, relay_text, **extra):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
@@ -818,8 +953,9 @@ class RelayedPrivateCallTest(unittest.TestCase):
             logs = [{"device": phone, "path": phone + ".log", "pid": 123} for phone in "ab"]
             if relay_text is not None:
                 (folder / "r.log").write_text(relay_text, encoding="utf-8")
-                logs.append({"device": "r", "path": "r.log", "pid": 123, "role": "call_relay"})
-            manifest = {"scenario": self.case, "devices": self.devices, "logs": logs, **extra}
+                logs.append({"device": "r", "path": "r.log", "pid": 123, "role": "call_relay",
+                             "start": "10-03 00:00:00.000"})
+            manifest = {"scenario": self.case, "devices": self.devices, "logs": logs, **(self.timeline() | extra)}
             return runner.score_call_manifest(manifest, folder)
 
     def relay_log(self, callee="000000000002", caller="000000000001"):
@@ -840,12 +976,67 @@ class RelayedPrivateCallTest(unittest.TestCase):
         self.assertEqual({item["status"] for item in hop["forwarding"].values()}, {"UNMEASURED"})
         self.assertIn("forwarding", " ".join(score["limitations"]))
 
+    def closure_gate(self, **timeline):
+        hop = self.score(self.relay_log(), **self.timeline(**timeline))["relays"][0]
+        return hop["gates"]["relay_unplanned_closures"]
+
+    def test_a_relay_closure_after_the_planned_end_is_planned_and_one_before_it_fails(self):
+        # relay_log() closes the caller path 9 s after the relay's launch.
+        self.assertEqual("PASS", self.closure_gate(end_at=8.0)["status"])
+        before = self.closure_gate(end_at=12.0)
+        self.assertEqual(("FAIL", 1), (before["status"], before["value"]))
+        self.assertEqual("FAIL", self.closure_gate(end_at=None)["status"])
+
+    def test_a_closure_the_live_health_check_never_saw_still_fails(self):
+        # health_events is empty: the relay's own log is the evidence, not whether the runner polled it in time.
+        score = self.score(self.relay_log(), **self.timeline(end_at=None), health_events=[])
+        hop = score["relays"][0]
+        self.assertEqual("FAIL", hop["gates"]["relay_unplanned_closures"]["status"])
+        self.assertEqual("FAIL", hop["log_status"])
+        self.assertEqual("FAIL", score["overall_status"])
+
+    def test_a_closure_that_cannot_be_placed_on_the_host_clock_is_unmeasured_not_a_pass(self):
+        gate = self.closure_gate(launched=False)
+        self.assertEqual("UNMEASURED", gate["status"])
+        self.assertIn("host clock", gate["reason"])
+
+    def test_a_relay_that_never_closed_passes_without_any_planned_end(self):
+        quiet = "".join(item for item in self.relay_log().splitlines(keepends=True) if "closed" not in item)
+        score = self.score(quiet, **self.timeline(end_at=None, launched=False))
+        self.assertEqual("PASS", score["relays"][0]["gates"]["relay_unplanned_closures"]["status"])
+
+    def test_a_planned_kill_without_a_clock_cannot_excuse_a_closure(self):
+        events = self.timeline(end_at=None)
+        events["control_events"] = [{"device": "a", "action": "kill", "acknowledged": True, "time": "10-03 00:00:08.000"}]
+        gate = self.score(self.relay_log(), **events)["relays"][0]["gates"]["relay_unplanned_closures"]
+        self.assertEqual("UNMEASURED", gate["status"])
+
     def test_active_call_without_the_relay_join_is_a_failed_requested_chain(self):
         for text in (None, self.line(0.5, "Private-call relay authenticated callee 000000000002.")):
             with self.subTest(relay_log=text is not None):
                 score = self.score(text)
                 self.assertEqual(score["relays"][0]["gates"]["requested_relay_route"]["status"], "FAIL")
                 self.assertEqual(score["overall_status"], "FAIL")
+
+    def test_a_relay_join_line_logd_dropped_is_unmeasured_not_a_failed_chain(self):
+        relay = self.line(0.5, "Private-call relay authenticated callee 000000000002.")
+        for drops, expected in ((self.line(0.8, "x").replace("BluetoothVideo: x", "liblog  : 9"), "UNMEASURED"),
+                                ("", "FAIL")):
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
+                folder = Path(directory)
+                for phone in "ab":
+                    (folder / f"{phone}.log").write_text(self.endpoint_log(phone), encoding="utf-8")
+                (folder / "r.log").write_text(relay, encoding="utf-8")
+                (folder / "r-liblog.log").write_text(drops, encoding="utf-8")
+                logs = [*({"device": phone, "path": phone + ".log", "pid": 123} for phone in "ab"),
+                        {"device": "r", "path": "r.log", "pid": 123, "role": "call_relay"}]
+                capture = {"device": "r", "pid": 123, "path": "r-liblog.log",
+                           "sha256": hashlib.sha256((folder / "r-liblog.log").read_bytes()).hexdigest()}
+                score = runner.score_call_manifest({"scenario": self.case, "devices": self.devices, "logs": logs,
+                                                    "log_drops": [capture]}, folder)
+                route = score["relays"][0]["gates"]["requested_relay_route"]
+                self.assertEqual(expected, route["status"])
+                self.assertEqual(expected == "UNMEASURED", route.get("reason") == "log lines dropped by logd")
 
     def test_wrong_adjacent_identity_or_unplanned_relay_loss_fails(self):
         for text, extra, name in ((self.relay_log(callee="0000000000ff"), {}, "relay_adjacent_child_identity"),
@@ -995,6 +1186,268 @@ class RelayChainPrivateCallTest(unittest.TestCase):
         self.assertEqual(hops[0]["gates"]["requested_relay_route"]["status"], "FAIL")
         self.assertEqual(hops[1]["gates"]["relay_adjacent_parent_identity"]["status"], "FAIL")
 
+    def test_a_relayed_carrier_case_launches_the_relay_with_the_carrier(self):
+        case = {**self.case, "carrier": "wifi_aware", "relays": ["c"]}
+        devices = {**self.devices, "c": {"serial": "c", "node_prefix": "000000000003"}}
+        runner.validate_call_case(case, devices)
+        launch = runner.relay_launch_case(case, "c")
+        self.assertEqual("wifi_aware", launch["carrier"])
+        self.assertEqual(self.case["transport"], launch["transport"])
+        self.assertNotIn("carrier", runner.relay_launch_case(self.case, "c"))
+
+class RelayedCalleeSettleTest(unittest.TestCase):
+    """A callee with relayed calls on rebuilt its idle endpoint at its first helper tick (rc-ctl-20261106): the relay is
+    launched only after that tick, and a relay timeout caused by a later restart says so."""
+
+    def setUp(self):
+        RelayedPrivateCallTest.setUp(self)  # the a -> r -> b case and registry
+        self.case["tunables"] = {"relayed_calls": True, "relayed_calls_consent": True}
+        self.clock = [0.0]
+
+    line = staticmethod(PrivateCallBenchmarkTest.line)
+    AVAILABLE = "BENCHMARK call available: node=000000000002"
+    RUNNING = "BENCHMARK relayed_helper: state=RUNNING | reason=NONE | scan=BALANCED | relaying=false"
+
+    def instance(self, callee_log, relay_log=""):
+        instance = runner.CallRunner("adb", self.devices, self.case, Path("unused"))
+        instance.log_text = lambda phone: callee_log if phone == "b" else relay_log
+        instance.check_cancelled = Mock()
+
+        def wait(phone, expression, since=None, timeout=None):
+            rows = [row for row in runner.records(instance.log_text(phone))
+                    if (since is None or row["at"] > runner.timestamp(since)) and runner.re.search(expression, row["message"])]
+            if not rows:
+                raise RuntimeError(f"{phone}: no app evidence for {expression!r} within the deadline")
+            return rows[0]
+        instance.wait_for = Mock(side_effect=wait)
+        instance.logs = [{"device": "b", "path": "b.log"}]
+        return instance
+
+    def settle(self, instance):
+        def sleep(seconds):
+            self.clock[0] += seconds
+        with patch.object(runner.time, "monotonic", lambda: self.clock[0]), patch.object(runner.time, "sleep", sleep):
+            return instance.settle_relayed_callee("b", instance.endpoint_ready("b"))
+
+    def test_a_restart_at_the_first_tick_is_waited_out_before_the_relay(self):
+        log = (self.line(0.1, self.AVAILABLE) + self.line(5.1, self.RUNNING) +
+               self.line(5.13, "BENCHMARK incoming_handshake: result=failed | reason=EOFException") +
+               self.line(5.14, "Stopped.") + self.line(5.75, self.AVAILABLE))
+        instance = self.instance(log)
+        ready = self.settle(instance)
+        self.assertEqual(ready["time"], "10-03 00:00:05.750")
+        self.assertEqual([event["action"] for event in instance.relay_events], ["callee_endpoint_restarted", "callee_settled"])
+        self.assertEqual(instance.relay_events[-1]["restarts"], 1)
+
+    def test_a_quiet_first_tick_launches_the_relay_without_the_full_wait(self):
+        instance = self.instance(self.line(0.1, self.AVAILABLE) + self.line(5.1, self.RUNNING))
+        ready = self.settle(instance)
+        self.assertEqual(ready["time"], "10-03 00:00:00.100")
+        self.assertEqual(instance.relay_events, [{"device": "b", "action": "callee_settled", "time": ready["time"], "restarts": 0}])
+        self.assertLess(self.clock[0], runner.CALLEE_SETTLE_S)
+
+    def test_no_tick_waits_the_settle_window_and_relayed_calls_off_does_not_wait(self):
+        instance = self.instance(self.line(0.1, self.AVAILABLE))
+        self.settle(instance)
+        self.assertGreaterEqual(self.clock[0], runner.CALLEE_SETTLE_S)
+        self.case["tunables"] = {"bounded_media_age": True}
+        self.clock[0] = 0.0
+        instance = self.instance(self.line(0.1, self.AVAILABLE) + self.line(5.14, "Stopped."))
+        self.settle(instance)
+        self.assertEqual(self.clock[0], 0.0)
+        self.assertEqual(instance.relay_events, [])
+        self.case["tunables"] = {"relayed_calls": True}
+        self.case["callee_settle"] = False
+        instance = self.instance(self.line(0.1, self.AVAILABLE) + self.line(5.14, "Stopped."))
+        self.settle(instance)
+        self.assertEqual((self.clock[0], instance.relay_events), (0.0, []))
+
+    def test_an_endpoint_that_keeps_restarting_fails_the_setup_explicitly(self):
+        log = self.line(0.1, self.AVAILABLE)
+        for second in (5, 10, 15):
+            log += self.line(second + 0.1, "Stopped.") + self.line(second + 0.7, self.AVAILABLE)
+        with self.assertRaisesRegex(RuntimeError, "callee endpoint restarted 3 times"):
+            self.settle(self.instance(log))
+
+    def test_a_relay_timeout_after_a_callee_restart_names_the_restart(self):
+        log = self.line(0.1, self.AVAILABLE) + self.line(5.1, self.RUNNING)
+        instance = self.instance(log)
+        instance.callee_settled = self.settle(instance)
+        # The callee restarts later, while the relay holds its hop (a build without the restart guard).
+        instance.log_text = lambda phone: log + self.line(12.0, "Stopped.") if phone == "b" else ""
+        with self.assertRaisesRegex(RuntimeError, r"no app evidence .*; callee endpoint restarted at 10-03 00:00:12.000"):
+            instance.relay_wait("r", runner.RELAY_JOINED, "b")
+        self.assertEqual(instance.relay_events[-1]["action"], "callee_endpoint_restarted")
+        # Without a restart the relay's own error is unchanged.
+        instance = self.instance(self.line(0.1, self.AVAILABLE) + self.line(5.1, self.RUNNING))
+        instance.callee_settled = self.settle(instance)
+        with self.assertRaisesRegex(RuntimeError, r"within the deadline$"):
+            instance.relay_wait("r", runner.RELAY_JOINED, "b")
+
+
+class LoggerDropTest(unittest.TestCase):
+    """logd drops app lines under a log burst (ASUS, Android 11, release-window-pres: the one-time
+    `call phase ACTIVE` vanished at camera open while the call showed video). liblog reports the count
+    in the events buffer on the process's next stored write. A missing one-time line inside a reported
+    window is UNMEASURED, never FAIL and never PASS; without a report it stays a failure."""
+
+    line = staticmethod(PrivateCallBenchmarkTest.line)
+
+    def setUp(self):
+        self.base = PrivateCallBenchmarkTest()
+        self.base.setUp()
+        self.case, self.devices = self.base.case, self.base.devices
+
+    @staticmethod
+    def drop(second, count, pid=123):
+        return f"10-03 00:00:{second:06.3f} {pid} {pid + 17} I liblog  : {count}\n"
+
+    def endpoint(self, phone, active=True):
+        own, remote = (15, 30) if phone == "a" else (30, 15)
+        return (self.base.log(phone, own, remote) + self.line(1.5, "BENCHMARK call phase NEGOTIATING_MEDIA") +
+                (self.line(2.2, "BENCHMARK call phase ACTIVE") if active else "") +
+                self.line(14, "BENCHMARK call phase ENDED"))
+
+    def score(self, logs, drops, **extra):
+        """logs/drops: phone -> app log text / liblog capture text (None = no capture recorded)."""
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            captures, tamper = [], extra.pop("tamper", ())
+            for phone, text in logs.items():
+                (folder / f"{phone}.log").write_text(text, encoding="utf-8")
+                if drops.get(phone) is not None:
+                    path = folder / f"{phone}-123-liblog.log"
+                    path.write_text(drops[phone], encoding="utf-8")
+                    captures.append({"device": phone, "pid": 123, "path": path.name, "status": "MEASURED",
+                                     "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+            for item in captures:
+                if item["device"] in tamper:
+                    (folder / item["path"]).write_text(self.drop(3, 1), encoding="utf-8")
+            manifest = {"scenario": self.case, "devices": self.devices, "log_drops": captures,
+                        "logs": [{"device": phone, "path": phone + ".log", "pid": 123} for phone in logs],
+                        "setup_anchors": [{"device": phone, "time": "10-03 00:00:00.500"} for phone in logs], **extra}
+            return runner.score_call_manifest(manifest, folder)
+
+    def active_gates(self, score):
+        return {item["device"]: item["gates"].get("call_phase_active", {}).get("status") for item in score["devices"]}
+
+    def test_callee_active_line_lost_in_a_reported_drop_is_unmeasured_not_failed(self):
+        # The caller's log shows no call picture here, so nothing but the callee's own (dropped) line could prove
+        # ACTIVE. With the peer's picture the gate is proven by the peer (test_call_validity, 2026-11-10).
+        caller = "".join(text for text in self.endpoint("a").splitlines(True)
+                         if "visible continuity" not in text and "first-surface" not in text)
+        score = self.score({"a": caller, "b": self.endpoint("b", active=False)},
+                           {"a": "", "b": self.drop(2.4, 12)})
+        self.assertEqual({"a": "PASS", "b": "UNMEASURED"}, self.active_gates(score))
+        callee = score["devices"][1]
+        self.assertEqual("log lines dropped by logd", callee["gates"]["call_phase_active"]["reason"])
+        self.assertNotEqual("FAIL", callee["log_status"])
+        self.assertNotEqual("FAIL", score["log_status"])
+
+    def test_active_is_counted_on_both_endpoints_and_a_missing_line_without_drops_fails(self):
+        for missing in "ab":
+            with self.subTest(missing=missing):
+                score = self.score({phone: self.endpoint(phone, active=phone != missing) for phone in "ab"},
+                                   {"a": "", "b": ""})
+                self.assertEqual({phone: "FAIL" if phone == missing else "PASS" for phone in "ab"},
+                                 self.active_gates(score))
+                self.assertEqual("FAIL", score["log_status"])
+
+    def test_only_a_report_between_the_last_phase_and_ended_can_hide_active(self):
+        # Before NEGOTIATING_MEDIA (stored at 1.5 s) or after ENDED (stored at 14 s) a report covers other lines.
+        for drops in (self.drop(1.2, 40), self.drop(14.5, 40), self.drop(2.4, 9, pid=99)):
+            with self.subTest(drops=drops):
+                score = self.score({"a": self.endpoint("a"), "b": self.endpoint("b", active=False)}, {"a": "", "b": drops})
+                self.assertEqual("FAIL", self.active_gates(score)["b"])
+
+    def test_a_present_active_line_passes_despite_drops_and_a_changed_capture_confirms_nothing(self):
+        score = self.score({phone: self.endpoint(phone) for phone in "ab"}, {"a": self.drop(2.4, 5), "b": self.drop(2.4, 5)})
+        self.assertEqual({"a": "PASS", "b": "PASS"}, self.active_gates(score))
+        score = self.score({"a": self.endpoint("a"), "b": self.endpoint("b", active=False)},
+                           {"a": "", "b": self.drop(2.4, 12)}, tamper={"b"})
+        self.assertEqual("FAIL", self.active_gates(score)["b"])
+
+    def test_runs_without_a_drop_capture_keep_their_previous_gates(self):
+        score = self.score({"a": self.endpoint("a"), "b": self.endpoint("b", active=False)}, {})
+        self.assertEqual({"a": None, "b": None}, self.active_gates(score))
+
+    def test_a_runner_stop_on_a_dropped_one_time_line_is_unmeasured_only_when_the_capture_confirms_it(self):
+        loss = {"device": "b", "pid": 123, "pattern": "BENCHMARK call phase INCOMING_RINGING",
+                "after": "10-03 00:00:01.000", "reason": "log lines dropped by logd"}
+        logs = {phone: self.endpoint(phone) for phone in "ab"}
+        for drops, expected in ((self.drop(2.4, 7), "UNMEASURED"), ("", "FAIL"), (self.drop(0.8, 7), "FAIL")):
+            with self.subTest(drops=drops):
+                score = self.score(logs, {"a": "", "b": drops}, runner_error="b: no app evidence; log lines dropped by logd",
+                                   runner_error_log_loss=loss)
+                runner_gate = next(item for item in score["lifecycle"] if item["action"] == "runner")
+                self.assertEqual(expected, runner_gate["gate"]["status"])
+                self.assertEqual(expected == "FAIL", score["log_status"] == "FAIL")
+
+    def test_voice_accept_evidence_names_the_logger_drop(self):
+        event = {"device": "b", "action": "accept", "acknowledged": True, "surface_evidence": {"a": "10-03 00:00:02.200"},
+                 "surface_log_loss": {"b": {"device": "b", "pid": 123, "reason": "log lines dropped by logd"}}}
+        score = self.score({phone: self.endpoint(phone) for phone in "ab"}, {}, control_events=[event])
+        evidence = score["lifecycle"][0]["evidence"]["both_visible_surfaces"]
+        self.assertEqual(("UNMEASURED", "log lines dropped by logd"), (evidence["status"], evidence["reason"]))
+
+    def test_every_drop_capture_is_stopped_and_hash_bound_even_when_the_run_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            instance = runner.CallRunner("adb", self.devices, self.case, Path(directory) / "run")
+            instance.inventory = Mock(return_value={"apk_sha256": "a" * 64})
+            capture = Mock()
+
+            def launch(phone, source=False):
+                instance.drop_captures.append((capture, capture))
+                instance.drop_logs.append({"device": phone, "pid": 7, "path": f"{phone}-7-liblog.log",
+                                           "start": "10-03 00:00:00.000"})
+                raise RuntimeError("launch failed")
+
+            instance.launch = launch
+            instance.phone_time = Mock(return_value="10-03 00:00:00.000")
+            instance.adb = Mock(return_value=self.drop(0.4, 2, pid=7).rstrip())
+            instance.beep = Mock()
+            instance.graceful_stop = Mock()
+            manifest = instance.run()
+            capture.terminate.assert_called_once()
+            capture.close.assert_called_once()
+            entry = manifest["log_drops"][0]
+            self.assertEqual(("MEASURED", 2), (entry["status"], entry["total_dropped"]))
+            self.assertEqual(hashlib.sha256((instance.output / entry["path"]).read_bytes()).hexdigest(), entry["sha256"])
+
+    def waiting_runner(self, directory, drops):
+        instance = runner.CallRunner("adb", self.devices, self.case, Path(directory))
+        instance.output.mkdir(parents=True, exist_ok=True)
+        instance.logs = [{"device": "b", "pid": 7, "path": "b-7.log"}]
+        instance.pids["b"] = "7"
+        (instance.output / "b-7.log").write_text(self.line(1.5, "BENCHMARK call phase NEGOTIATING_MEDIA", pid=7),
+                                                 encoding="utf-8")
+        instance.drop_logs = [{"device": "b", "pid": 7, "start": "10-03 00:00:00.000", "path": "b-7-liblog.log"}]
+        (instance.output / "b-7-liblog.log").write_text(drops, encoding="utf-8")
+        return instance
+
+    def test_waiting_for_a_dropped_active_line_reports_log_loss_and_a_plain_absence_still_fails(self):
+        for drops, dropped in ((self.drop(2.4, 12, pid=7), True), ("", False), (self.drop(0.9, 12, pid=7), False)):
+            with self.subTest(drops=drops), tempfile.TemporaryDirectory() as directory:
+                instance = self.waiting_runner(directory, drops)
+                with patch.object(instance, "adb", return_value=""), \
+                     patch.object(runner.time, "monotonic", side_effect=[0, 0, 2]), patch.object(runner.time, "sleep"):
+                    with self.assertRaisesRegex(RuntimeError, "b: no app evidence") as raised:
+                        instance.wait_for("b", r"BENCHMARK call phase ACTIVE", timeout=1, drops_after="10-03 00:00:01.000")
+                self.assertEqual(dropped, isinstance(raised.exception, runner.LogLinesDropped))
+                self.assertEqual(dropped, "log lines dropped by logd" in str(raised.exception))
+                self.assertEqual(dropped, any(event["action"] == "log_lines_dropped" for event in instance.events))
+
+    def test_a_drop_report_only_the_events_buffer_holds_is_found_at_the_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            instance = self.waiting_runner(directory, "")
+            buffer = self.drop(2.4, 3, pid=7).rstrip()
+            with patch.object(instance, "adb", side_effect=lambda phone, *args, **kwargs: buffer if "events" in args else ""), \
+                 patch.object(runner.time, "monotonic", side_effect=[0, 0, 2]), patch.object(runner.time, "sleep"):
+                with self.assertRaises(runner.LogLinesDropped) as raised:
+                    instance.wait_for("b", r"BENCHMARK call phase ACTIVE", timeout=1)
+            self.assertEqual([{"time": "10-03 00:00:02.400", "pid": 7, "dropped": 3}], raised.exception.record["reports"])
+
+
 class SelectedProfileAnnotationTest(unittest.TestCase):
     # 2026-10-17: every relayed and direct call since fe2acce (2026-10-10) scored selected_profile_mismatches=2 because the
     # app logs "thermalReduction=false (setting=false)" and the whole string was compared with "false".
@@ -1005,6 +1458,317 @@ class SelectedProfileAnnotationTest(unittest.TestCase):
                     "playbackMs": "250", "rateControl": "AUTOMATIC", "thermalReduction": "false (setting=false)"}
         self.assertEqual(runner.requested_matches(requested, observed), 0)
         self.assertEqual(runner.requested_matches(requested, {**observed, "thermalReduction": "true (setting=true)"}), 1)
+
+
+
+class OnDemandRelayedCallTest(unittest.TestCase):
+    """relay_shape "on_demand": the middle phones are ordinary call-ready helpers, as in production (Design C), not the
+    DEBUG call relay. The caller must pick the requested helper and each helper must dial the requested next hop."""
+
+    def setUp(self):
+        self.devices = {"a": {"serial": "a", "node_prefix": "000000000001"},
+                        "b": {"serial": "b", "node_prefix": "000000000002"},
+                        "r1": {"serial": "r1", "node_prefix": "000000000011"},
+                        "r2": {"serial": "r2", "node_prefix": "000000000012"},
+                        "r3": {"serial": "r3", "node_prefix": "000000000013"}}
+        profile = {"codec": "encoder-a", "width": 352, "height": 288, "fps": 15,
+                   "bitrate_kbps": 110, "playback": "balanced", "rate_control": "cbr", "thermal_reduction": False}
+        self.case = {"id": "relay-on-demand", "caller": "a", "callee": "b", "relays": ["r1"], "transport": "gatt",
+                     "relay_shape": "on_demand", "duration_s": 45,
+                     "profiles": {"a": profile, "b": {**profile, "codec": "encoder-b"}},
+                     "tunables": {"bounded_media_age": True}}
+
+    line = staticmethod(PrivateCallBenchmarkTest.line)
+
+    def chain(self, count):
+        return {**self.case, "relays": ["r1", "r2", "r3"][:count], "transport": "ble"}
+
+    def test_pins_name_each_requested_next_hop_and_never_the_callee_side(self):
+        prefixes = {phone: device["node_prefix"] for phone, device in self.devices.items()}
+        two = self.chain(2)
+        self.assertEqual(runner.on_demand_pins(two, "a", prefixes), {"relayed_calls_helper": "000000000011"})
+        self.assertEqual(runner.on_demand_pins(two, "r1", prefixes), {"relayed_calls_next_hop": "000000000012"})
+        self.assertEqual(runner.on_demand_pins(two, "r2", prefixes), {"relayed_calls_next_hop": "000000000002"})
+        self.assertEqual(runner.on_demand_pins(two, "b", prefixes), {})
+        self.assertEqual(runner.on_demand_pins({**two, "relay_shape": "static"}, "a", prefixes), {})
+
+    def test_a_pin_without_a_registered_prefix_is_refused(self):
+        with self.assertRaises(ValueError):
+            runner.on_demand_pins(self.case, "a", {"r1": None, "a": "000000000001", "b": "000000000002"})
+
+    def test_pins_are_launch_extras(self):
+        self.assertEqual(device_runner.TUNABLES["relayed_calls_helper"], ("test_relayed_calls_helper", str))
+        self.assertEqual(device_runner.TUNABLES["relayed_calls_next_hop"], ("test_relayed_calls_next_hop", str))
+
+    def test_the_default_shape_is_the_debug_relay_and_an_unknown_shape_is_refused(self):
+        static = {key: value for key, value in self.case.items() if key != "relay_shape"}
+        self.assertEqual(runner.relay_shape(static), "static")
+        self.assertEqual({phone: runner.on_demand_tunables(static, phone) for phone in ("a", "b", "r1")},
+                         {"a": {}, "b": {}, "r1": {}})
+        self.assertNotIn("relayed_calls", runner.broadcast_shape(static, "a")["tunables"])
+        with self.assertRaisesRegex(ValueError, "relay_shape must be one of"):
+            runner.validate_call_case({**self.case, "relay_shape": "dynamic"}, self.devices)
+
+    def test_each_phone_is_launched_with_the_tunables_that_force_the_requested_chain(self):
+        one = self.chain(1)
+        self.assertEqual(runner.on_demand_tunables(one, "a"), {"relayed_calls": True, "relayed_calls_require": 1})
+        self.assertEqual(runner.on_demand_tunables(one, "r1"), {"relayed_calls": True})
+        self.assertEqual(runner.on_demand_tunables(one, "b"), {"relayed_calls": True})
+        self.assertEqual(runner.on_demand_tunables(one, "r2"), {})  # not on this route
+        # Two relays: the caller and every relay but the last cannot hear the callee, or the table would take the shortest path.
+        two = self.chain(2)
+        self.assertEqual(runner.on_demand_tunables(two, "a"),
+                         {"relayed_calls": True, "relayed_calls_require": 2, "relayed_calls_no_direct": True})
+        self.assertEqual(runner.on_demand_tunables(two, "r1"), {"relayed_calls": True, "relayed_calls_no_direct": True})
+        self.assertEqual(runner.on_demand_tunables(two, "r2"), {"relayed_calls": True})
+        # Above the app's default cap of 2 relays every helper must accept the larger budget.
+        three = self.chain(3)
+        for phone in ("a", "r1", "r2", "r3", "b"):
+            self.assertEqual(runner.on_demand_tunables(three, phone)["relayed_calls_max_relays"], 3)
+        # The case's own tunables are kept and the endpoints' launch case carries the implied ones.
+        self.assertEqual(runner.broadcast_shape(one, "a")["tunables"],
+                         {"bounded_media_age": True, "relayed_calls": True, "relayed_calls_require": 1})
+
+    def test_the_schema_refuses_what_the_app_cannot_route_or_the_harness_cannot_prove(self):
+        self.assertEqual(runner.validate_call_case(self.case, self.devices), {"a", "b", "r1"})
+        self.assertEqual(runner.validate_call_case(self.chain(2), self.devices), {"a", "b", "r1", "r2"})
+        for name, changes in (("no relay", {"relays": None}), ("classic", {"transport": "classic"}),
+                              ("rotating ids", {"tunables": {"rotating_ids": True}}),
+                              ("phone rotating ids", {"phone_tunables": {"b": {"rotating_ids": True}}}),
+                              ("relayed calls off", {"tunables": {"relayed_calls": False}}),
+                              ("a different requirement", {"phone_tunables": {"a": {"relayed_calls_require": 2}}}),
+                              ("a bad wait", {"route_wait_s": "soon"})):
+            case = {key: value for key, value in {**self.case, **changes}.items() if value is not None}
+            with self.subTest(name), self.assertRaises(ValueError):
+                runner.validate_call_case(case, self.devices)
+        # A matching explicit value, and a larger cap than the chain needs, are the case's own request and are kept.
+        runner.validate_call_case({**self.chain(3), "tunables": {"relayed_calls": True, "relayed_calls_max_relays": 4}},
+                                  self.devices)
+
+    def launched(self, case, launcher, phone):
+        """The `am start` extras one launch sends, with the device calls mocked."""
+        with tempfile.TemporaryDirectory() as directory:
+            instance = runner.CallRunner("adb", self.devices, case, Path(directory))
+            instance.phone_time = Mock(return_value="10-03 17:00:00.000")
+            instance.logs = []
+            with patch.object(runner.Runner, "adb", return_value="123") as adb, \
+                 patch.object(Path, "open", mock_open()), patch.object(runner.subprocess, "Popen"):
+                getattr(instance, launcher)(phone)
+            argv = next(call.args[1:] for call in adb.call_args_list if "start" in call.args)  # args[0] is the phone
+            return dict(zip(argv[7::3], argv[8::3])), instance
+
+    def test_the_middle_phone_launches_as_an_ordinary_helper_not_the_debug_relay(self):
+        helper, instance = self.launched(self.case, "launch_helper", "r1")
+        self.assertIn("test_private_call_browser", helper)
+        self.assertEqual(helper["test_relayed_calls"], "true")
+        self.assertEqual(helper["test_bounded_media_age"], "true")
+        for debug_relay in ("test_private_call_relay", "test_relay_callee", "test_relay_route_cost", "test_relayed_calls_require"):
+            self.assertNotIn(debug_relay, helper)
+        self.assertNotEqual(helper.get("test_role"), "relay")
+        self.assertEqual(instance.logs[-1]["role"], "call_relay")
+        # The same phone as the DEBUG relay keeps its old launch (the default shape is unchanged).
+        static = {key: value for key, value in self.case.items() if key != "relay_shape"}
+        debug, _ = self.launched(static, "launch_relay", "r1")
+        self.assertEqual((debug["test_role"], debug["test_private_call_relay"]), ("relay", "true"))
+        self.assertNotIn("test_relayed_calls", debug)
+
+    def test_an_on_demand_helper_takes_its_own_tunables_and_the_static_relay_refuses_them(self):
+        # 2026-11-10: the relayed GATT stall needed one helper's device-policy off-switch as the test arm.
+        arm = {"device_policy_off": "qcom-legacy-call-relay-gatt-acknowledged-writes"}
+        case = {**self.case, "phone_tunables": {"r1": arm}}
+        runner.validate_call_case(case, self.devices)
+        helper, _ = self.launched(case, "launch_helper", "r1")
+        self.assertEqual(helper["test_device_policy_off"], arm["device_policy_off"])
+        caller, _ = self.launched(case, "launch", "a")
+        self.assertNotIn("test_device_policy_off", caller)
+        static = {key: value for key, value in case.items() if key != "relay_shape"}
+        with self.assertRaisesRegex(ValueError, "call endpoints"):
+            runner.validate_call_case(static, self.devices)
+        # The `relay` shorthand names the same helper.
+        short = {key: value for key, value in case.items() if key != "relays"}
+        short["relay"] = "r1"
+        runner.validate_call_case(short, self.devices)
+
+    def test_the_caller_is_told_to_accept_only_the_requested_number_of_relays(self):
+        caller, _ = self.launched(self.chain(2), "launch", "a")
+        self.assertEqual((caller["test_relayed_calls"], caller["test_relayed_calls_require"],
+                          caller["test_relayed_calls_no_direct"]), ("true", "2", "true"))
+        callee, _ = self.launched(self.chain(2), "launch", "b")
+        self.assertEqual(callee["test_relayed_calls"], "true")
+        self.assertNotIn("test_relayed_calls_require", callee)
+        self.assertNotIn("test_relayed_calls_no_direct", callee)
+        self.assertNotIn("test_private_call_relay", caller)
+
+    def test_the_route_is_built_callee_then_helpers_then_caller_without_the_debug_relay(self):
+        instance = runner.CallRunner("adb", self.devices, self.chain(2), Path("unused"))
+        order = []
+        instance.logs = [{}]
+        instance.launch = Mock(side_effect=lambda phone: order.append(("endpoint", phone)))
+        instance.launch_helper = Mock(side_effect=lambda phone: order.append(("helper", phone)))
+        instance.launch_relay = Mock(side_effect=AssertionError("the DEBUG relay is the static shape"))
+        instance.endpoint_ready = Mock(return_value={"time": "t", "message": "BENCHMARK call available: node=x"})
+        instance.settle_relayed_callee = Mock()
+        instance.wait_on_demand_route_hint = Mock()
+        instance.start_relayed_route("a", "b")
+        self.assertEqual(order, [("endpoint", "b"), ("helper", "r2"), ("helper", "r1"), ("endpoint", "a")])
+        self.assertEqual([item["device"] for item in instance.relay_events if item["action"] == "helper_ready"], ["r2", "r1"])
+        instance.wait_on_demand_route_hint.assert_called_once_with("a")
+
+    def test_each_helper_settles_before_the_next_phone_although_it_has_no_camera_profile(self):
+        # Lane 2, 2026-11-10: every on-demand case stopped with KeyError('asus') before the caller launched, because the
+        # settle step looked up a camera profile for the helper (a case carries profiles for the two endpoints only).
+        instance = runner.CallRunner("adb", self.devices, self.chain(2), Path("unused"))
+        order = []
+        instance.logs = [{}]
+        instance.launch = Mock(side_effect=order.append)
+        instance.launch_helper = Mock(side_effect=order.append)
+        instance.endpoint_ready = Mock(return_value={"time": "10-03 17:00:00.000",
+                                                     "message": "BENCHMARK call available: node=x"})
+        instance.wait_on_demand_route_hint = Mock()
+        instance.log_text = lambda phone: ""
+        instance.check_cancelled = Mock()
+        clock = [0.0]
+
+        def sleep(seconds):
+            clock[0] += seconds
+        with patch.object(runner.time, "monotonic", lambda: clock[0]), patch.object(runner.time, "sleep", sleep):
+            instance.start_relayed_route("a", "b")
+        self.assertEqual(order, ["b", "r2", "r1", "a"])
+        self.assertEqual([item["device"] for item in instance.relay_events if item["action"] == "callee_settled"],
+                         ["b", "r2", "r1"])
+
+    def test_the_route_wait_is_a_recorded_hint_and_never_blocks_the_dial(self):
+        instance = runner.CallRunner("adb", self.devices, self.chain(2), Path("unused"))
+        table = ("BENCHMARK relayed_reach_table: entries=3 | rotating_entries=0 | pages=4 | offers=9 | "
+                 "costs=c0=1,c2=1 | rotating_costs=none")
+        instance.wait_for = Mock(return_value={"time": "t", "message": table})
+        instance.wait_on_demand_route_hint("a")
+        self.assertRegex(table, instance.wait_for.call_args.args[1])
+        self.assertNotRegex(table.replace("c2=1", "c1=1"), instance.wait_for.call_args.args[1])  # another relay count
+        self.assertTrue(instance.relay_events[-1]["found"])
+        instance.wait_for = Mock(side_effect=RuntimeError("a: no app evidence for 'x' within the deadline"))
+        instance.wait_on_demand_route_hint("a")
+        self.assertFalse(instance.relay_events[-1]["found"])
+        instance.wait_for = Mock(side_effect=RuntimeError("a: call application crashed"))
+        with self.assertRaisesRegex(RuntimeError, "crashed"):
+            instance.wait_on_demand_route_hint("a")
+
+    def test_a_caller_that_selects_another_helper_or_relay_count_stops_the_run(self):
+        instance = runner.CallRunner("adb", self.devices, self.chain(2), Path("unused"))
+        route = lambda helper, budget: {"time": "t", "message": (
+            f"BENCHMARK relayed_route: role=caller | target=000000000002 | helper={helper} | id=node | budget={budget}")}
+        instance.wait_for = Mock(return_value=route("000000000011", 2))
+        instance.confirm_on_demand_route("a", "b")
+        self.assertEqual(instance.relay_events[-1]["helper"], "000000000011")
+        for helper, budget in (("000000000013", 2), ("000000000011", 1)):
+            instance.wait_for = Mock(return_value=route(helper, budget))
+            with self.subTest(helper=helper, budget=budget), self.assertRaisesRegex(RuntimeError, "not the requested r1"):
+                instance.confirm_on_demand_route("a", "b")
+
+    def hop_logs(self, count, caller_extra=""):
+        """Endpoint and helper logs of a call that really went a -> r1 [-> r2] -> b through production's helper path."""
+        nodes = ["000000000001", "000000000011", "000000000012", "000000000002"]
+        if count == 1:
+            nodes = ["000000000001", "000000000011", "000000000002"]
+        logs = {"a": (self.line(0.5, f"BENCHMARK relayed_route: role=caller | target=000000000002 | helper={nodes[1]} | "
+                                     f"id=node | budget={count}") + caller_extra +
+                      self.line(1, f"BENCHMARK relayed_setup: role=caller | result=ready | budget={count} | relays={count}"))}
+        for index in range(count):
+            nxt = nodes[index + 2]
+            kind = "target" if index == count - 1 else "helper"
+            logs[f"r{index + 1}"] = (
+                self.line(0.7, f"BENCHMARK relayed_setup: role=helper | result=accepted | budget={count - index} | "
+                               f"next_budget={count - index - 1} | next={kind}:{nxt}") +
+                self.line(1, f"Relaying an endpoint-encrypted private call between {nodes[index]} and {nxt}; "
+                             "this relay cannot decrypt call media.") +
+                self.line(9, "Private-call caller path closed: Socket closed"))
+        return logs
+
+    def score(self, case, logs):
+        with tempfile.TemporaryDirectory() as directory:
+            folder, entries = Path(directory), []
+            for phone in "ab":
+                peer = "b" if phone == "a" else "a"
+                (folder / f"{phone}.log").write_text(
+                    logs.get(phone, "") + self.line(1, f"Encrypted private-call link to {self.devices[peer]['node_prefix']} "
+                                                       "over BLE GATT (2M)") + self.line(2, "BENCHMARK call phase ACTIVE"),
+                    encoding="utf-8")
+                entries.append({"device": phone, "path": phone + ".log", "pid": 123})
+            for phone, text in logs.items():
+                if phone not in "ab":
+                    (folder / f"{phone}.log").write_text(text, encoding="utf-8")
+                    entries.append({"device": phone, "path": phone + ".log", "pid": 123, "role": "call_relay"})
+            return runner.score_call_manifest({"scenario": case, "devices": self.devices, "logs": entries}, folder)
+
+    def test_a_call_through_the_requested_helpers_passes_without_a_debug_relay_authentication_line(self):
+        for count in (1, 2):
+            with self.subTest(relays=count):
+                score = self.score(self.chain(count), self.hop_logs(count))
+                self.assertEqual(score["requested_route"], ["a", *["r1", "r2"][:count], "b"])
+                for hop in score["relays"]:
+                    self.assertEqual(hop["gates"]["requested_relay_route"]["status"], "PASS", hop["gates"])
+                    self.assertEqual(hop["gates"]["helper_accepted_requested_next_hop"]["status"], "PASS")
+                    self.assertEqual(hop["gates"]["relay_adjacent_child_identity"]["status"], "PASS")
+                    self.assertEqual(hop["gates"]["relay_adjacent_parent_identity"]["status"], "PASS")
+                first = score["relays"][0]
+                self.assertEqual(first["gates"]["caller_selected_requested_helper"]["status"], "PASS")
+                self.assertEqual(first["gates"]["caller_ready_relay_count"]["status"], "PASS")
+                self.assertEqual(first["authenticated_child_links"], ["000000000012" if count == 2 else "000000000002"])
+
+    def test_a_direct_fallback_or_another_helper_is_a_failed_requested_chain(self):
+        direct = self.hop_logs(1)
+        direct["a"] = ""  # a direct dial logs no relayed route and no relayed SETUP
+        direct.pop("r1")  # no helper carried it
+        other_helper = self.hop_logs(1)
+        other_helper["a"] = other_helper["a"].replace("helper=000000000011", "helper=000000000013")
+        moved = self.hop_logs(1, caller_extra=self.line(
+            0.9, "BENCHMARK relayed_route: role=caller | attempt=2 | helper=000000000013 | target=000000000002 | "
+                 "budget=1 | afterMs=5000 | previousError=IOException"))
+        shorter = self.hop_logs(1)
+        shorter["a"] = shorter["a"].replace("relays=1", "relays=0")
+        for name, logs, gate_name in (("direct", direct, "requested_relay_route"),
+                                      ("other helper", other_helper, "caller_selected_requested_helper"),
+                                      ("candidate moved", moved, "caller_selected_requested_helper"),
+                                      ("fewer relays than asked", shorter, "caller_ready_relay_count")):
+            with self.subTest(name):
+                hop = self.score(self.chain(1), logs)["relays"][0]
+                self.assertEqual(hop["gates"]["requested_relay_route"]["status"], "FAIL")
+                self.assertEqual(hop["log_status"], "FAIL")
+                if gate_name in hop["gates"]:
+                    self.assertIn(hop["gates"][gate_name]["status"], ("FAIL", "UNMEASURED"))
+        self.assertEqual(self.score(self.chain(1), other_helper)["relays"][0]["gates"]
+                         ["caller_selected_requested_helper"]["status"], "FAIL")
+
+    def test_a_helper_that_dials_another_next_hop_fails_even_if_it_joined_the_requested_pair(self):
+        logs = self.hop_logs(2)
+        logs["r1"] = logs["r1"].replace("next=helper:000000000012", "next=helper:000000000013")
+        hops = self.score(self.chain(2), logs)["relays"]
+        self.assertEqual(hops[0]["gates"]["helper_accepted_requested_next_hop"]["status"], "FAIL")
+        self.assertEqual(hops[0]["gates"]["requested_relay_route"]["status"], "FAIL")
+        self.assertEqual(hops[1]["gates"]["requested_relay_route"]["status"], "PASS")
+        budget = self.hop_logs(2)
+        budget["r2"] = budget["r2"].replace("budget=1 | next_budget=0", "budget=2 | next_budget=1")
+        hop = self.score(self.chain(2), budget)["relays"][1]
+        self.assertEqual(hop["gates"]["helper_accepted_requested_next_hop"]["status"], "FAIL")
+
+    def test_a_missing_helper_log_line_is_unmeasured_not_a_pass(self):
+        logs = self.hop_logs(1)
+        logs["r1"] = "".join(row for row in logs["r1"].splitlines(True) if "result=accepted" not in row)
+        hop = self.score(self.chain(1), logs)["relays"][0]
+        self.assertEqual(hop["gates"]["helper_accepted_requested_next_hop"]["status"], "UNMEASURED")
+        self.assertEqual(hop["gates"]["requested_relay_route"]["status"], "UNMEASURED")
+        self.assertNotEqual(hop["log_status"], "PASS")
+
+    def test_bmh3_hides_the_callers_identity_from_the_first_helper_only(self):
+        case = {**self.chain(2), "tunables": {"bmh3": True}}
+        logs = self.hop_logs(2)
+        logs["r1"] = logs["r1"].replace("between 000000000001 and", "between 0000000000ee and")  # a throwaway
+        hops = self.score(case, logs)["relays"]
+        self.assertEqual(hops[0]["gates"]["relay_adjacent_parent_identity"]["status"], "UNMEASURED")
+        self.assertEqual(hops[0]["gates"]["requested_relay_route"]["status"], "PASS")
+        self.assertEqual(hops[1]["gates"]["relay_adjacent_parent_identity"]["status"], "PASS")
+        logs["r2"] = logs["r2"].replace("between 000000000011 and", "between 0000000000ee and")
+        self.assertEqual(self.score(case, logs)["relays"][1]["gates"]["relay_adjacent_parent_identity"]["status"], "FAIL")
 
 
 if __name__ == "__main__":

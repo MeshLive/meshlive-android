@@ -23,12 +23,20 @@ import android.content.Intent
  * Experimental, default off:
  * - `test_coc_echo_verify=true`: 1 KB echo over the new CoC socket before it is used (Berty pattern);
  *   both phones need the switch, because the listener answers the echo before anything else.
+ * - `test_coc_prime_async=true` (join-latency P1): a fresh-ACL CoC client returns the socket right after the connect and
+ *   runs the MTU prime and the GATT control reattach on a background thread; the first bulk write waits for them, at most
+ *   [CocPrimeGate.WAIT_BOUND_MS] ([CocPrimeGate]). The hop handshake starts 0.7 s earlier; its order is unchanged.
+ * - `test_coc_psm_reuse_retry=true` (join-latency P4b): a fresh-ACL CoC connect that fails fast after the PSM was read
+ *   is retried once with the same PSM after the ACL-down wait, instead of the caller redoing the GATT connect and PSM
+ *   read ([CocPsmReuseRetry]).
  */
 object CocSwitches {
     const val EXTRA_MTU_PRIME = "test_coc_mtu_prime"
     const val EXTRA_ECHO_VERIFY = "test_coc_echo_verify"
     const val EXTRA_CONNECT_BOUND_MS = "test_coc_connect_bound_ms"
     const val EXTRA_CLASSIC_RFCOMM_CAP = "test_classic_rfcomm_cap"
+    const val EXTRA_PRIME_ASYNC = "test_coc_prime_async"
+    const val EXTRA_PSM_REUSE_RETRY = "test_coc_psm_reuse_retry"
 
     /** Shipped: the MTU prime runs wherever its registry entry applies (fresh-ACL CoC centrals). */
     const val DEFAULT_MTU_PRIME = true
@@ -52,6 +60,14 @@ object CocSwitches {
     @Volatile var echoVerify: Boolean = false
         private set
 
+    /** `test_coc_prime_async` (Experimental, default off): MTU prime and control reattach off the authentication path. */
+    @Volatile var primeAsync: Boolean = false
+        private set
+
+    /** `test_coc_psm_reuse_retry` (Experimental, default off): one same-PSM CoC retry after the ACL-down wait. */
+    @Volatile var psmReuseRetry: Boolean = false
+        private set
+
     /** `test_coc_connect_bound_ms` (default [DEFAULT_CONNECT_BOUND_MS]; 0 turns the bound off). */
     @Volatile var connectBoundMs: Long = DEFAULT_CONNECT_BOUND_MS
         private set
@@ -69,6 +85,8 @@ object CocSwitches {
                 ?.let { it.getLongExtra(EXTRA_CONNECT_BOUND_MS, it.getIntExtra(EXTRA_CONNECT_BOUND_MS, -1).toLong()) },
             classicRfcommCap = intent?.takeIf { it.hasExtra(EXTRA_CLASSIC_RFCOMM_CAP) }
                 ?.getIntExtra(EXTRA_CLASSIC_RFCOMM_CAP, -1),
+            primeAsync = intent?.takeIf { it.hasExtra(EXTRA_PRIME_ASYNC) }?.getBooleanExtra(EXTRA_PRIME_ASYNC, false),
+            psmReuseRetry = intent?.takeIf { it.hasExtra(EXTRA_PSM_REUSE_RETRY) }?.getBooleanExtra(EXTRA_PSM_REUSE_RETRY, false),
             debugBuild = BuildConfig.DEBUG,
         )
     }
@@ -79,8 +97,12 @@ object CocSwitches {
         echoVerify: Boolean? = null,
         connectBoundMs: Long? = null,
         classicRfcommCap: Int? = null,
+        primeAsync: Boolean? = null,
+        psmReuseRetry: Boolean? = null,
         debugBuild: Boolean = BuildConfig.DEBUG,
     ) {
+        this.primeAsync = debugBuild && primeAsync == true
+        this.psmReuseRetry = debugBuild && psmReuseRetry == true
         this.mtuPrime = if (debugBuild && mtuPrime != null) mtuPrime else DEFAULT_MTU_PRIME
         this.echoVerify = debugBuild && echoVerify == true
         this.connectBoundMs = if (debugBuild && connectBoundMs != null && connectBoundMs >= 0L) {
@@ -97,5 +119,6 @@ object CocSwitches {
 
     /** One line for the launch log: which arms this run uses. */
     fun label(): String =
-        "mtuPrime=$mtuPrime | echoVerify=$echoVerify | connectBoundMs=$connectBoundMs | classicRfcommCap=$classicRfcommCap"
+        "mtuPrime=$mtuPrime | echoVerify=$echoVerify | connectBoundMs=$connectBoundMs | classicRfcommCap=$classicRfcommCap" +
+            (if (primeAsync) " | primeAsync=true" else "") + if (psmReuseRetry) " | psmReuseRetry=true" else ""
 }

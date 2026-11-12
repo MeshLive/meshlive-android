@@ -5,4 +5,6 @@
     <dimen name="key_radius">6dp</dimen>
     <dimen name="key_min_height">112dp</dimen>
     <dimen name="action_tile_height">128dp</dimen>
+    <!-- A Settings row that depends on the row above it (Wi-Fi: Wider reach, Wi-Fi Direct): indent under its parent. -->
+    <dimen name="settings_dependent_indent">40dp</dimen>
 </resources>

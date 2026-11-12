@@ -11,7 +11,8 @@ import java.util.Locale
  * 1. a name may not start or end with `~`, U+223C, U+FF5E, U+02DC, U+2053 or U+301C (the mark the screens draw for a
  *    self-claimed name);
  * 2. it may not contain `~` anywhere, U+1F6E1 (shield), the lock symbols U+1F512, U+1F513, U+1F510, U+1F50F, or the
- *    separators the app uses to join name parts (" - " and a comma followed by "seen");
+ *    separators the app uses to join name parts (" - ", and a comma or a middle dot followed by "seen": U+00B7 or a
+ *    look-alike dot U+0387, U+2027, U+2219, U+22C5, U+30FB, U+FF65; the dot is design decision 2026-11-06, AB3 R7);
  * 3. its reduced skeleton may not equal the reduced skeleton of any generated name (so "BlueOtter", "Blue 0tter" and
  *    "blue otter" are refused, not only "Blue Otter").
  *
@@ -23,7 +24,7 @@ internal object NameTextRules {
 
     private val TILDES = setOf(0x007E, 0x223C, 0xFF5E, 0x02DC, 0x2053, 0x301C)
     private val SYMBOLS = setOf(0x1F6E1, 0x1F512, 0x1F513, 0x1F510, 0x1F50F)
-    private val SEEN_SEPARATOR = Regex(",\\s*seen", RegexOption.IGNORE_CASE)
+    private val SEEN_SEPARATOR = Regex("[,\u00B7\u0387\u2027\u2219\u22C5\u30FB\uFF65]\\s*seen", RegexOption.IGNORE_CASE)
 
     private class SkeletonCache(val table: ConfusableTable, val adjectives: List<String>, val nouns: Set<String>)
 

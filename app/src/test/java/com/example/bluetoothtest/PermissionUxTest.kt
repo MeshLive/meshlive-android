@@ -86,7 +86,9 @@ class PermissionUxTest {
 
     @Test
     fun aTestExtraStillMakesABenchmarkLaunch() {
-        assertTrue(BenchmarkLaunch.fromExtras(setOf(UpdateSettings.EXTRA_DEBUG_PIN_OWN_SIGNER), userLaunch = false))
+        assertTrue(BenchmarkLaunch.fromExtras(setOf(UpdateSettings.EXTRA_DEBUG_PIN_OWN_SIGNER), userLaunch = false, debug = true))
+        // A release launch is never a benchmark launch, whatever extras another app sends.
+        assertFalse(BenchmarkLaunch.fromExtras(setOf(UpdateSettings.EXTRA_DEBUG_PIN_OWN_SIGNER), userLaunch = false, debug = false))
         assertFalse(BenchmarkLaunch.fromExtras(emptySet(), userLaunch = false))
         assertFalse(BenchmarkLaunch.fromExtras(setOf("android.intent.extra.TEXT"), userLaunch = false))
     }

@@ -21,6 +21,10 @@ internal data class CodecChoiceSwitches(
     val powerAware: Boolean = true,
     /** The power state read at session start ([CodecPowerAware.read]); normal outside a session start. */
     val power: CodecPowerState = CodecPowerState.NORMAL,
+    /** Experimental `test_sw_shortfall_avc` ([SoftwareEncoderShortfall]); false (the default) leaves every order as it is. */
+    val swShortfall: Boolean = false,
+    /** Software encoders remembered short for this session ([SoftwareShortfallStore.slowEncoders]), read at session start. */
+    val slowSoftware: Set<String> = emptySet(),
 ) {
     /** Either master on: Design HC rules; both off: exactly today's two-codec rules. */
     val anyNew: Boolean get() = hevc || h264
@@ -65,6 +69,8 @@ internal class CodecChoice(
     val notes: List<String> = emptyList(),
     /** `codec_power_aware` changed the Automatic order of this session ([CodecPowerAware.reorder]). */
     val powerApplied: Boolean = false,
+    /** `test_sw_shortfall_avc` put hardware H.264 ahead of a remembered-short software encoder ([SoftwareEncoderShortfall.reorder]). */
+    val shortfallApplied: Boolean = false,
 )
 
 /**
@@ -259,14 +265,23 @@ internal object VideoCodecChoice {
         // codec_power_aware: decided here, once per call (the caller passes the session-start power state).
         val powered = if (forced == null) CodecPowerAware.reorder(ordered, switches.power, switches.powerAware, excluded) else null
         if (powered != null) ordered = powered
+        // test_sw_shortfall_avc (Experimental, off): a remembered-short software first choice yields to hardware H.264 the
+        // peer decodes; never over a family VP9 or bit 7 rule, and not when the power-aware start already reordered.
+        val shortfall = if (forced == null && powered == null) {
+            SoftwareEncoderShortfall.reorder(ordered, switches.swShortfall, switches.slowSoftware, excluded)
+        } else {
+            null
+        }
+        if (shortfall != null) ordered = shortfall
         val sent = ordered.firstOrNull()
         val reason = when {
             sent == null -> "no_common_codec"
             forced != null && sent == vp9 -> forced
             powered != null -> CodecPowerAware.reason(sent)
+            shortfall != null -> SoftwareEncoderShortfall.REASON
             else -> automaticReason(sent, available, CodecChoiceMode.CALL, switches, session, excluded, peerDecodeMask, staticIneligibility)
         }
-        return CodecChoice(sent, ordered, reason, requested, notes, powerApplied = powered != null)
+        return CodecChoice(sent, ordered, reason, requested, notes, powerApplied = powered != null, shortfallApplied = shortfall != null)
     }
 
     /** Peer bit 4: AV1 entries move below this phone's hardware HEVC and hardware VP9 entries (those the peer decodes). */
@@ -299,6 +314,9 @@ internal object VideoCodecChoice {
         if (userChoice) return CodecChoice(requested, listOf(requested) + auto.filter { it != requested }, "user_choice", requested)
         CodecPowerAware.reorder(auto, switches.power, switches.powerAware, excluded)?.let { powered ->
             return CodecChoice(powered.first(), powered, CodecPowerAware.reason(powered.first()), requested, powerApplied = true)
+        }
+        SoftwareEncoderShortfall.reorder(auto, switches.swShortfall, switches.slowSoftware, excluded)?.let { shortfall ->
+            return CodecChoice(shortfall.first(), shortfall, SoftwareEncoderShortfall.REASON, requested, shortfallApplied = true)
         }
         val sent = auto.firstOrNull() ?: requested
         return CodecChoice(sent, auto, automaticReason(sent, available, CodecChoiceMode.STREAM, switches, session, excluded, null, staticIneligibility), requested)
@@ -404,6 +422,8 @@ internal object VideoCodecChoice {
             "list=${choice.ordered.joinToString(",") { it.encoderName }.ifEmpty { "none" }}" +
             (sent.envelope?.let { " | fps_points=${it.label()}" } ?: "") +
             " | power=${switches.power.label} | codec_power_aware=${switches.powerAware}" +
+            // test_sw_shortfall_avc: only while the switch is on, so every other line keeps its exact format.
+            (if (switches.swShortfall) " | sw_shortfall=true | slow=${switches.slowSoftware.sorted().joinToString(",").ifEmpty { "none" }}" else "") +
             (if (choice.notes.isEmpty()) "" else " | notes=${choice.notes.joinToString(",")}")
     }
 }

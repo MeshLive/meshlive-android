@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "revision": "2026-10-28.1",
+  "revision": "2026-11-09.1",
   "generated_by": "app/src/test/java/com/example/bluetoothtest/DeviceFamilyPolicyTest.kt (run :app:testDebugUnitTest with DEVICE_POLICY_UPDATE=1 to rewrite); source of truth: app/src/main/java/com/example/bluetoothtest/DevicePolicyRegistry.kt",
   "off_switch": "DEBUG launch extra test_device_policy_off=<id>[,<id>...] or all",
   "entries": [
@@ -234,7 +234,7 @@
     },
     {
       "id": "qcom-legacy-call-relay-gatt-acknowledged-writes",
-      "title": "Legacy Qualcomm call-relay GATT writes with response",
+      "title": "Legacy Qualcomm call-relay GATT writes with response (Experimental arm: applied only with test_relay_gatt_acknowledged_writes=true)",
       "status": "implemented",
       "matcher": {
         "sdk_min": null,
@@ -253,19 +253,20 @@
       "matcher_text": "API <= 32; Build.HARDWARE in [qcom]",
       "component": null,
       "effects": ["call relay GATT writes with response, paced at 24 KB/s"],
-      "behaviour": "The hidden one-hop call relay opens its downstream GATT link with acknowledged writes paced at 24 KB/s.",
+      "behaviour": "Only with the Experimental arm test_relay_gatt_acknowledged_writes=true (DEBUG): the hidden one-hop call relay opens its downstream GATT link with acknowledged writes paced at 24 KB/s. Off by default: the relay writes without response, as on every other phone.",
       "sources": [],
       "source_status": "EVIDENCE_ONLY",
       "area": "BLUETOOTH_TRANSPORT",
       "validation": "EXPERIMENTAL",
       "fallback": "",
-      "evidence": ["none located: the rule predates the git history and no retained run has a legacy-Qualcomm call relay"],
+      "evidence": ["none located for the rule itself: it predates the git history and no retained run before 2026-11-10 has a legacy-Qualcomm call relay", "benchmarks/runs/l2q27ab-20261110g: relayed calls S22 -> ASUS -> A15s, interleaved A/B on one build; rule on (control) 0 of 3 calls held 60 s, each with the A15s dropping write responses (\"Sending response failed\"), \"GATT video write timed out\", 25-43 records forwarded, relay closed at 18-26 s; rule off (test_device_policy_off) 2 of 3 held 60 s with 4023-4034 records forwarded and none of those symptoms, the third failed on the other hop (S22-ASUS notification status 129); ASUS -> S22 -> A15s (S22 relays, rule does not match) held 2 of 2"],
       "confidence": "LOW",
       "confidence_note": "",
       "reviewed": "2026-10-09",
       "off_switch": "test_device_policy_off=qcom-legacy-call-relay-gatt-acknowledged-writes",
       "legacy_switches": [],
-      "origin": "BluetoothPrivateCallRelay: legacyQualcommGattCallFlushIntervalMs(...) > 0 as acknowledgedWrites"
+      "origin": "BluetoothPrivateCallRelay: legacyQualcommGattCallFlushIntervalMs(...) > 0 as acknowledgedWrites",
+      "arm": "test_relay_gatt_acknowledged_writes=true"
     },
     {
       "id": "qcom-msmnile-classic-source-balanced-scan",
@@ -1579,7 +1580,7 @@
       "matcher_text": "every phone",
       "component": null,
       "effects": [],
-      "behaviour": "With DEBUG test_decoder_stall_recovery=true, the first decoder_stall of a decoder makes the receiver wait for a keyframe (the normal needsKeyFrame request) and rebuild the same decoder; a repeat excludes the component for the rest of the session and rebuilds with the next candidate; after three stalls without 60 healthy frames in between it only logs.",
+      "behaviour": "With test_decoder_stall_recovery (default on; DEBUG false is the control arm), the first decoder_stall of a decoder makes the receiver wait for a keyframe (the normal needsKeyFrame request) and rebuild the same decoder; a repeat excludes the component for the rest of the session and rebuilds with the next candidate; after three stalls without 60 healthy frames in between it only logs.",
       "sources": [
         {
           "kind": "GOOGLE_OPEN_SOURCE",
@@ -1595,10 +1596,10 @@
       "source_status": "PARTIAL",
       "area": "CODEC",
       "validation": "EXPERIMENTAL",
-      "fallback": "Off (default): a stall is logged only.",
-      "evidence": ["none: Experimental; needs an A15s (MediaTek) smoke and a hidden-surface case"],
+      "fallback": "DEBUG test_decoder_stall_recovery=false: a stall is logged only (the control arm).",
+      "evidence": ["randomised user-launch A/B on one pair, 12 calls per arm, same build: without recovery 8 of 12 calls survived a software-AV1 stall at the Wi-Fi switch, with it 12 of 12 (one-sided Fisher p = 0.047); promoted to default on 2026-11-10; an A15s (MediaTek) smoke and a hidden-surface case are still open"],
       "confidence": "LOW",
-      "confidence_note": "the mechanism mirrors Moonlight's recovery ladder; false positives on a legitimately slow decoder are the risk and are why the arm is off by default",
+      "confidence_note": "the mechanism mirrors Moonlight's recovery ladder; false positives on a legitimately slow decoder are the risk; the DEBUG false arm stays as the control",
       "reviewed": "2026-10-14",
       "off_switch": "test_device_policy_off=decoder-stall-recovery-arm",
       "legacy_switches": [],
@@ -3142,6 +3143,64 @@
       "off_switch": "test_device_policy_off=mediatek-call-relay-gatt-helper-off",
       "legacy_switches": [],
       "origin": "Q-MTK (2026-10-27): relayed calls through a MediaTek GATT middle broke with record desyncs."
+    },
+    {
+      "id": "mediatek-coloros-native-gatt-client-wedge",
+      "title": "MediaTek with ColorOS or Realme UI, Android 16+: a native GATT client wedge needs a Bluetooth restart (on by default since 2026-11-10; DEBUG control arm test_gatt_native_wedge_guard=false)",
+      "status": "implemented",
+      "matcher": {
+        "sdk_min": 36,
+        "sdk_max": null,
+        "hardware": [],
+        "boards": [],
+        "board_prefixes": [],
+        "soc_families": ["MEDIATEK"],
+        "soc_model_prefixes": [],
+        "manufacturers": [],
+        "skins": ["COLOROS", "REALME_UI"],
+        "stack_lineages": [],
+        "controller": null,
+        "codec_component_prefixes": []
+      },
+      "matcher_text": "API >= 36; SoC [MEDIATEK]; skin [COLOROS, REALME_UI]",
+      "component": null,
+      "effects": ["2 central connects in a row failing with status 128 within 500 ms of the dial, inside 60000 ms, with no GATT client of this app held = native client wedge: show the Bluetooth off/on guidance at once"],
+      "behaviour": "On a MediaTek phone with ColorOS or Realme UI on Android 16 or newer, central GATT and LE CoC connects that fail with status 128 (GATT_NO_RESOURCES) within 500 ms of the dial, 2 in a row inside 60 s, while MeshLive holds no GATT client, are read as a native client wedge: the reliability card shows the Bluetooth off/on guidance at once (the generic path needs three back-off steps 1-4 s apart) and one BENCHMARK gatt_native_client_wedge line is logged. A successful central connect clears it. Nothing is toggled (apps cannot restart Bluetooth on Android 13+); the peripheral role is untouched.",
+      "sources": [
+        {
+          "kind": "AOSP_SOURCE",
+          "reference": "https://android.googlesource.com/platform/packages/modules/Bluetooth/+/refs/heads/android16-release/system/bta/gatt/bta_gattc_act.cc",
+          "note": "bta_gattc_process_api_open logs \"No resources to open a new connection.\" and reports GATT_NO_RESOURCES (128) to the app when bta_gattc_find_alloc_clcb returns null"
+        },
+        {
+          "kind": "AOSP_SOURCE",
+          "reference": "https://android.googlesource.com/platform/packages/modules/Bluetooth/+/refs/heads/android16-release/system/bta/gatt/bta_gattc_utils.cc",
+          "note": "bta_gattc_clcb_alloc fails when the client registration lookup (cl_rcb_map) or the server-cache allocation fails; bta_gattc_srcb_alloc is bounded by the controller's LE filter accept list size and recycles only an entry that is not connected, so a leaked entry blocks every new open"
+        },
+        {
+          "kind": "PLATFORM_DOC",
+          "reference": "https://source.android.com/docs/core/ota/modular-system/bluetooth",
+          "note": "the Bluetooth stack is a Mainline module, updatable from Android 16: a fix can arrive without an SDK change"
+        },
+        {
+          "kind": "API_REFERENCE",
+          "reference": "https://developer.android.com/reference/android/bluetooth/BluetoothAdapter#disable()",
+          "note": "deprecated in API 33: an app targeting Android 13+ cannot turn Bluetooth off, so it can only ask the user"
+        }
+      ],
+      "source_status": "PARTIAL",
+      "area": "BLUETOOTH_TRANSPORT",
+      "validation": "LOCALLY_REPRODUCED",
+      "fallback": "The generic pool back-off and guidance only: the card shows after three back-off steps of client failures, which one failed call never reaches.",
+      "evidence": ["benchmarks/runs/p2b-20261106 cases 0005, 0006, 0010-0012 (Realme RMX5256, Bluetooth process up about 5.3 h, about 150 central opens): first wedge; status 128 12-61 ms after the dial, clients=0", "benchmarks/runs/p3g-20261106 cases 0001-0006, benchmarks/runs/rm03g-20261106 cases 0005-0008, benchmarks/runs/rm03m2-20261106 cases 0009-0016: every Realme central connect status 128; the generic guidance appeared in 4 of 23 app sessions", "benchmarks/runs/rm3xa-20261106, rm3xb-20261106, rm3y-20261106, p3g2-20261106, p4a-20261106, p4b-20261106: after Bluetooth off/on no status 128", "benchmarks/runs/rm3s-20261106, rm3t1..4-20261106, rm3uoff1..15-20261106, rm3voff1..3-20261106 (120 cases on a fresh stack): no status 128; the trigger is unknown"],
+      "confidence": "LOW",
+      "confidence_note": "One phone (Realme RMX5256, MT6835, Android 16, patch 2026-08-01); the leak reproduced once after hours of use and never in 120 soak cases, so the trigger is unknown. The AOSP code shows how status 128 arises; no MediaTek or OPPO document names this defect. The family scope (every MediaTek phone with ColorOS or Realme UI on Android 16+) is an assumption; Android 16 phones of other makers are unmeasured.",
+      "reviewed": "2026-11-06",
+      "off_switch": "test_device_policy_off=mediatek-coloros-native-gatt-client-wedge",
+      "legacy_switches": [],
+      "origin": "Realme RMX5256 lane 2026-11-06 (ab-lanes s24-realme-REPORT Updates 6, 9-11): a stuck native stack refused every central connect and the generic guidance rarely showed.",
+      "arm": "test_gatt_native_wedge_guard=true",
+      "arm_on_by_default": true
     },
     {
       "id": "bg-battery-optimization",
@@ -8685,13 +8744,54 @@
       "off_switch": "test_device_policy_off=coded-phy-confirmed-callback-only",
       "legacy_switches": [],
       "origin": "BACKLOG P-04 residue (bluetooth.md coded-phy-flag-not-reliable, controllers.md C-22)."
+    },
+    {
+      "id": "wifi-aware-exynos-one-ndp",
+      "title": "Samsung Exynos (S.LSI): at most one Wi-Fi Aware data path",
+      "status": "proposed",
+      "matcher": {
+        "sdk_min": null,
+        "sdk_max": null,
+        "hardware": [],
+        "boards": [],
+        "board_prefixes": [],
+        "soc_families": ["EXYNOS"],
+        "soc_model_prefixes": [],
+        "manufacturers": [],
+        "skins": [],
+        "stack_lineages": [],
+        "controller": null,
+        "codec_component_prefixes": []
+      },
+      "matcher_text": "SoC [EXYNOS]",
+      "component": null,
+      "effects": [],
+      "behaviour": "Would cap simultaneous Wi-Fi Aware data paths at 1 on matching phones. The runtime already reads Characteristics and getAvailableAwareResources and learns a lower cap from a local request error, so this entry matters only if those over-report.",
+      "sources": [
+        {
+          "kind": "AOSP_SOURCE",
+          "reference": "https://android.googlesource.com/platform/packages/modules/Wifi/+/refs/heads/main/service/java/com/android/server/wifi/aware/WifiAwareDataPathStateManager.java",
+          "note": "one Network per NDI; the NDI and NDP counts come from the vendor HAL capabilities, so a vendor may ship 1"
+        }
+      ],
+      "source_status": "PARTIAL",
+      "area": "WIFI",
+      "validation": "EXPERIMENTAL",
+      "fallback": "free data paths come from the platform and the learned cap",
+      "evidence": ["none"],
+      "confidence": "LOW",
+      "confidence_note": "The value 1 for Exynos rests on a third-party app's field notes, not on an official source or on our phones; the Wi-Fi census (DeviceWifiCapabilitiesTest) decides. Promote with the census run id as evidence.",
+      "reviewed": "2026-11-04",
+      "off_switch": "test_device_policy_off=wifi-aware-exynos-one-ndp",
+      "legacy_switches": [],
+      "origin": "new (Wi-Fi carrier plan, package A4)"
     }
   ],
   "known_devices": [
     {
       "alias": "a15s",
       "model": "CPH2179",
-      "capability_file": "benchmarks/catalog/capabilities/a15s.json",
+      "capability_file": "benchmarks/catalog/capabilities/a15s-20261109.json",
       "platform_provenance": "benchmarks/runs/a15s-opusfix-5a2d93a7/0001-4b5ecaf7784b/physical/manifest.json",
       "traits": {
         "hardware": "mt6765",
@@ -8704,11 +8804,14 @@
         "soc_family": "MEDIATEK",
         "skin": "COLOROS",
         "stack_lineage": "PLATFORM_SYSTEM_BT",
-        "codec_components": []
+        "codec_components": ["OMX.MTK.VIDEO.ENCODER.AVC", "c2.android.avc.encoder"]
       },
       "active": ["gatt-context-map-race", "le-coc-server-leak", "app-bluetooth-toggle-allowed", "decoder-init-fallback", "codec-exception-recoverable-reinit", "decoder-no-output-watchdog", "decoder-bounded-release", "yuv-image-crop-rect", "le-scan-start-quota", "le-connect-retry-link-statuses", "gatt-link-slot-limit", "gatt-registration-pool-exhaustion", "gatt-close-before-registration-leak", "gatt-stale-connected-callback", "gatt-link-silence-detector", "gatt-one-client-per-remote", "bluetooth-audio-airtime-coexistence", "android11-gatt-server-connection-untracked", "mediatek-call-relay-gatt-helper-off", "bg-battery-optimization", "bg-background-restricted", "bg-standby-bucket", "bg-power-save-mode", "bg-oem-oppo", "bg-system-bluetooth-app", "bg-phone-updated", "bg-incoming-call-popup", "bg-killer-package-scan", "bg-scan-paused-by-maker", "thermal-status-ladder", "low-ram-sender-queue", "trim-memory-release", "bounded-control-queues", "memory-tier-log", "native-16kb-page-alignment", "native-simd-runtime-detection", "peer-label-title-advertising-set", "android10-11-location-switch-scan-gate", "scan-silence-watchdog", "bluetooth-process-restart-recovery", "android10-scanner-leak-on-process-death", "android10-11-background-scan-needs-location-fgs", "android15-audio-focus-requires-top-or-fgs", "audio-effect-default-state-logging", "audio-capture-silence-watchdog", "audio-echo-risk-hint", "call-route-set-result-and-reassert", "opus-encoder-native-fallback", "coc-connect-bounded", "coc-android10-address-type-precondition", "classic-connect-runtime-guard", "classic-pairing-request-logging", "classic-rfcomm-peer-cap", "coc-credit-stall-classification", "camera-stream-combination-validation", "camera-open-error-retry", "camera-frame-stall-watchdog", "encoder-init-fallback", "advertising-start-non-throwing", "advertising-set-budget-learned", "advertising-set-watchdog-restart", "advertising-slots-stuck-report", "advertising-legacy-payload-28-bytes", "advertising-multi-adv-flag-not-trusted", "le-priority-request-supervision-log", "dual-role-probe-log"],
-      "component_rules": {},
-      "matching_proposals": ["android-10-11-le-coc-security-id-budget", "android-11-coc-small-sdu-coalescing", "pre-android-13-coc-congested-write-loss", "decoder-stall-recovery-arm", "decoder-low-latency-ladder-arm", "decoder-realtime-priority-arm", "att-payload-ll-packing", "gatt-connect-on-main-looper", "gatt-refresh-before-discovery", "thermal-native-speed-floor", "thermal-battery-temperature-fallback", "memory-tier-sizing", "userspace32-tier", "native-armeabi-v7a-optional-build", "le-scan-timeout-renewal", "scan-hardware-filter-fallback", "oem-screenoff-scan-pause-vivo-poco-oppo", "audio-capture-source-fallback-chain", "opus-complexity-governor", "encoder-size-alignment", "encoder-size-support-false-negative", "encoder-explicit-colour-keys", "link-lost-after-change-rollback", "le-priority-interval-reassert"]
+      "component_rules": {
+        "codec2-encoder-tie-break": ["c2.android.avc.encoder"],
+        "aosp-codec2-opus-decoder-first": ["c2.android.avc.encoder"]
+      },
+      "matching_proposals": ["android-10-11-le-coc-security-id-budget", "android-11-coc-small-sdu-coalescing", "pre-android-13-coc-congested-write-loss", "omx-encoder-qp-bounds-ignored", "decoder-stall-recovery-arm", "decoder-low-latency-ladder-arm", "decoder-realtime-priority-arm", "mediatek-decoder-crop-and-pts-quirks", "att-payload-ll-packing", "gatt-connect-on-main-looper", "gatt-refresh-before-discovery", "thermal-native-speed-floor", "thermal-battery-temperature-fallback", "memory-tier-sizing", "userspace32-tier", "native-armeabi-v7a-optional-build", "le-scan-timeout-renewal", "scan-hardware-filter-fallback", "oem-screenoff-scan-pause-vivo-poco-oppo", "audio-capture-source-fallback-chain", "opus-complexity-governor", "encoder-size-alignment", "encoder-size-support-false-negative", "encoder-explicit-colour-keys", "link-lost-after-change-rollback", "le-priority-interval-reassert"]
     },
     {
       "alias": "a55",
@@ -8733,12 +8836,12 @@
         "codec2-encoder-tie-break": ["c2.exynos.vp9.encoder", "c2.android.av1.encoder"],
         "aosp-codec2-opus-decoder-first": ["c2.android.av1.encoder"]
       },
-      "matching_proposals": ["one-ui-never-sleeping-apps", "decoder-stall-recovery-arm", "decoder-low-latency-ladder-arm", "decoder-realtime-priority-arm", "android16-bond-loss-dialog", "samsung-gatt-direct-connect-5s", "att-payload-ll-packing", "gatt-connect-on-main-looper", "gatt-refresh-before-discovery", "thermal-headroom-forecast", "thermal-native-speed-floor", "thermal-battery-temperature-fallback", "memory-tier-sizing", "native-simd-safe-mode", "userspace32-tier", "le-scan-timeout-renewal", "scan-hardware-filter-fallback", "audio-capture-source-fallback-chain", "call-audio-mode-change-wait", "call-usb-headset-mode-normal", "opus-complexity-governor", "android16-bluetooth-socket-settings-coc", "encoder-size-alignment", "encoder-size-support-false-negative", "encoder-explicit-colour-keys", "exynos-vendor-qp-range", "encoder-key-latency", "link-lost-after-change-rollback", "le-priority-interval-reassert"]
+      "matching_proposals": ["one-ui-never-sleeping-apps", "decoder-stall-recovery-arm", "decoder-low-latency-ladder-arm", "decoder-realtime-priority-arm", "android16-bond-loss-dialog", "samsung-gatt-direct-connect-5s", "att-payload-ll-packing", "gatt-connect-on-main-looper", "gatt-refresh-before-discovery", "thermal-headroom-forecast", "thermal-native-speed-floor", "thermal-battery-temperature-fallback", "memory-tier-sizing", "native-simd-safe-mode", "userspace32-tier", "le-scan-timeout-renewal", "scan-hardware-filter-fallback", "audio-capture-source-fallback-chain", "call-audio-mode-change-wait", "call-usb-headset-mode-normal", "opus-complexity-governor", "android16-bluetooth-socket-settings-coc", "encoder-size-alignment", "encoder-size-support-false-negative", "encoder-explicit-colour-keys", "exynos-vendor-qp-range", "encoder-key-latency", "link-lost-after-change-rollback", "le-priority-interval-reassert", "wifi-aware-exynos-one-ndp"]
     },
     {
       "alias": "asus",
       "model": "ASUS_I01WD",
-      "capability_file": "benchmarks/catalog/capabilities/asus.json",
+      "capability_file": "benchmarks/catalog/capabilities/asus-20261107.json",
       "platform_provenance": "benchmarks/runs/20261002-204037-asus-m31-gatt900/manifest.json",
       "traits": {
         "hardware": "qcom",
@@ -8751,19 +8854,20 @@
         "soc_family": "QUALCOMM",
         "skin": "ASUS",
         "stack_lineage": "PLATFORM_SYSTEM_BT",
-        "codec_components": ["c2.android.vp9.encoder"]
+        "codec_components": ["c2.qti.avc.encoder", "OMX.qcom.video.encoder.hevc", "c2.android.avc.encoder", "c2.android.hevc.encoder", "c2.android.vp9.encoder"]
       },
-      "active": ["qcom-legacy-gatt-call", "qcom-legacy-coc-call", "qcom-legacy-classic-call", "qcom-msmnile-call", "qcom-legacy-call-vp9-software-decoder", "qcom-legacy-call-relay-gatt-acknowledged-writes", "qcom-msmnile-classic-source-balanced-scan", "gatt-context-map-race", "app-bluetooth-toggle-allowed", "decoder-init-fallback", "codec-exception-recoverable-reinit", "decoder-no-output-watchdog", "decoder-bounded-release", "yuv-image-crop-rect", "le-scan-start-quota", "le-connect-retry-link-statuses", "gatt-link-slot-limit", "gatt-registration-pool-exhaustion", "gatt-close-before-registration-leak", "gatt-stale-connected-callback", "gatt-link-silence-detector", "gatt-one-client-per-remote", "bluetooth-audio-airtime-coexistence", "android11-gatt-server-connection-untracked", "bg-battery-optimization", "bg-background-restricted", "bg-standby-bucket", "bg-unused-app-restrictions", "bg-power-save-mode", "bg-oem-asus", "bg-system-bluetooth-app", "bg-phone-updated", "bg-killer-package-scan", "bg-process-exit", "bg-scan-paused-by-maker", "thermal-status-ladder", "low-ram-sender-queue", "trim-memory-release", "bounded-control-queues", "memory-tier-log", "native-16kb-page-alignment", "native-simd-runtime-detection", "peer-label-title-advertising-set", "android10-11-location-switch-scan-gate", "scan-silence-watchdog", "bluetooth-process-restart-recovery", "android10-scanner-leak-on-process-death", "android10-11-background-scan-needs-location-fgs", "android15-audio-focus-requires-top-or-fgs", "audio-effect-default-state-logging", "audio-capture-silence-watchdog", "audio-echo-risk-hint", "call-route-set-result-and-reassert", "opus-encoder-native-fallback", "coc-connect-bounded", "classic-connect-runtime-guard", "classic-pairing-request-logging", "classic-rfcomm-peer-cap", "coc-credit-stall-classification", "camera-session-wait-closed", "camera-stream-combination-validation", "camera-open-error-retry", "camera-frame-stall-watchdog", "encoder-init-fallback", "advertising-start-non-throwing", "advertising-set-budget-learned", "advertising-set-watchdog-restart", "advertising-slots-stuck-report", "advertising-legacy-payload-28-bytes", "advertising-multi-adv-flag-not-trusted", "le-priority-request-supervision-log", "dual-role-probe-log"],
+      "active": ["qcom-legacy-gatt-call", "qcom-legacy-coc-call", "qcom-legacy-classic-call", "qcom-msmnile-call", "qcom-legacy-call-vp9-software-decoder", "qcom-msmnile-classic-source-balanced-scan", "gatt-context-map-race", "app-bluetooth-toggle-allowed", "decoder-init-fallback", "codec-exception-recoverable-reinit", "decoder-no-output-watchdog", "decoder-bounded-release", "yuv-image-crop-rect", "le-scan-start-quota", "le-connect-retry-link-statuses", "gatt-link-slot-limit", "gatt-registration-pool-exhaustion", "gatt-close-before-registration-leak", "gatt-stale-connected-callback", "gatt-link-silence-detector", "gatt-one-client-per-remote", "bluetooth-audio-airtime-coexistence", "android11-gatt-server-connection-untracked", "bg-battery-optimization", "bg-background-restricted", "bg-standby-bucket", "bg-unused-app-restrictions", "bg-power-save-mode", "bg-oem-asus", "bg-system-bluetooth-app", "bg-phone-updated", "bg-killer-package-scan", "bg-process-exit", "bg-scan-paused-by-maker", "thermal-status-ladder", "low-ram-sender-queue", "trim-memory-release", "bounded-control-queues", "memory-tier-log", "native-16kb-page-alignment", "native-simd-runtime-detection", "peer-label-title-advertising-set", "android10-11-location-switch-scan-gate", "scan-silence-watchdog", "bluetooth-process-restart-recovery", "android10-scanner-leak-on-process-death", "android10-11-background-scan-needs-location-fgs", "android15-audio-focus-requires-top-or-fgs", "audio-effect-default-state-logging", "audio-capture-silence-watchdog", "audio-echo-risk-hint", "call-route-set-result-and-reassert", "opus-encoder-native-fallback", "coc-connect-bounded", "classic-connect-runtime-guard", "classic-pairing-request-logging", "classic-rfcomm-peer-cap", "coc-credit-stall-classification", "camera-session-wait-closed", "camera-stream-combination-validation", "camera-open-error-retry", "camera-frame-stall-watchdog", "encoder-init-fallback", "advertising-start-non-throwing", "advertising-set-budget-learned", "advertising-set-watchdog-restart", "advertising-slots-stuck-report", "advertising-legacy-payload-28-bytes", "advertising-multi-adv-flag-not-trusted", "le-priority-request-supervision-log", "dual-role-probe-log"],
       "component_rules": {
-        "codec2-encoder-tie-break": ["c2.android.vp9.encoder"],
-        "aosp-codec2-opus-decoder-first": ["c2.android.vp9.encoder"]
+        "codec2-encoder-tie-break": ["c2.qti.avc.encoder", "c2.android.avc.encoder", "c2.android.hevc.encoder", "c2.android.vp9.encoder"],
+        "aosp-codec2-opus-decoder-first": ["c2.android.avc.encoder", "c2.android.hevc.encoder", "c2.android.vp9.encoder"],
+        "qcom-decoder-vendor-low-latency": ["c2.qti.avc.encoder"]
       },
-      "matching_proposals": ["android-10-11-le-coc-security-id-budget", "android-11-coc-small-sdu-coalescing", "pre-android-13-coc-congested-write-loss", "asus-auto-start-manager", "decoder-stall-recovery-arm", "decoder-low-latency-ladder-arm", "decoder-realtime-priority-arm", "att-payload-ll-packing", "gatt-connect-on-main-looper", "gatt-refresh-before-discovery", "thermal-headroom-forecast", "thermal-native-speed-floor", "thermal-battery-temperature-fallback", "memory-tier-sizing", "native-simd-safe-mode", "userspace32-tier", "le-scan-timeout-renewal", "scan-hardware-filter-fallback", "audio-capture-source-fallback-chain", "opus-complexity-governor", "encoder-size-alignment", "encoder-size-support-false-negative", "encoder-explicit-colour-keys", "encoder-key-latency", "qualcomm-wcn399x-dual-role-unvalidated", "link-lost-after-change-rollback", "le-priority-interval-reassert"]
+      "matching_proposals": ["android-10-11-le-coc-security-id-budget", "android-11-coc-small-sdu-coalescing", "pre-android-13-coc-congested-write-loss", "asus-auto-start-manager", "omx-encoder-qp-bounds-ignored", "decoder-stall-recovery-arm", "decoder-low-latency-ladder-arm", "decoder-realtime-priority-arm", "att-payload-ll-packing", "gatt-connect-on-main-looper", "gatt-refresh-before-discovery", "thermal-headroom-forecast", "thermal-native-speed-floor", "thermal-battery-temperature-fallback", "memory-tier-sizing", "native-simd-safe-mode", "userspace32-tier", "le-scan-timeout-renewal", "scan-hardware-filter-fallback", "audio-capture-source-fallback-chain", "opus-complexity-governor", "encoder-size-alignment", "encoder-size-support-false-negative", "encoder-explicit-colour-keys", "encoder-key-latency", "qualcomm-wcn399x-dual-role-unvalidated", "link-lost-after-change-rollback", "le-priority-interval-reassert"]
     },
     {
       "alias": "m31",
       "model": "SM-M315F",
-      "capability_file": "benchmarks/catalog/capabilities/m31-20261005.json",
+      "capability_file": "benchmarks/catalog/capabilities/m31-20261106.json",
       "platform_provenance": "benchmarks/runs/20261002-204037-asus-m31-gatt900/manifest.json",
       "traits": {
         "hardware": "exynos9611",
@@ -8776,16 +8880,45 @@
         "soc_family": "EXYNOS",
         "skin": "ONE_UI",
         "stack_lineage": "PLATFORM_SYSTEM_BT",
-        "codec_components": ["OMX.Exynos.VP9.Encoder"]
+        "codec_components": ["OMX.Exynos.VP9.Encoder", "OMX.Exynos.HEVC.Encoder", "OMX.Exynos.AVC.Encoder", "c2.android.hevc.encoder", "c2.android.avc.encoder"]
       },
       "active": ["le-coc-eatt-stranded-channels", "app-bluetooth-toggle-allowed", "decoder-init-fallback", "codec-exception-recoverable-reinit", "decoder-no-output-watchdog", "decoder-bounded-release", "yuv-image-crop-rect", "le-scan-start-quota", "le-connect-retry-link-statuses", "gatt-link-slot-limit", "gatt-registration-pool-exhaustion", "gatt-close-before-registration-leak", "gatt-stale-connected-callback", "gatt-link-silence-detector", "gatt-one-client-per-remote", "bluetooth-audio-airtime-coexistence", "bg-battery-optimization", "bg-background-restricted", "bg-standby-bucket", "bg-unused-app-restrictions", "bg-power-save-mode", "bg-fgs-start-fallback", "bg-oem-samsung", "bg-system-bluetooth-app", "bg-phone-updated", "bg-killer-package-scan", "bg-process-exit", "bg-scan-paused-by-maker", "thermal-status-ladder", "low-ram-sender-queue", "trim-memory-release", "bounded-control-queues", "memory-tier-log", "native-16kb-page-alignment", "native-simd-runtime-detection", "peer-label-title-advertising-set", "scan-silence-watchdog", "bluetooth-process-restart-recovery", "android15-audio-focus-requires-top-or-fgs", "audio-effect-default-state-logging", "audio-capture-silence-watchdog", "audio-echo-risk-hint", "call-route-set-result-and-reassert", "opus-encoder-native-fallback", "coc-connect-bounded", "classic-connect-runtime-guard", "classic-pairing-request-logging", "classic-rfcomm-peer-cap", "coc-credit-stall-classification", "coc-mtu-exchange-before-traffic", "camera-stream-combination-validation", "camera-open-error-retry", "camera-frame-stall-watchdog", "camera-privacy-toggle-notice", "encoder-init-fallback", "advertising-start-non-throwing", "advertising-set-budget-learned", "advertising-set-watchdog-restart", "advertising-slots-stuck-report", "advertising-legacy-payload-28-bytes", "advertising-multi-adv-flag-not-trusted", "le-priority-request-supervision-log", "dual-role-probe-log"],
-      "component_rules": {},
-      "matching_proposals": ["pre-android-13-coc-congested-write-loss", "one-ui-never-sleeping-apps", "omx-encoder-qp-bounds-ignored", "omx-exynos-vp9-framerate-bitrate-adjuster", "omx-exynos-framerate-adjuster-arm", "decoder-stall-recovery-arm", "decoder-low-latency-ladder-arm", "decoder-realtime-priority-arm", "samsung-gatt-direct-connect-5s", "android12-gatt-disconnect-status-zero", "exynos9611-dual-role-equal-interval-child-starvation", "att-payload-ll-packing", "android12-le-acl-segment-miscount", "gatt-connect-on-main-looper", "gatt-refresh-before-discovery", "thermal-headroom-forecast", "thermal-native-speed-floor", "thermal-battery-temperature-fallback", "memory-tier-sizing", "native-simd-safe-mode", "userspace32-tier", "le-scan-timeout-renewal", "scan-hardware-filter-fallback", "audio-capture-source-fallback-chain", "audio-off-main-thread-commands", "call-audio-mode-change-wait", "call-usb-headset-mode-normal", "opus-complexity-governor", "encoder-size-alignment", "encoder-size-support-false-negative", "encoder-explicit-colour-keys", "exynos-vendor-qp-range", "link-lost-after-change-rollback", "le-priority-interval-reassert"]
+      "component_rules": {
+        "codec2-encoder-tie-break": ["c2.android.hevc.encoder", "c2.android.avc.encoder"],
+        "aosp-codec2-opus-decoder-first": ["c2.android.hevc.encoder", "c2.android.avc.encoder"]
+      },
+      "matching_proposals": ["pre-android-13-coc-congested-write-loss", "one-ui-never-sleeping-apps", "omx-encoder-qp-bounds-ignored", "omx-exynos-vp9-framerate-bitrate-adjuster", "omx-exynos-framerate-adjuster-arm", "decoder-stall-recovery-arm", "decoder-low-latency-ladder-arm", "decoder-realtime-priority-arm", "samsung-gatt-direct-connect-5s", "android12-gatt-disconnect-status-zero", "exynos9611-dual-role-equal-interval-child-starvation", "att-payload-ll-packing", "android12-le-acl-segment-miscount", "gatt-connect-on-main-looper", "gatt-refresh-before-discovery", "thermal-headroom-forecast", "thermal-native-speed-floor", "thermal-battery-temperature-fallback", "memory-tier-sizing", "native-simd-safe-mode", "userspace32-tier", "le-scan-timeout-renewal", "scan-hardware-filter-fallback", "audio-capture-source-fallback-chain", "audio-off-main-thread-commands", "call-audio-mode-change-wait", "call-usb-headset-mode-normal", "opus-complexity-governor", "encoder-size-alignment", "encoder-size-support-false-negative", "encoder-explicit-colour-keys", "exynos-vendor-qp-range", "encoder-key-latency", "link-lost-after-change-rollback", "le-priority-interval-reassert", "wifi-aware-exynos-one-ndp"]
+    },
+    {
+      "alias": "realme",
+      "model": "RMX5256",
+      "capability_file": "benchmarks/catalog/capabilities/realme-20261109.json",
+      "platform_provenance": "benchmarks/catalog/capabilities/realme-20261109.json",
+      "traits": {
+        "hardware": "mt6835",
+        "board": "k6835v2_64",
+        "sdk": 36,
+        "manufacturer": "realme",
+        "brand": "realme",
+        "soc_manufacturer": "Mediatek",
+        "soc_model": "MT6835",
+        "soc_family": "MEDIATEK",
+        "skin": "REALME_UI",
+        "stack_lineage": "BLUETOOTH_MODULE",
+        "codec_components": ["c2.mtk.hevc.encoder", "c2.mtk.avc.encoder", "c2.android.av1.encoder", "c2.android.hevc.encoder", "c2.android.avc.encoder"]
+      },
+      "active": ["decoder-init-fallback", "codec-exception-recoverable-reinit", "decoder-no-output-watchdog", "decoder-bounded-release", "yuv-image-crop-rect", "le-scan-start-quota", "gatt-mtu-fixed-517", "gatt-write-busy-retry", "le-connect-retry-link-statuses", "gatt-link-slot-limit", "gatt-registration-pool-exhaustion", "gatt-stale-connected-callback", "gatt-link-silence-detector", "bluetooth-audio-airtime-coexistence", "mediatek-call-relay-gatt-helper-off", "mediatek-coloros-native-gatt-client-wedge", "bg-battery-optimization", "bg-background-restricted", "bg-standby-bucket", "bg-unused-app-restrictions", "bg-power-save-mode", "bg-fgs-start-fallback", "bg-oem-realme", "bg-system-bluetooth-app", "bg-phone-updated", "bg-incoming-call-popup", "bg-killer-package-scan", "bg-process-exit", "bg-scan-paused-by-maker", "thermal-status-ladder", "low-ram-sender-queue", "trim-memory-release", "bounded-control-queues", "memory-tier-log", "native-16kb-page-alignment", "native-simd-runtime-detection", "peer-label-title-advertising-set", "scan-silence-watchdog", "bluetooth-process-restart-recovery", "android15-audio-focus-requires-top-or-fgs", "audio-effect-default-state-logging", "audio-capture-silence-watchdog", "audio-echo-risk-hint", "call-route-set-result-and-reassert", "opus-encoder-native-fallback", "coc-connect-bounded", "coc-socket-error-codes", "classic-connect-runtime-guard", "classic-pairing-request-logging", "classic-rfcomm-peer-cap", "camera-stream-combination-validation", "camera-open-error-retry", "camera-frame-stall-watchdog", "camera-privacy-toggle-notice", "encoder-init-fallback", "advertising-start-non-throwing", "advertising-set-budget-learned", "advertising-set-watchdog-restart", "advertising-slots-stuck-report", "advertising-legacy-payload-28-bytes", "advertising-multi-adv-flag-not-trusted", "le-priority-request-supervision-log", "dual-role-probe-log"],
+      "component_rules": {
+        "codec2-encoder-tie-break": ["c2.mtk.hevc.encoder", "c2.mtk.avc.encoder", "c2.android.av1.encoder", "c2.android.hevc.encoder", "c2.android.avc.encoder"],
+        "aosp-codec2-opus-decoder-first": ["c2.android.av1.encoder", "c2.android.hevc.encoder", "c2.android.avc.encoder"],
+        "c2-mtk-release-instead-of-flush": ["c2.mtk.hevc.encoder", "c2.mtk.avc.encoder"]
+      },
+      "matching_proposals": ["decoder-stall-recovery-arm", "decoder-low-latency-ladder-arm", "decoder-realtime-priority-arm", "mediatek-decoder-crop-and-pts-quirks", "android16-bond-loss-dialog", "att-payload-ll-packing", "gatt-connect-on-main-looper", "gatt-refresh-before-discovery", "thermal-headroom-forecast", "thermal-native-speed-floor", "thermal-battery-temperature-fallback", "memory-tier-sizing", "native-simd-safe-mode", "userspace32-tier", "native-armeabi-v7a-optional-build", "le-scan-timeout-renewal", "scan-hardware-filter-fallback", "audio-capture-source-fallback-chain", "call-audio-mode-change-wait", "opus-complexity-governor", "android16-bluetooth-socket-settings-coc", "encoder-size-alignment", "encoder-size-support-false-negative", "encoder-explicit-colour-keys", "encoder-key-latency", "link-lost-after-change-rollback", "le-priority-interval-reassert"]
     },
     {
       "alias": "s22",
       "model": "SM-S901E",
-      "capability_file": "benchmarks/catalog/capabilities/s22.json",
+      "capability_file": "benchmarks/catalog/capabilities/s22-20261106.json",
       "platform_provenance": "benchmarks/runs/20261002-194829-samsung-classic500-parent-loss/manifest.json",
       "traits": {
         "hardware": "qcom",
@@ -8798,19 +8931,20 @@
         "soc_family": "QUALCOMM",
         "skin": "ONE_UI",
         "stack_lineage": "BLUETOOTH_MODULE",
-        "codec_components": ["c2.android.av1.encoder", "c2.android.vp9.encoder"]
+        "codec_components": ["c2.qti.hevc.encoder", "c2.qti.avc.encoder", "c2.android.av1.encoder", "c2.android.hevc.encoder", "c2.android.avc.encoder", "c2.android.vp9.encoder"]
       },
       "active": ["decoder-init-fallback", "codec-exception-recoverable-reinit", "decoder-no-output-watchdog", "decoder-bounded-release", "yuv-image-crop-rect", "le-scan-start-quota", "gatt-mtu-fixed-517", "gatt-write-busy-retry", "le-connect-retry-link-statuses", "gatt-link-slot-limit", "gatt-registration-pool-exhaustion", "gatt-stale-connected-callback", "gatt-link-silence-detector", "bluetooth-audio-airtime-coexistence", "bg-battery-optimization", "bg-background-restricted", "bg-standby-bucket", "bg-unused-app-restrictions", "bg-power-save-mode", "bg-fgs-start-fallback", "bg-oem-samsung", "bg-system-bluetooth-app", "bg-phone-updated", "bg-killer-package-scan", "bg-process-exit", "bg-scan-paused-by-maker", "thermal-status-ladder", "low-ram-sender-queue", "trim-memory-release", "bounded-control-queues", "memory-tier-log", "native-16kb-page-alignment", "native-simd-runtime-detection", "peer-label-title-advertising-set", "scan-silence-watchdog", "bluetooth-process-restart-recovery", "android15-audio-focus-requires-top-or-fgs", "audio-effect-default-state-logging", "audio-capture-silence-watchdog", "audio-echo-risk-hint", "call-route-set-result-and-reassert", "opus-encoder-native-fallback", "coc-connect-bounded", "coc-socket-error-codes", "classic-connect-runtime-guard", "classic-pairing-request-logging", "classic-rfcomm-peer-cap", "camera-stream-combination-validation", "camera-open-error-retry", "camera-frame-stall-watchdog", "camera-privacy-toggle-notice", "encoder-init-fallback", "advertising-start-non-throwing", "advertising-set-budget-learned", "advertising-set-watchdog-restart", "advertising-slots-stuck-report", "advertising-legacy-payload-28-bytes", "advertising-multi-adv-flag-not-trusted", "le-priority-request-supervision-log", "dual-role-probe-log"],
       "component_rules": {
-        "codec2-encoder-tie-break": ["c2.android.av1.encoder", "c2.android.vp9.encoder"],
-        "aosp-codec2-opus-decoder-first": ["c2.android.av1.encoder", "c2.android.vp9.encoder"]
+        "codec2-encoder-tie-break": ["c2.qti.hevc.encoder", "c2.qti.avc.encoder", "c2.android.av1.encoder", "c2.android.hevc.encoder", "c2.android.avc.encoder", "c2.android.vp9.encoder"],
+        "aosp-codec2-opus-decoder-first": ["c2.android.av1.encoder", "c2.android.hevc.encoder", "c2.android.avc.encoder", "c2.android.vp9.encoder"],
+        "qcom-decoder-vendor-low-latency": ["c2.qti.hevc.encoder", "c2.qti.avc.encoder"]
       },
       "matching_proposals": ["one-ui-never-sleeping-apps", "decoder-stall-recovery-arm", "decoder-low-latency-ladder-arm", "decoder-realtime-priority-arm", "android16-bond-loss-dialog", "samsung-gatt-direct-connect-5s", "android15-qcom-coc-connect-stall", "att-payload-ll-packing", "gatt-connect-on-main-looper", "gatt-refresh-before-discovery", "thermal-headroom-forecast", "thermal-native-speed-floor", "thermal-battery-temperature-fallback", "memory-tier-sizing", "native-simd-safe-mode", "userspace32-tier", "le-scan-timeout-renewal", "scan-hardware-filter-fallback", "audio-capture-source-fallback-chain", "call-audio-mode-change-wait", "call-usb-headset-mode-normal", "opus-complexity-governor", "android16-bluetooth-socket-settings-coc", "camera-device-reopen-one-ui-qualcomm-api36", "camera-timebase-inconsistent", "encoder-size-alignment", "encoder-size-support-false-negative", "encoder-explicit-colour-keys", "encoder-key-latency", "qualcomm-android16-first-frames-suspect", "link-lost-after-change-rollback", "le-priority-interval-reassert"]
     },
     {
       "alias": "s24",
       "model": "SM-S921B",
-      "capability_file": "benchmarks/catalog/capabilities/s24.json",
+      "capability_file": "benchmarks/catalog/capabilities/s24-20261107.json",
       "platform_provenance": "benchmarks/runs/20261002-194829-samsung-classic500-parent-loss/manifest.json",
       "traits": {
         "hardware": "s5e9945",
@@ -8823,14 +8957,14 @@
         "soc_family": "EXYNOS",
         "skin": "ONE_UI",
         "stack_lineage": "BLUETOOTH_MODULE",
-        "codec_components": ["c2.exynos.vp9.encoder", "c2.android.av1.encoder"]
+        "codec_components": ["c2.exynos.vp9.encoder", "c2.exynos.hevc.encoder", "c2.exynos.h264.encoder", "c2.android.av1.encoder", "c2.android.hevc.encoder", "c2.android.avc.encoder"]
       },
       "active": ["decoder-init-fallback", "codec-exception-recoverable-reinit", "decoder-no-output-watchdog", "decoder-bounded-release", "yuv-image-crop-rect", "le-scan-start-quota", "gatt-mtu-fixed-517", "gatt-write-busy-retry", "le-connect-retry-link-statuses", "gatt-link-slot-limit", "gatt-registration-pool-exhaustion", "gatt-stale-connected-callback", "gatt-link-silence-detector", "bluetooth-audio-airtime-coexistence", "bg-battery-optimization", "bg-background-restricted", "bg-standby-bucket", "bg-unused-app-restrictions", "bg-power-save-mode", "bg-fgs-start-fallback", "bg-oem-samsung", "bg-system-bluetooth-app", "bg-phone-updated", "bg-killer-package-scan", "bg-process-exit", "bg-scan-paused-by-maker", "thermal-status-ladder", "low-ram-sender-queue", "trim-memory-release", "bounded-control-queues", "memory-tier-log", "native-16kb-page-alignment", "native-simd-runtime-detection", "peer-label-title-advertising-set", "scan-silence-watchdog", "bluetooth-process-restart-recovery", "android15-audio-focus-requires-top-or-fgs", "audio-effect-default-state-logging", "audio-capture-silence-watchdog", "audio-echo-risk-hint", "call-route-set-result-and-reassert", "opus-encoder-native-fallback", "coc-connect-bounded", "coc-socket-error-codes", "classic-connect-runtime-guard", "classic-pairing-request-logging", "classic-rfcomm-peer-cap", "camera-stream-combination-validation", "camera-open-error-retry", "camera-frame-stall-watchdog", "camera-privacy-toggle-notice", "encoder-init-fallback", "advertising-start-non-throwing", "advertising-set-budget-learned", "advertising-set-watchdog-restart", "advertising-slots-stuck-report", "advertising-legacy-payload-28-bytes", "advertising-multi-adv-flag-not-trusted", "le-priority-request-supervision-log", "dual-role-probe-log"],
       "component_rules": {
-        "codec2-encoder-tie-break": ["c2.exynos.vp9.encoder", "c2.android.av1.encoder"],
-        "aosp-codec2-opus-decoder-first": ["c2.android.av1.encoder"]
+        "codec2-encoder-tie-break": ["c2.exynos.vp9.encoder", "c2.exynos.hevc.encoder", "c2.exynos.h264.encoder", "c2.android.av1.encoder", "c2.android.hevc.encoder", "c2.android.avc.encoder"],
+        "aosp-codec2-opus-decoder-first": ["c2.android.av1.encoder", "c2.android.hevc.encoder", "c2.android.avc.encoder"]
       },
-      "matching_proposals": ["one-ui-never-sleeping-apps", "decoder-stall-recovery-arm", "decoder-low-latency-ladder-arm", "decoder-realtime-priority-arm", "android16-bond-loss-dialog", "samsung-gatt-direct-connect-5s", "att-payload-ll-packing", "gatt-connect-on-main-looper", "gatt-refresh-before-discovery", "thermal-headroom-forecast", "thermal-native-speed-floor", "thermal-battery-temperature-fallback", "memory-tier-sizing", "native-simd-safe-mode", "userspace32-tier", "le-scan-timeout-renewal", "scan-hardware-filter-fallback", "audio-capture-source-fallback-chain", "call-audio-mode-change-wait", "call-usb-headset-mode-normal", "opus-complexity-governor", "android16-bluetooth-socket-settings-coc", "encoder-size-alignment", "encoder-size-support-false-negative", "encoder-explicit-colour-keys", "exynos-vendor-qp-range", "encoder-key-latency", "link-lost-after-change-rollback", "le-priority-interval-reassert"]
+      "matching_proposals": ["one-ui-never-sleeping-apps", "decoder-stall-recovery-arm", "decoder-low-latency-ladder-arm", "decoder-realtime-priority-arm", "android16-bond-loss-dialog", "samsung-gatt-direct-connect-5s", "att-payload-ll-packing", "gatt-connect-on-main-looper", "gatt-refresh-before-discovery", "thermal-headroom-forecast", "thermal-native-speed-floor", "thermal-battery-temperature-fallback", "memory-tier-sizing", "native-simd-safe-mode", "userspace32-tier", "le-scan-timeout-renewal", "scan-hardware-filter-fallback", "audio-capture-source-fallback-chain", "call-audio-mode-change-wait", "call-usb-headset-mode-normal", "opus-complexity-governor", "android16-bluetooth-socket-settings-coc", "encoder-size-alignment", "encoder-size-support-false-negative", "encoder-explicit-colour-keys", "exynos-vendor-qp-range", "encoder-key-latency", "link-lost-after-change-rollback", "le-priority-interval-reassert", "wifi-aware-exynos-one-ndp"]
     },
     {
       "alias": "xiaomi",

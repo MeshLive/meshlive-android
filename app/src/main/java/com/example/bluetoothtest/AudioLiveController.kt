@@ -574,7 +574,7 @@ class AudioLiveController(
     private fun bindListenScreen(view: View) {
         view.findViewById<View>(R.id.audioListenReport).apply {
             visibility = View.GONE
-            setOnClickListener { CallBlockingUi.report(activity, listenSourceFingerprint, listenToken, host::leaveListening) }
+            setOnClickListener { CallBlockingUi.report(activity, listenSourceFingerprint, onDone = host::leaveListening) }
         }
         view.findViewById<ImageButton>(R.id.audioListenBack).setOnClickListener { host.leaveListening() }
         view.findViewById<MaterialButton>(R.id.audioListenStop).setOnClickListener { host.leaveListening() }
@@ -602,7 +602,8 @@ class AudioLiveController(
         if (!listening) return
         listenSourceFingerprint = header.audioLiveAuth?.let { IdentityFingerprint.fromPublicKey(it.identitySpki) }
         if (listenSourceFingerprint?.let { LocalReporting.hidden(activity, it.hex) } == true) {
-            listenToken?.let { LocalReporting.hideStream(activity, it) }
+            // AB3: the route that played is hidden for this run only, as for a blocked person; never its bare token.
+            listenOffer?.let(PersonPolicy::hideStream)
             host.leaveListening()
             return
         }

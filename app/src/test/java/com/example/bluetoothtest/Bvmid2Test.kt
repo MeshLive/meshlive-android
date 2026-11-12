@@ -504,15 +504,15 @@ class Bvmid2Test {
         val older = IdentityFingerprint.fromHex("cd".repeat(32))
         visit.begin()
         // An older verified contact that won the race for the code was never confirmed in this visit (review R1).
-        assertFalse(visit.displayerMayLease(older))
+        assertFalse(visit.mayLease(older))
         visit.confirm(asha)
-        assertTrue(visit.displayerMayLease(asha))
+        assertTrue(visit.mayLease(asha))
         visit.onReuseAlert()
-        assertFalse(visit.displayerMayLease(asha))
+        assertFalse(visit.mayLease(asha))
         assertTrue(visit.reuseAlerted())
         // A new visit starts clean.
         visit.begin()
-        assertFalse(visit.displayerMayLease(asha))
+        assertFalse(visit.mayLease(asha))
         assertFalse(visit.reuseAlerted())
     }
 

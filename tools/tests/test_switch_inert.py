@@ -51,6 +51,23 @@ class SwitchInertTest(unittest.TestCase):
         self.assertEqual(True, extras["test_ios_compact_discovery"])
         self.assertEqual("gatt_default", extras["test_call_head_of_line"])
 
+    def test_the_direction_split_needs_adaptive_phy_and_replaces_the_fixed_direction_split(self):
+        extras = runner.tunable_extras({"adaptive_phy": False, "phy_direction_split": True})
+        self.assertEqual([("phy_direction_split", "adaptive_phy=false")], switch_inert.inert_arms(extras))
+        extras = runner.tunable_extras({"phy_direction_split": True, "adaptive_phy_split": True})
+        self.assertEqual([("adaptive_phy_split", "phy_direction_split=true")], switch_inert.inert_arms(extras))
+        self.assertEqual([], switch_inert.inert_arms(runner.tunable_extras({"phy_direction_split": True})))
+
+    def test_the_aware_port_control_arm_reaches_the_launch_and_is_inert_only_without_a_wifi_carrier(self):
+        # W5: the derived port is the app default, so only `false` (the control arm) is an arm.
+        case = {"carrier": "wifi_aware", "tunables": {"wifi_aware_derived_port": False}}
+        self.assertIs(False, runner.case_extras(case)["test_wifi_aware_derived_port"])
+        self.assertIs(True, runner.case_extras(case)["test_wifi_carrier"])
+        runner.refuse_inert_arms(case)
+        with self.assertRaisesRegex(ValueError, "wifi_aware_derived_port because wifi_carrier=false"):
+            runner.refuse_inert_arms({"tunables": {"wifi_aware_derived_port": False}})
+        runner.refuse_inert_arms({"tunables": {"wifi_aware_derived_port": True}})
+
 
 if __name__ == "__main__":
     unittest.main()

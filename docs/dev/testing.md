@@ -25,6 +25,10 @@ Terms used below:
   frame size and rate, buffers, lifecycle actions, input). Its **case ID** is derived from that request.
 - **Transport**: `classic` = Bluetooth Classic RFCOMM, `ble` = LE L2CAP connection-oriented channel (CoC), `gatt` = LE
   GATT (the slow, widely supported attribute protocol, used as a byte stream).
+- **Carrier**: the optional second radio a hop may move to after it connects (`wifi_aware`, `wifi_aware_wider`,
+  `wifi_direct`; `wifi_aware_native` for a hop that starts on Wi-Fi). A request without a `carrier` key is Bluetooth only.
+  `transport` still names the Bluetooth transport the hop starts on. A requested Wi-Fi carrier that ran on Bluetooth is a
+  failed case, shown by `BENCHMARK carrier: ... requested= effective=`.
 - **Frozen APK**: one built APK, identified by its SHA-256, used for a whole comparison.
 
 ## Quick checks (no phone needed)

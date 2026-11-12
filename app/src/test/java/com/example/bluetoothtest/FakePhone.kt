@@ -21,6 +21,8 @@ internal class FakePhone(val root: File) {
 
     val noBackupDir: File = File(root, "no_backup").also { it.mkdirs() }
     val filesDir: File = File(root, "files").also { it.mkdirs() }
+    /** The app's data directory: preferences are also written as `shared_prefs/<name>.xml` there, as Android does. */
+    val dataDir: File = File(root, "data").also { it.mkdirs() }
 
     /** Stands in for the phone's non-exportable Keystore key (one per phone, like the real one). */
     val atRestCipher: AtRestCipher = AesGcmAtRestCipher {
@@ -30,14 +32,24 @@ internal class FakePhone(val root: File) {
     init {
         // Stores sealed with the verified-contacts key read and write through this phone's stand-in key.
         RecentCalls.cipher = { atRestCipher }
+        SealedRecords.cipher = { atRestCipher }
     }
 
-    fun preferences(name: String): MemoryPreferences = prefs.getOrPut(name) { MemoryPreferences() }
+    fun preferences(name: String): MemoryPreferences =
+        synchronized(prefs) { prefs.getOrPut(name) { MemoryPreferences(File(dataDir, "shared_prefs/$name.xml")) } }
+
+    /** As Context.deleteSharedPreferences: the in-memory instance and both files on the disk. */
+    fun deletePreferences(name: String): Boolean {
+        synchronized(prefs) { prefs.remove(name) }
+        val xml = File(dataDir, "shared_prefs/$name.xml")
+        File(xml.path + ".bak").delete()
+        return !xml.exists() || xml.delete()
+    }
 
     fun preferenceNames(): Set<String> = prefs.keys.toSet()
 
     fun clearPreferences(name: String) {
-        prefs.remove(name)
+        deletePreferences(name)
     }
 
     fun registerService(name: String, service: Any) {
@@ -59,6 +71,10 @@ internal class FakeAppContext(
 
     override fun getFilesDir(): File = phone.filesDir
 
+    override fun getDataDir(): File = phone.dataDir
+
+    override fun deleteSharedPreferences(name: String): Boolean = phone.deletePreferences(name)
+
     override fun getPackageName(): String = pkg
 
     override fun getApplicationContext(): Context = this
@@ -66,11 +82,27 @@ internal class FakeAppContext(
     override fun getSystemService(name: String): Any? = services[name]
 }
 
-/** An in-memory [SharedPreferences]: an edit is visible as soon as it is applied or committed. */
-internal class MemoryPreferences : SharedPreferences {
-    private val values = LinkedHashMap<String, Any>()
+/**
+ * An in-memory [SharedPreferences]: an edit is visible as soon as it is applied or committed. With a [file], a successful
+ * commit also writes the names and values there as Android's XML does; with [failCommits], a commit changes the memory but
+ * not the file and returns false, as a failed disk write does (AOSP SharedPreferencesImpl: memory first, then the file).
+ */
+internal class MemoryPreferences(private val file: File? = null) : SharedPreferences {
+    private val values = java.util.Collections.synchronizedMap(LinkedHashMap<String, Any>())
+    @Volatile var failCommits = false
 
-    override fun getAll(): MutableMap<String, *> = LinkedHashMap(values)
+    override fun getAll(): MutableMap<String, *> = synchronized(values) { LinkedHashMap(values) }
+
+    private fun writeFile(): Boolean {
+        val target = file ?: return true
+        if (failCommits) return false
+        val entries = synchronized(values) { values.entries.map { it.key to it.value } }
+        target.parentFile?.mkdirs()
+        target.writeText(
+            entries.joinToString("", "<map>", "</map>") { (key, value) -> "<entry name=\"$key\" value=\"$value\" />" },
+        )
+        return true
+    }
 
     override fun getString(key: String, defValue: String?): String? = values[key] as? String ?: defValue
 
@@ -141,10 +173,12 @@ internal class MemoryPreferences : SharedPreferences {
         }
 
         override fun commit(): Boolean {
-            if (clearAll) values.clear()
-            removed.forEach { values.remove(it) }
-            pending.forEach { (key, value) -> if (value == null) values.remove(key) else values[key] = value }
-            return true
+            synchronized(values) {
+                if (clearAll) values.clear()
+                removed.forEach { values.remove(it) }
+                pending.forEach { (key, value) -> if (value == null) values.remove(key) else values[key] = value }
+            }
+            return writeFile()
         }
 
         override fun apply() {

@@ -685,12 +685,19 @@ class PresenceStoreTest {
         assertEquals(current, vault.generation())
     }
 
+    /**
+     * Design decision 2026-11-06 (all platforms): "Can see when I'm nearby" starts as not yet asked, which counts as off
+     * (it replaced "default on"); off after a delivery revokes once.
+     */
     @Test
-    fun turningTheSwitchOffAfterDeliveryRevokesOnceAndNeverAgain() {
+    fun theSwitchStartsNotYetAskedCountsAsOffAndOffAfterDeliveryRevokesOnceAndNeverAgain() {
         val vault = vault()
         vault.ensureLoaded()
-        assertTrue(vault.visibleToThem(nodeB))
+        assertFalse("not yet asked counts as off", vault.visibleToThem(nodeB))
+        assertNull(vault.answer(nodeB))
+        assertFalse(vault.canDeliver(nodeB))
         vault.recordDelivered(nodeB)
+        assertNull("a record made for a delivery is not an answer", vault.answer(nodeB))
         val before = vault.generation()
         assertTrue(vault.setVisible(nodeB, false))
         assertFalse(vault.visibleToThem(nodeB))
@@ -703,6 +710,58 @@ class PresenceStoreTest {
         assertFalse(vault.setVisible(nodeB, true))
         assertTrue(vault.visibleToThem(nodeB))
         assertEquals(after, vault.generation())
+    }
+
+    /** A no for a contact not yet asked is kept as an answer; answers survive a restart; anyone else stays not yet asked. */
+    @Test
+    fun aNoIsKeptAsAnAnswerAndAnswersSurviveARestartWhileOthersStayNotYetAsked() {
+        val vault = vault()
+        vault.ensureLoaded()
+        assertFalse("no lease was delivered: nothing to revoke", vault.setVisible(nodeA, false))
+        assertEquals(false, vault.answer(nodeA))
+        assertFalse(vault.setVisible(nodeB, true))
+        assertEquals(true, vault.answer(nodeB))
+        vault.recordDelivered(nodeC)
+        val restarted = vault()
+        assertTrue(restarted.ensureLoaded())
+        assertEquals(false, restarted.answer(nodeA))
+        assertFalse(restarted.visibleToThem(nodeA))
+        assertEquals(true, restarted.answer(nodeB))
+        assertTrue(restarted.visibleToThem(nodeB))
+        assertNull("a delivery record is not an answer", restarted.answer(nodeC))
+        assertFalse(restarted.visibleToThem(nodeC))
+    }
+
+    /**
+     * AB3 R5: a store an older build wrote (flag byte 1 = on, 0 = off; its default was on, so every stored contact was
+     * answered) keeps each answer.
+     */
+    @Test
+    fun answersAnOlderBuildStoredKeepTheirMeaning() {
+        val bytes = java.io.ByteArrayOutputStream()
+        java.io.DataOutputStream(bytes).use { out ->
+            out.write("BPS1".toByteArray(Charsets.US_ASCII))
+            out.writeByte(2)
+            out.writeInt(4)
+            out.writeByte(1)
+            out.writeInt(day.toInt())
+            out.write(ByteArray(32) { 3 })
+            out.writeShort(2)
+            for ((node, flag) in listOf(nodeA to 1, nodeB to 0)) {
+                out.write(node.toByteArray())
+                out.writeByte(flag)
+                out.writeInt(0)
+                out.writeInt(0)
+            }
+        }
+        file.writeBytes(cipher.seal(bytes.toByteArray()))
+        floor.value = 4
+        val vault = vault()
+        assertTrue(vault.ensureLoaded())
+        assertEquals(true, vault.answer(nodeA))
+        assertTrue(vault.visibleToThem(nodeA))
+        assertEquals(false, vault.answer(nodeB))
+        assertFalse(vault.visibleToThem(nodeB))
     }
 
     @Test

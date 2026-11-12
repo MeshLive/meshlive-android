@@ -393,18 +393,35 @@ class BoundedMediaAgeTest {
         val lock = Object()
         val queue = java.util.concurrent.LinkedBlockingQueue<Int>()
         val written = java.util.Collections.synchronizedList(ArrayList<Int>())
+        // Video is written in increasing order, so the newest written video frame says how far the writer got.
+        val newestVideo = java.util.concurrent.atomic.AtomicInteger(-1)
         val done = java.util.concurrent.atomic.AtomicBoolean(false)
         val writer = Thread {
             while (true) {
                 val frame = takeNextUnderLock(lock, queue, { it < 0 }, timeoutMs = 5) ?: if (done.get()) break else continue
                 written += frame
+                if (frame >= 0) newestVideo.set(frame)
             }
         }
         writer.start()
         val shedder = MediaAgeShedder(cooldownNs = 0)
         val classify: (Int) -> ShedClass = { if (it < 0) ShedClass.KEEP else if (it % 10 == 0) ShedClass.KEY_FRAME else ShedClass.VIDEO }
+        // Between checkpoints the producer races the writer freely. The writer takes audio first, so on a busy host it can
+        // fall behind and every queued video frame is shed before it is reached: a correct run that writes no video and
+        // checks nothing. At a checkpoint keyframe k the producer waits, right after each put, until the writer has written
+        // k and then k + 1, so every run checks real writes. k is never a multiple of 7: no shed runs at k or before k + 1
+        // is queued, so neither can be shed or skipped while the producer waits.
+        val checkpointKeys = (0 until 20_000 step 10).filter { it % 500 == 0 && it % 7 != 0 }
+        val checkpointFrames = checkpointKeys.flatMap { listOf(it, it + 1) }.toSet()
         for (frame in 0 until 20_000) {
-            if (!shedder.dropArrivingVideo(frame % 10 == 0)) putUnderLock(lock, queue, frame)
+            val queued = !shedder.dropArrivingVideo(frame % 10 == 0)
+            if (queued) putUnderLock(lock, queue, frame)
+            if (frame in checkpointFrames) {
+                assertTrue("checkpoint frame $frame was queued", queued)
+                val deadline = System.nanoTime() + 120_000_000_000L
+                while (newestVideo.get() < frame && System.nanoTime() < deadline) Thread.sleep(1)
+                assertTrue("the writer reached checkpoint frame $frame", newestVideo.get() >= frame)
+            }
             if (frame % 3 == 0) putUnderLock(lock, queue, -frame - 1)
             if (frame % 7 == 0) {
                 // Stale keyframes are not resume points: the shed waits for the next one.
@@ -418,7 +435,9 @@ class BoundedMediaAgeTest {
         writer.join(120_000)
         assertFalse("the writer must finish draining", writer.isAlive)
         val video = written.filter { it >= 0 }
-        assertTrue(video.isNotEmpty())
+        for (key in checkpointKeys) {
+            assertTrue("checkpoint keyframe $key and frame ${key + 1} were written", key in video && key + 1 in video)
+        }
         // Each written inter frame directly follows its reference; a keyframe may follow a gap.
         video.zipWithNext().forEach { (previous, next) ->
             assertTrue("frame $next written after $previous", next % 10 == 0 || next == previous + 1)

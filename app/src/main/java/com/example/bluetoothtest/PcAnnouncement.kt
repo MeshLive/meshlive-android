@@ -159,6 +159,21 @@ internal object DiscoveryScanPlan {
     /** `BluetoothDevice.PHY_LE_1M` (inlined so the plan is JVM-testable). */
     const val PHY_LE_1M = 1
 
+    /** `ScanSettings.SCAN_MODE_*` (inlined so the choice is JVM-testable). */
+    const val MODE_LOW_POWER = 0
+    const val MODE_BALANCED = 1
+    const val MODE_LOW_LATENCY = 2
+
+    /**
+     * The system scan mode of one discovery scan: low latency while a person waits ([startLowLatency]), otherwise
+     * balanced, except the idle relay helper's [lowPower] scan (screen off, not charging; [RelayHelperPolicy]).
+     */
+    fun mode(startLowLatency: Boolean, lowPower: Boolean): Int = when {
+        startLowLatency -> MODE_LOW_LATENCY
+        lowPower -> MODE_LOW_POWER
+        else -> MODE_BALANCED
+    }
+
     /**
      * Software filtering sends no hardware filter at all (the PC form is then matched in software, in `addResult`).
      * Order: the app's filter, then compact, then the PC filter, so the original two are byte-for-byte what they were.

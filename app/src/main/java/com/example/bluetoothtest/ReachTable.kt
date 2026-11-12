@@ -56,6 +56,14 @@ internal class ReachRoute<P : Any>(
     val hop: OfferSighting<P>,
 )
 
+/**
+ * AP8 DEBUG pin: true when [pin] is absent (off) or [firstHop] is exactly the pinned signed-node prefix. A caller's
+ * direct route passes no first hop and is never allowed while a pin is set; a helper passes its direct target's prefix.
+ * An empty (malformed) pin matches nothing.
+ */
+internal fun relayPinAllows(pin: ByteArray?, firstHop: ByteArray?): Boolean =
+    pin == null || (pin.isNotEmpty() && firstHop != null && firstHop.contentEquals(pin))
+
 /** What a helper advertises about one target. */
 internal class AdvertisedReach(val entry: ReachPageEntry, val relay: Boolean)
 
@@ -300,6 +308,8 @@ internal class ReachTable<P : Any>(
         target: ByteArray,
         accept: (DiscoveryAnnouncement) -> Boolean = { true },
         requireRelays: Int = 0,
+        /** AP8 DEBUG pin: keep only routes whose first relay is exactly this signed-node prefix (null = off). */
+        firstHopPin: ByteArray? = null,
     ): List<ReachRoute<P>> {
         val now = clock()
         prune(now)
@@ -307,7 +317,9 @@ internal class ReachTable<P : Any>(
         val routes = ArrayList<ReachRoute<P>>()
         if (requireRelays == 0) {
             directOffer(target)?.takeIf { accept(it.announcement) }?.let { hop ->
-                routes += ReachRoute(target.copyOf(), null, 0, 0L, hop)
+                if (relayPinAllows(firstHopPin, null)) {
+                    routes += ReachRoute(target.copyOf(), null, 0, 0L, hop)
+                }
             }
         }
         observations.values.filter { it.targetKey == targetKey && it.relay != null }.forEach { o ->
@@ -315,6 +327,7 @@ internal class ReachTable<P : Any>(
             if ((skipUntil[o.routeKey] ?: 0L) > now) return@forEach
             // The target is never a helper for its own call (its helper offer is its own call offer).
             if (o.relay!!.contentEquals(target)) return@forEach
+            if (!relayPinAllows(firstHopPin, o.relay)) return@forEach
             val hop = helperOffer(o.relay, accept) ?: return@forEach
             routes += ReachRoute(target.copyOf(), o.relay.copyOf(), o.rawCost, o.ageMs(now), hop)
         }
@@ -347,14 +360,22 @@ internal class ReachTable<P : Any>(
      * next hop. Null when none.
      */
     @Synchronized
-    fun setupRoute(target: ByteArray, budget: Int, accept: (DiscoveryAnnouncement) -> Boolean = { true }): ReachRoute<P>? {
+    fun setupRoute(
+        target: ByteArray,
+        budget: Int,
+        accept: (DiscoveryAnnouncement) -> Boolean = { true },
+        /** AP8 DEBUG pin: accept only this next relay or target prefix (null = off). */
+        nextHopPin: ByteArray? = null,
+    ): ReachRoute<P>? {
         if (budget < 1) return null
-        directOffer(target)?.takeIf { accept(it.announcement) }?.let { hop ->
-            val consented = RelayedCalls.consents(hop.announcement, rotating)
-            if (consented) return ReachRoute(target.copyOf(), null, 0, 0L, hop)
+        val direct = directOffer(target)?.takeIf { accept(it.announcement) }
+        if (direct != null && relayPinAllows(nextHopPin, direct.announcement.nodeIdPrefix)) {
+            val consented = RelayedCalls.consents(direct.announcement, rotating)
+            if (consented) return ReachRoute(target.copyOf(), null, 0, 0L, direct)
         }
         if (budget == 1) return null
-        return callerRoutes(target, accept).firstOrNull { it.nextHop != null && it.relays <= budget - 1 }
+        return callerRoutes(target, accept, firstHopPin = nextHopPin)
+            .firstOrNull { it.nextHop != null && it.relays <= budget - 1 }
     }
 
     /**

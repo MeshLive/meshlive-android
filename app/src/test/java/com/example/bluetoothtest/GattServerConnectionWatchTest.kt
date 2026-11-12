@@ -128,4 +128,33 @@ class GattServerConnectionWatchTest {
         now += 200
         assertEquals(peer, watch.expired(linkAdmitted = false))
     }
+
+    // AP7 F1: the ASUS received the recovery hello at 22.561 but the stage-2 watch fired at +1.2 s because a type-2
+    // control write does not stamp GattBytePipe.heardAny().
+
+    @Test
+    fun aDeliveredRecoveryHelloOrHighCountsAsAFirstWrite() {
+        assertTrue(recoveryControlDelivered(Gr1.hello()))
+        assertTrue(recoveryControlDelivered(Gr1.high(1)))
+        assertTrue(controlCountsAsFirstWrite(enabled = true, value = Gr1.hello()))
+        assertFalse(controlCountsAsFirstWrite(enabled = false, value = Gr1.hello()))
+        assertFalse(recoveryControlDelivered(ByteArray(0)))
+        assertFalse(recoveryControlDelivered(byteArrayOf(1, 2, 3)))
+        assertFalse(recoveryControlDelivered(byteArrayOf(2, 'G'.code.toByte(), 'R'.code.toByte(), '1'.code.toByte())))
+    }
+
+    @Test
+    fun theFirstWriteWatchAcceptsADecodedControlWriteOnlyWhenTheSwitchIsOn() {
+        val delivered = ServerConnectionWatch(timeoutMs = 400L, clock = { now }, firstWriteTimeoutMs = 1_200L)
+        assertTrue(delivered.onSubscribed(peer, advertisingListener = true))
+        now += 140
+        if (controlCountsAsFirstWrite(enabled = true, value = Gr1.hello())) delivered.onDataReceived(peer)
+        now += 1_200
+        assertNull("a delivered control write is not a missing write", delivered.firstWriteExpired(dataReceived = false))
+
+        val off = ServerConnectionWatch(timeoutMs = 400L, clock = { now }, firstWriteTimeoutMs = 1_200L)
+        assertTrue(off.onSubscribed(peer, advertisingListener = true))
+        now += 1_200
+        assertEquals("off keeps today's decision", peer, off.firstWriteExpired(dataReceived = false))
+    }
 }

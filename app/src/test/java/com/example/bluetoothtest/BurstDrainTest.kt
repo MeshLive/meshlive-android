@@ -4,6 +4,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 
 /** Experimental burst-aware drain (sender) and one-step playout growth (receiver). */
@@ -143,6 +144,8 @@ class BurstDrainTest {
 
     @Test
     fun theOneStepGrowthArmChangesStreamClocksButNeverCallClocks() {
+        // A release build ignores launch extras (the setter keeps the shipped default); the growth arm cannot be set there.
+        assumeTrue("DEBUG arm", BuildConfig.DEBUG)
         fun delayAfterLateFrame(profile: PlaybackDelayProfile): Long {
             val clock = profile.newPlayoutClock()
             clock.timing(0, 0)

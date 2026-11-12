@@ -113,7 +113,8 @@ class RelayChildDialGateTest {
         assertTrue(DebugTunables.relayHoldInPlace)
         try {
             DebugTunables.relayHoldInPlace = false
-            assertFalse(DebugTunables.relayHoldInPlace)
+            // The control arm is DEBUG-only: a release build keeps hold in place on.
+            assertEquals(!BuildConfig.DEBUG, DebugTunables.relayHoldInPlace)
         } finally {
             DebugTunables.relayHoldInPlace = true
         }

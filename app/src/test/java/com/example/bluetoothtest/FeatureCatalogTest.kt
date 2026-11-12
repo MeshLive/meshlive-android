@@ -100,9 +100,10 @@ class FeatureCatalogTest {
     fun theConnectivityFeaturesKeepTheirOldSwitchesAndAreAllDescribed() {
         val all = ConnectivityFeatures.all
         assertEquals(all.size, all.map { it.id }.toSet().size)
-        assertEquals(all.size, all.map { it.prefKey }.toSet().size)
+        val rows = all.filter { !it.constant }
+        assertEquals(rows.size, rows.map { it.prefKey }.toSet().size)
+        rows.forEach { assertTrue(it.id, it.titleRes != 0 && it.descriptionRes != 0 && it.iconRes != 0) }
         all.forEach {
-            assertTrue(it.id, it.titleRes != 0 && it.descriptionRes != 0 && it.iconRes != 0)
             assertEquals(ConnectivityFeatures.GROUP, it.group)
             assertTrue(it.id, it.phoneTest != null)
         }
@@ -113,11 +114,12 @@ class FeatureCatalogTest {
         assertEquals("test_offline_app_share", ConnectivityFeatures.shareAppNearby.benchmarkExtra)
         assertEquals("test_call_native_opus", ConnectivityFeatures.nativeOpus.benchmarkExtra)
         assertEquals("test_dual_listening", ConnectivityFeatures.dualListening.benchmarkExtra)
-        assertEquals("experimental_coc_auto_gatt", ConnectivityFeatures.cocAutoGatt.prefKey)
         assertEquals("experimental_classic_bond_free", ConnectivityFeatures.classicWithoutPairing.prefKey)
         assertEquals("experimental_ios_compact_discovery_v2", ConnectivityFeatures.iphoneDiscovery.prefKey)
         assertEquals("experimental_offline_app_share", ConnectivityFeatures.shareAppNearby.prefKey)
-        assertEquals("experimental_dual_listening", ConnectivityFeatures.dualListening.prefKey)
+        // No Settings switch since 2026-11-04 (owner): these follow their default; the extras above still run A/Bs.
+        listOf(ConnectivityFeatures.cocAutoGatt, ConnectivityFeatures.dualListening, ConnectivityFeatures.nativeOpus,
+            ConnectivityFeatures.bmh3, ConnectivityFeatures.bmh3Pseudonyms).forEach { assertTrue(it.id, it.constant) }
         // One default constant per feature.
         assertEquals(ConnectivityFeatureDefaults.COC_AUTO_GATT, ConnectivityFeatures.cocAutoGatt.defaultEnabled)
         assertEquals(ConnectivityFeatureDefaults.CLASSIC_WITHOUT_PAIRING, ConnectivityFeatures.classicWithoutPairing.defaultEnabled)
@@ -125,6 +127,37 @@ class FeatureCatalogTest {
         assertEquals(ConnectivityFeatureDefaults.SHARE_APP_NEARBY, ConnectivityFeatures.shareAppNearby.defaultEnabled)
         assertEquals(ConnectivityFeatureDefaults.NATIVE_OPUS, ConnectivityFeatures.nativeOpus.defaultEnabled)
         assertEquals(ConnectivityFeatureDefaults.DUAL_LISTENING, ConnectivityFeatures.dualListening.defaultEnabled)
+    }
+
+    @Test
+    fun theWifiSwitchesAreOffByDefaultAndKeepTheirStoredKeys() {
+        FeatureCatalog.clearForTest()
+        ConnectivityFeatures.registerAll()
+        val snapshot = FeatureCatalog.refresh(false, { null }) { null }
+        ConnectivityFeatures.wifi.forEach { assertFalse(it.id, snapshot.isOn(it)) }
+        assertEquals("test_wifi_carrier", ConnectivityFeatures.wifiCarrier.benchmarkExtra)
+        assertEquals(setOf("wifi_carrier", "wifi_wider_reach", "wifi_direct"), ConnectivityFeatures.wifi.mapNotNull { it.prefKey }.toSet())
+    }
+
+    @Test
+    fun aStoredWifiSubSwitchCountsOnlyWhileTheCarrierSwitchIsOn() {
+        FeatureCatalog.clearForTest(); ConnectivityFeatures.registerAll()
+        val stored = mutableMapOf("wifi_wider_reach" to true)
+        assertFalse(FeatureCatalog.refresh(false, { null }) { stored[it] }.isOn("wifi_wider_reach"))
+        stored["wifi_carrier"] = true
+        assertTrue(FeatureCatalog.refresh(false, { null }) { stored[it] }.isOn("wifi_wider_reach"))
+        stored["wifi_carrier"] = false
+        assertFalse(FeatureCatalog.refresh(false, { null }) { stored[it] }.isOn("wifi_wider_reach"))
+    }
+
+    @Test
+    fun aDebugLaunchExtraTurnsAWifiSwitchOnAndAReleaseLaunchIgnoresIt() {
+        FeatureCatalog.clearForTest(); ConnectivityFeatures.registerAll()
+        val extras = mapOf("test_wifi_carrier" to true)
+        assertTrue(FeatureCatalog.refresh(true, { extras[it] }, { null }, debugBuild = true).isOn("wifi_carrier"))
+        // A person's DEBUG launch (not a benchmark launch) still reads the extra: extraInAnyDebugLaunch.
+        assertTrue(FeatureCatalog.refresh(false, { extras[it] }, { null }, debugBuild = true).isOn("wifi_carrier"))
+        assertFalse(FeatureCatalog.refresh(false, { extras[it] }, { null }, debugBuild = false).isOn("wifi_carrier"))
     }
 
     @Test
@@ -160,8 +193,12 @@ class FeatureCatalogTest {
     }
 
     @Test
-    fun theNativeOpusSwitchIsReachableWithoutTheDebugGate() {
-        assertTrue(NativeOpusSettings.resolveEnabled(false, { false }) { if (it == NativeOpusSettings.PREF_ENABLED) true else null })
+    fun nativeOpusFollowsItsShippedDefaultAndTheDebugExtraOnly() {
+        // No Settings switch since 2026-11-04: a stored choice is ignored.
+        assertEquals(
+            ConnectivityFeatureDefaults.NATIVE_OPUS,
+            NativeOpusSettings.resolveEnabled(false, { false }) { if (it == NativeOpusSettings.PREF_ENABLED) !ConnectivityFeatureDefaults.NATIVE_OPUS else null },
+        )
         assertFalse(NativeOpusSettings.resolveEnabled(true, { false }) { true })
         assertTrue(NativeOpusSettings.resolveEnabled(true, { it == NativeOpusSettings.EXTRA_ENABLED }) { false })
         assertEquals(

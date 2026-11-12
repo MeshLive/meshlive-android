@@ -63,6 +63,10 @@ data class BleL2capPeer(
     val relayRoute: RelayRoute? = null,
     /** A compact call offer's receive form (legacy or extended, compared ADs) for the copied-ID PC exemption; else null. */
     val twinForm: AdvertTwinForm? = null,
+    /** Wider reach: the Wi-Fi Aware sighting of the same key, when the person was also (or only) heard over Wi-Fi. */
+    val wifi: WifiSighting? = null,
+    /** True for a row heard only over Wi-Fi. [device] is then a placeholder ([WifiOnlyPeer]) that is never connected to. */
+    val wifiOnly: Boolean = false,
 )
 
 class BleL2capDiscovery(
@@ -203,13 +207,7 @@ class BleL2capDiscovery(
             onError("BLE scanning is unavailable while Bluetooth is off.")
             return
         }
-        activeScanMode = if (startLowLatency) {
-            ScanSettings.SCAN_MODE_LOW_LATENCY
-        } else if (lowPower) {
-            ScanSettings.SCAN_MODE_LOW_POWER
-        } else {
-            ScanSettings.SCAN_MODE_BALANCED
-        }
+        activeScanMode = DiscoveryScanPlan.mode(startLowLatency, lowPower)
         try {
             EncoderBenchGuard.check("BleL2capControl.scan")
             // Review B11: a close() that ran while this start waited (quota deferral, another thread) must not leave a
@@ -798,6 +796,14 @@ class BleL2capDiscovery(
 
     fun isLowLatency(): Boolean = running.get() && activeScanMode == ScanSettings.SCAN_MODE_LOW_LATENCY
 
+    /** The system scan mode this scanner runs now, for the DEBUG dial lines (JT2): `none` while it is not running. */
+    fun scanModeLabel(): String = if (!running.get()) "none" else when (activeScanMode) {
+        ScanSettings.SCAN_MODE_LOW_LATENCY -> "low_latency"
+        ScanSettings.SCAN_MODE_LOW_POWER -> "low_power"
+        ScanSettings.SCAN_MODE_BALANCED -> "balanced"
+        else -> "other($activeScanMode)"
+    }
+
     override fun close() = stop(notify = false)
 
     private companion object {
@@ -1037,6 +1043,11 @@ class BleL2capControlServer(
     @Volatile var phySummary: String = "PHY pending"
         private set
 
+    private val centrals = BoundaryRestartPlan.ConnectedCentrals()
+
+    /** R1 C9 on LE CoC: a central is connected to the control service, so closing this server now could orphan its call setup. */
+    fun linkInFlight(): Boolean = !closed.get() && centrals.any()
+
     private val gattCallback = object : BluetoothGattServerCallback() {
         override fun onServiceAdded(status: Int, service: BluetoothGattService) {
             if (service.uuid != BleL2capControlProtocol.SERVICE_UUID) return
@@ -1046,6 +1057,8 @@ class BleL2capControlServer(
 
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS && newState == BluetoothProfile.STATE_CONNECTED) centrals.connected(device.address)
+            if (newState == BluetoothProfile.STATE_DISCONNECTED) centrals.disconnected(device.address)
             if (status == BluetoothGatt.GATT_SUCCESS && newState == BluetoothProfile.STATE_CONNECTED) {
                 val server = gattServer ?: return
                 // The client requests the preferred PHY once its control setup is done (BleL2capPsmReader).
@@ -1203,11 +1216,14 @@ class BleL2capControlServer(
     }
 
     private fun switchToBalancedAdvertising() {
-        if (closed.get()) return
         // F11: while a verification code is shown the set stays low-latency / high power; checked again later.
-        if (AdvertisingBoost.holding()) {
-            advertiseHandler.postDelayed(::switchToBalancedAdvertising, LOW_LATENCY_ADVERTISE_BURST_MS)
-            return
+        when (CallReadyAdvertisingHold.decideControlListener(closed = closed.get(), boostHolding = AdvertisingBoost.holding())) {
+            CallReadyAdvertisingHold.Action.IGNORE -> return
+            CallReadyAdvertisingHold.Action.RETRY_LATER -> {
+                advertiseHandler.postDelayed(::switchToBalancedAdvertising, LOW_LATENCY_ADVERTISE_BURST_MS)
+                return
+            }
+            else -> Unit
         }
         // Same set, same address: a peer that just discovered it can still connect.
         if (DebugTunables.stableAdvertisingAddress && advertising && advertisement.switchToBalanced()) return
@@ -1311,6 +1327,28 @@ class BleL2capControlConnection internal constructor(
             phyStatus.listener = null
         }
     }
+
+    /**
+     * Experimental `test_slow_2m_in_place` ([SlowTwoMInPlace]): asks this live LE link (the ACL the CoC socket rides on) for
+     * [preference] now, through the setup's LL procedure gate, and reads the PHY back so [phySummary] follows the move. True when
+     * the request was started or queued; false when this control link is closed or the stack refused it.
+     */
+    @SuppressLint("MissingPermission")
+    internal fun requestPhyInPlace(preference: BlePhyPreference, label: String = "call_slow_2m_in_place"): Boolean {
+        if (!attempt.active) return false
+        val start: () -> Boolean = {
+            runCatching {
+                gatt.setPreferredPhy(preference.mask, preference.mask, preference.option)
+                gatt.readPhy()
+            }.isSuccess
+        }
+        val gate = gate ?: return start()
+        return gate.submit(LlProcedure.PHY, label, expectedTx = LePhy.valueForMask(preference.mask), start = start).accepted
+    }
+
+    /** Reads this link's PHY (no LL procedure); the result updates [phySummary]. */
+    @SuppressLint("MissingPermission")
+    internal fun readPhyNow(): Boolean = attempt.active && runCatching { gatt.readPhy() }.isSuccess
 
     init {
         val address = gatt.device?.address
@@ -1431,6 +1469,11 @@ object BleL2capPsmReader {
             } catch (error: IOException) {
                 if (error is LinkReachedSetupFailure) linkReached = true
                 GattPoolBackoff.noteConnectFailure(error.message, "ble-control-client")
+                GattNativeClientWedge.onCentralConnectFailure(
+                    error.message,
+                    SystemClock.elapsedRealtime() - attemptStartedMs,
+                    "ble-control-client",
+                )
                 val retryable = runCatching { BluetoothTransportPolicy.retryableConnectStatuses() }
                     .getOrDefault(setOf(BluetoothTransportPolicy.GATT_ERROR_133))
                 val nowMs = SystemClock.elapsedRealtime()

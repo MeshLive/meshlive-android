@@ -63,7 +63,7 @@ object OfflineAppShareFeature {
 object OfflineAppShareGate {
     @Volatile var liveSessionCheck: (() -> Boolean)? = null
 
-    fun liveSessionActive(): Boolean = runCatching { liveSessionCheck?.invoke() == true }.getOrDefault(true)
+    fun liveSessionActive(): Boolean = runCatching { liveSessionCheck?.invoke() == true || WifiRadio.activeCount() > 0 }.getOrDefault(true)
 }
 
 /**

@@ -252,6 +252,12 @@ class AdvertisingBudgetTest {
         val budget = budget()
         assertFalse("off by default", budget.simulatedRefusal())
         AdvertisingSwitches.budgetCap = 1
+        if (!BuildConfig.DEBUG) {
+            // A DEBUG test arm: a release build keeps no simulated cap and never refuses on its own.
+            assertEquals(0, AdvertisingSwitches.budgetCap)
+            assertFalse(budget.simulatedRefusal())
+            return
+        }
         assertEquals(1, budget.ceiling())
         assertFalse(budget.simulatedRefusal())
         budget.acquire("stable", AdvertisingSetRole.STABLE)

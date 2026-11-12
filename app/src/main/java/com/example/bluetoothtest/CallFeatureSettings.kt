@@ -52,7 +52,7 @@ internal object CallFeatureDefaults {
     /** Start a message exchange by itself when a contact comes into range (T4). Needs Messages. */
     const val AUTO_SYNC = false
 
-    /** Optional names, call subjects and stream titles. On since 2026-10-17, no Settings switch (design decision). */
+    /** Optional names and stream titles. On since 2026-10-17, no Settings switch (design decision). */
     const val NAMES_AND_TITLES = true
 }
 

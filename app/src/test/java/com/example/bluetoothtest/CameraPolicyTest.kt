@@ -108,6 +108,12 @@ class CameraPolicyTest {
             { key, default -> if (key in setOf("test_camera_reopen", "test_encoder_colour_keys")) true else default },
             { key -> if (key == "test_exynos_qp_range") "20,50" else null },
         )
+        if (!BuildConfig.DEBUG) {
+            // A release build ignores launch extras: the experiments stay off.
+            assertFalse(CameraSwitches.reopenDevice || CameraSwitches.encoderColourKeys)
+            assertEquals(null, CameraSwitches.exynosQpRange)
+            return
+        }
         assertTrue(CameraSwitches.reopenDevice)
         assertTrue(CameraSwitches.encoderColourKeys)
         assertFalse(CameraSwitches.sessionConfiguration)

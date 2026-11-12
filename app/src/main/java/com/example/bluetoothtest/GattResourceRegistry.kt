@@ -325,6 +325,15 @@ internal class PoolExhaustionPolicy(private val clock: () -> Long = SystemClock:
     }
 
     /**
+     * A native client wedge was detected ([GattNativeClientWedge], Experimental): the restart guidance is due now, as
+     * after a connect streak. The next successful connect ([onConnectSuccess]) clears it.
+     */
+    @Synchronized
+    fun onNativeClientWedge() {
+        if (restartGuidanceAtMs == 0L) restartGuidanceAtMs = clock().coerceAtLeast(1L)
+    }
+
+    /**
      * True once the streak, or repeated registration failures of the scanner, the GATT server or the client, say new
      * connects are futile until Bluetooth or the phone restarts. Failures older than [REGISTRATION_STALE_MS] with no
      * newer failure no longer count (the pool may have been cleared by a Bluetooth restart).

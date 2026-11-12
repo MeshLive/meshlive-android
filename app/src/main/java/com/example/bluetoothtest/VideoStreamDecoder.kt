@@ -68,6 +68,15 @@ internal fun initialCodedSize(
     return parsed ?: (header.width to header.height)
 }
 
+/** The decoder MIME type for a stream codec ID; null for an ID no decoder handles. */
+internal fun videoDecoderMime(codecId: Int): String? = when (codecId) {
+    StreamProtocol.CODEC_VP9 -> MediaFormat.MIMETYPE_VIDEO_VP9
+    StreamProtocol.CODEC_AV1 -> MediaFormat.MIMETYPE_VIDEO_AV1
+    StreamProtocol.CODEC_H264 -> MediaFormat.MIMETYPE_VIDEO_AVC
+    StreamProtocol.CODEC_HEVC -> MediaFormat.MIMETYPE_VIDEO_HEVC
+    else -> null
+}
+
 class VideoStreamDecoder(
     private val header: StreamProtocol.Header,
     private val surface: Surface,
@@ -89,6 +98,12 @@ class VideoStreamDecoder(
      */
     private val presentFirstFrameImmediately: Boolean = false,
     /**
+     * Experimental first call frame with a playout ramp (DebugTunables.callFirstFrameRamp, calls only): the first frame
+     * is shown at once and the following frames are slowed (bounded) until they meet the playout target
+     * ([FirstFrameRamp]). Takes precedence over [presentFirstFrameImmediately]. False: unchanged.
+     */
+    firstFrameRamp: Boolean = false,
+    /**
      * Experimental viewer frame age (null = off): the source timestamp of each frame the codec
      * rendered to the surface. Called on the codec worker thread; it must only record.
      */
@@ -107,15 +122,37 @@ class VideoStreamDecoder(
     private val sizeChangeRebuild: Boolean = DebugTunables.decoderSizeChangeRebuild,
     /** Told (on the offering thread) the new coded size when a keyframe changes it, for the display aspect. */
     private val onCodedSizeChanged: ((width: Int, height: Int) -> Unit)? = null,
-    /** Experimental `test_decoder_stall_recovery` ([DecoderSwitches.stallRecovery]); false: a stall is only logged. */
+    /** `test_decoder_stall_recovery` ([DecoderSwitches.stallRecovery], default on since 2026-11-10); false: a stall is only logged. */
     private val stallRecovery: Boolean = DecoderSwitches.stallRecovery,
     /** Experimental `test_decoder_low_latency_ladder` ([DecoderSwitches.lowLatencyLadder]). */
     private val lowLatencyLadder: Boolean = DecoderSwitches.lowLatencyLadder,
     /** Experimental `test_decoder_priority` ([DecoderSwitches.realtimePriority]). */
     private val realtimePriority: Boolean = DecoderSwitches.realtimePriority,
+    /**
+     * Experimental call pre-warm (`test_call_prewarm`; null otherwise): the first create of this decoder asks it for a
+     * component already allocated under that name (null: create as before). Only the very first attempt asks.
+     */
+    private val preallocated: ((String) -> MediaCodec?)? = null,
+    /** DEBUG call join stages (null for streams): told once, on the codec thread, when the first picture leaves the decoder. */
+    private val onFirstDecoded: (() -> Unit)? = null,
+    /**
+     * Experimental `test_call_video_restart` (calls only, [CallVideoStallRestart]): a watchdog stall is handed to the
+     * caller as a [DecoderStalledException] from [offer] (a receiver waiting for queue room gets it at once), and the
+     * caller replaces this decoder, instead of the in-place `test_decoder_stall_recovery` arm. False: unchanged.
+     */
+    private val stallRestartsCaller: Boolean = false,
+    /** Experimental `test_call_video_restart`: how long a full queue waits for room; null keeps the queue's 5 s. */
+    queueWaitNs: Long? = null,
+    /**
+     * Experimental `test_call_video_restart`: components a stall excluded earlier in this call. They are skipped for the
+     * next decoder that supports the stream ([stallExcludedCandidates]) unless nothing else is left. Empty: unchanged.
+     */
+    private val stallExcludedDecoders: Set<String> = emptySet(),
 ) : Closeable {
     private val running = AtomicBoolean(true)
+    private val firstDecodedTold = AtomicBoolean(false)
     private val debugStageTrace = DebugStageTrace.startIfRequested(debugTraceSession, "video_decoder")
+    private val playoutRamp: FirstFrameRamp? = if (firstFrameRamp) FirstFrameRamp(log = { Log.i("BluetoothVideo", it) }) else null
     private val failure = AtomicReference<Throwable?>()
     private val workerThread = HandlerThread("VideoDecoder").apply { start() }
     private val worker = Handler(workerThread.looper)
@@ -126,13 +163,7 @@ class VideoStreamDecoder(
      */
     @Volatile private var activeAttempt = 0
     private var attemptSequence = 0
-    private val mime = when (header.codecId) {
-        StreamProtocol.CODEC_VP9 -> MediaFormat.MIMETYPE_VIDEO_VP9
-        StreamProtocol.CODEC_AV1 -> MediaFormat.MIMETYPE_VIDEO_AV1
-        StreamProtocol.CODEC_H264 -> MediaFormat.MIMETYPE_VIDEO_AVC
-        StreamProtocol.CODEC_HEVC -> MediaFormat.MIMETYPE_VIDEO_HEVC
-        else -> error("Unsupported codec ID ${header.codecId}")
-    }
+    private val mime = videoDecoderMime(header.codecId) ?: error("Unsupported codec ID ${header.codecId}")
     /**
      * Design HC (codecs 4 and 5): the fail-closed structural gate every video packet passes before the decoder sees it
      * (PROTOCOL "Access-unit validation"), holding the active parameter sets. Null for VP9 and AV1.
@@ -173,7 +204,7 @@ class VideoStreamDecoder(
     private val stallDetector = DecoderStallDetector(header.fps)
     private val stallEscalation = DecoderStallEscalation()
     /** Components a stall excluded for this session (worker thread; also read by the rebuild order). */
-    private val excludedDecoders = LinkedHashSet<String>()
+    private val excludedDecoders = LinkedHashSet<String>(stallExcludedDecoders)
     /** The next recovery keyframe re-creates the decoder (a stall) even where flush() would be allowed. */
     private val forceRebuildOnRecovery = AtomicBoolean(false)
     private var stallLogLines = 0
@@ -199,6 +230,7 @@ class VideoStreamDecoder(
     private val encodedFrames = EncodedFrameQueue(
         queueCapacity,
         requireInitialKeyFrame = true,
+        backpressureTimeoutNs = queueWaitNs ?: EncodedFrameQueue.BACKPRESSURE_TIMEOUT_NS,
         thinDiscardable = DebugTunables.experimentalTemporalLayers,
     )
     private val decoderWait = RollingLatencyStats()
@@ -282,10 +314,24 @@ class VideoStreamDecoder(
         // Bounded (CodecPolicy.MAX_DECODER_INIT_ATTEMPTS): callers build this decoder inside their packet
         // path (PrivateCallMedia.offer is synchronized with audio), so a failing start can delay audio by at
         // most three create/configure/start attempts, and only after the first one already failed.
-        val candidates = CodecPolicy.decoderInitCandidates(
+        val initCandidates = CodecPolicy.decoderInitCandidates(
             preferredDecoderName, decoderRequest, frameworkChoice, supporting, fallbackEnabled,
             lowLatencyFirst = lowLatencyLadder,
         )
+        // Experimental test_call_video_restart: a component that stalled twice in this call gives way to the next
+        // decoder that supports the stream (an explicitly requested decoder is never substituted).
+        val candidates = if (stallExcludedDecoders.isEmpty()) {
+            initCandidates
+        } else {
+            stallExcludedCandidates(
+                initCandidates,
+                CodecPolicy.decoderInitCandidates(
+                    preferredDecoderName, decoderRequest, frameworkChoice, supporting, fallback = true,
+                    lowLatencyFirst = lowLatencyLadder,
+                ),
+                stallExcludedDecoders,
+            )
+        }
         val lowLatencyReordered = lowLatencyLadder && decoderRequest == DecoderRequest.NONE &&
             candidates.firstOrNull()?.equals(frameworkChoice, ignoreCase = true) == false
         val requestedLabel = preferredDecoderName ?: "none"
@@ -295,7 +341,8 @@ class VideoStreamDecoder(
                 "reason=${CodecPolicy.decoderSelectionReason(preferredDecoderName, decoderRequest, effective, attempt, lowLatencyReordered)} " +
                 "kind=${decoderRequest.label} fallback=${if (fallbackEnabled) "on" else "off"} " +
                 "tried=${if (effective == null) candidates.size else attempt + 1} mime=$mime" +
-                if (lowLatencyLadder || realtimePriority || stallRecovery) " switches=${DecoderSwitches.describe()}" else "",
+                (if (lowLatencyLadder || realtimePriority || stallRecovery) " switches=${DecoderSwitches.describe()}" else "") +
+                if (stallExcludedDecoders.isNotEmpty()) " stallExcluded=${stallExcludedDecoders.joinToString(",")}" else "",
         )
         fun giveUp(error: Throwable): Nothing {
             activeAttempt = -1
@@ -383,7 +430,8 @@ class VideoStreamDecoder(
                 activeAttempt = attemptId
                 var attempt: MediaCodec? = null
                 try {
-                    attempt = MediaCodec.createByCodecName(candidate)
+                    attempt = (if (attemptId == 1) preallocated?.invoke(candidate) else null)
+                        ?: MediaCodec.createByCodecName(candidate)
                     val planned = rungs ?: planRungs(candidate, attempt, featureLowLatency).also { rungs = it }
                     val rung = planned[rungIndex]
                     val candidateFormat = MediaFormat(baseFormat)
@@ -709,11 +757,14 @@ class VideoStreamDecoder(
             try {
                 val render = info.size > 0 && info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0
                 if (render) {
+                    if (onFirstDecoded != null && firstDecodedTold.compareAndSet(false, true)) onFirstDecoded.invoke()
                     val nowNs = System.nanoTime()
                     val presentationTimeUs = info.presentationTimeUs
                     debugStageTrace?.record("decoder_output", presentationTimeUs, info.size)
                     recordDecodeLatency(presentationTimeUs, nowNs)
-                    val renderTimeNs = if (presentFirstFrameImmediately && submittedForRenderFrames.get() == 0) {
+                    val renderTimeNs = if (playoutRamp != null) {
+                        playoutRamp.renderTimeNs(presentationTimeUs, playoutClock.renderTimeNs(presentationTimeUs, nowNs), nowNs)
+                    } else if (presentFirstFrameImmediately && submittedForRenderFrames.get() == 0) {
                         nowNs
                     } else {
                         playoutClock.renderTimeNs(presentationTimeUs, nowNs)
@@ -832,7 +883,12 @@ class VideoStreamDecoder(
                 val nowNs = System.nanoTime()
                 val aheadMs = adaptiveDecoderFeedAheadMs(decodeLatency.p99Ms(), playoutClock.currentDelayMs)
                 feedAheadMs = aheadMs
-                val feedDelayMs = if (presentFirstFrameImmediately && queuedToDecoderFrames.get() == 0) {
+                val feedDelayMs = if (playoutRamp != null) {
+                    videoPacketFeedTarget(nextPacket, playoutClock, nowNs)?.let {
+                        playoutRamp.feedTargetNs(nextPacket.presentationTimeUs, it.targetTimeNs)
+                            ?.let { targetNs -> decoderFeedDelayMs(targetNs, nowNs, aheadMs) }
+                    } ?: 0L
+                } else if (presentFirstFrameImmediately && queuedToDecoderFrames.get() == 0) {
                     0L
                 } else {
                     videoPacketFeedTarget(nextPacket, playoutClock, nowNs)?.let {
@@ -1041,7 +1097,7 @@ class VideoStreamDecoder(
 
     /**
      * Worker tick: a decoder that was queued input and produced no output callback (or offered no input buffer
-     * for 5 s) is logged as `decoder_stall`; the Experimental recovery arm then re-creates it. The signal is the
+     * for 5 s) is logged as `decoder_stall`; the recovery (default on) then re-creates it. The signal is the
      * decoder's own callbacks, so a hidden surface or a paused feed does not fire it. Decoder callback timing is
      * a proxy for the decoder, never a screen or glass-to-glass measurement.
      */
@@ -1058,7 +1114,8 @@ class VideoStreamDecoder(
         ) ?: return
         stallDetector.reset(nowNs)
         val otherCandidate = candidateNames.any { !it.equals(decoderName, ignoreCase = true) && it !in excludedDecoders }
-        val action = stallEscalation.next(stallRecovery, otherCandidate)
+        // Experimental test_call_video_restart: the call replaces the decoder, so the in-place arm stands aside.
+        val action = stallEscalation.next(stallRecovery && !stallRestartsCaller, otherCandidate)
         if (stallLogLines < DecoderWatchdogLimits.MAX_STALL_LOG_LINES) {
             stallLogLines++
             Log.w(
@@ -1066,13 +1123,21 @@ class VideoStreamDecoder(
                 "BENCHMARK decoder_stall: kind=${stall.kind.label} | decoder=$decoderName | unanswered=${stall.unanswered} | " +
                     "ageMs=${stall.ageMs} | inputs=$inputsQueuedTotal | outputs=$outputsTotal | " +
                     "rendered=${actuallyRenderedFrames.get()} | stalls=${stallEscalation.stallCount} | " +
-                    "action=${action.name.lowercase()} | recovery=${if (stallRecovery) "on" else "off"} | mime=$mime",
+                    "action=${if (stallRestartsCaller) "call_restart" else action.name.lowercase()} | " +
+                    "recovery=${if (stallRecovery) "on" else "off"} | mime=$mime",
             )
         }
         when (action) {
             DecoderStallEscalation.Action.LOG_ONLY, DecoderStallEscalation.Action.GIVE_UP -> Unit
             DecoderStallEscalation.Action.REBUILD_SAME -> startStallRecovery(excludeComponent = false)
             DecoderStallEscalation.Action.EXCLUDE_AND_REBUILD -> startStallRecovery(excludeComponent = true)
+        }
+        if (stallRestartsCaller) {
+            // Nothing more is fed to this codec; the receiver (waiting for room or offering the next frame) gets the stall.
+            decoderInputBlocked.set(true)
+            encodedFrames.reportStall(
+                DecoderStalledException("Video decoder $decoderName stalled (${stall.kind.label}, ${stall.ageMs} ms)"),
+            )
         }
     }
 
@@ -1126,7 +1191,16 @@ class VideoStreamDecoder(
         }
     }
 
-    override fun close() {
+    override fun close() = close(waitForRelease = true)
+
+    /**
+     * Experimental `test_call_video_restart`: [close] without waiting for the codec release, for a decoder that stalled
+     * (its release can hang). The worker releases it with the bounded release while the caller's receive thread, which
+     * also carries the call's audio, goes on at once.
+     */
+    fun closeWithoutWaiting() = close(waitForRelease = false)
+
+    private fun close(waitForRelease: Boolean) {
         if (running.get()) logDecoderHoldIfDue(final = true)
         if (!running.getAndSet(false)) return
         if (recovering.getAndSet(false)) onRecoveryStateChanged(false)
@@ -1149,7 +1223,7 @@ class VideoStreamDecoder(
                 release()
                 released.countDown()
             }
-            runCatching { released.await(2, TimeUnit.SECONDS) }
+            if (waitForRelease) runCatching { released.await(2, TimeUnit.SECONDS) }
         }
         workerThread.quitSafely()
         debugStageTrace?.close()

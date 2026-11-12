@@ -68,6 +68,15 @@ internal object ConnectivityFeatureDefaults {
      * `test_codec_power_aware=false`; a benchmark launch without the extra keeps it off.
      */
     const val CODEC_POWER_AWARE = true
+
+    /** Design WF (docs/dev/decisions/README.md "Design WF"): calls and streams move to Wi-Fi Aware after they connect. Off until measured (Design WF decision D5). */
+    const val WIFI_CARRIER = false
+
+    /** Design WF: Wi-Fi Aware discovery and Wi-Fi-native hops; API 30-32 Aware. Off until measured. */
+    const val WIFI_WIDER_REACH = false
+
+    /** Design WF: Wi-Fi Direct carrier for phones and PCs without Wi-Fi Aware. Off until measured. */
+    const val WIFI_DIRECT = false
 }
 
 /**
@@ -80,12 +89,10 @@ internal object ConnectivityFeatures {
 
     val cocAutoGatt = FeatureSpec(
         id = "coc_auto_gatt",
-        prefKey = CocAutoGattSettings.PREF_ENABLED,
+        // No Settings switch since 2026-11-04 (owner: fewer knobs); a stored choice is ignored, the DEBUG extra still works.
+        prefKey = null,
         defaultEnabled = ConnectivityFeatureDefaults.COC_AUTO_GATT,
         benchmarkExtra = CocAutoGattSettings.EXTRA_ENABLED,
-        titleRes = R.string.feat_coc_auto_gatt,
-        descriptionRes = R.string.feat_coc_auto_gatt_description,
-        iconRes = R.drawable.ic_refresh,
         group = GROUP,
         phoneTest = "T6",
     )
@@ -149,36 +156,30 @@ internal object ConnectivityFeatures {
 
     val nativeOpus = FeatureSpec(
         id = "native_opus",
-        prefKey = NativeOpusSettings.PREF_ENABLED,
+        // No Settings switch since 2026-11-04 (owner: fewer knobs); a stored choice is ignored, the DEBUG extra still works.
+        prefKey = null,
         defaultEnabled = ConnectivityFeatureDefaults.NATIVE_OPUS,
         benchmarkExtra = NativeOpusSettings.EXTRA_ENABLED,
-        titleRes = R.string.feat_native_opus,
-        descriptionRes = R.string.feat_native_opus_description,
-        iconRes = R.drawable.ic_mic,
         group = GROUP,
         phoneTest = "T10",
     )
 
     val dualListening = FeatureSpec(
         id = "dual_listening",
-        prefKey = DualListeningFeature.PREF_ENABLED,
+        // No Settings switch since 2026-11-04 (owner: fewer knobs); a stored choice is ignored, the DEBUG extra still works.
+        prefKey = null,
         defaultEnabled = ConnectivityFeatureDefaults.DUAL_LISTENING,
         benchmarkExtra = DualListeningFeature.EXTRA_ENABLED,
-        titleRes = R.string.feat_dual_listening,
-        descriptionRes = R.string.feat_dual_listening_description,
-        iconRes = R.drawable.ic_relay,
         group = GROUP,
         phoneTest = "T12",
     )
 
     val bmh3 = FeatureSpec(
         id = "bmh3",
-        prefKey = Bmh3Feature.PREF,
+        // No Settings switch since 2026-11-04 (owner: fewer knobs); a stored choice is ignored, the DEBUG extra still works.
+        prefKey = null,
         defaultEnabled = ConnectivityFeatureDefaults.BMH3,
         benchmarkExtra = Bmh3Feature.EXTRA,
-        titleRes = R.string.feat_bmh3,
-        descriptionRes = R.string.feat_bmh3_description,
-        iconRes = R.drawable.ic_lock,
         group = GROUP,
         phoneTest = "T14",
     )
@@ -186,20 +187,64 @@ internal object ConnectivityFeatures {
     /** Needs BMH3 and rotating IDs (it is greyed out and off while "Hidden identities" or rotating IDs is off). */
     val bmh3Pseudonyms = FeatureSpec(
         id = "bmh3_pseudonyms",
-        prefKey = Bmh3PseudonymFeature.PREF,
+        // No Settings switch since 2026-11-04 (owner: fewer knobs); a stored choice is ignored, the DEBUG extra still works.
+        prefKey = null,
         defaultEnabled = ConnectivityFeatureDefaults.BMH3_PSEUDONYMS,
         benchmarkExtra = Bmh3PseudonymFeature.EXTRA,
-        titleRes = R.string.feat_bmh3_pseudonyms,
-        descriptionRes = R.string.feat_bmh3_pseudonyms_description,
-        iconRes = R.drawable.ic_lock,
         group = GROUP,
         dependsOn = listOf("bmh3", RotatingDiscoveryFeature.spec.id),
         phoneTest = "T15",
     )
 
+    val wifiCarrier = FeatureSpec(
+        id = WifiFeatures.ID_CARRIER,
+        prefKey = WifiFeatures.PREF_CARRIER,
+        defaultEnabled = ConnectivityFeatureDefaults.WIFI_CARRIER,
+        benchmarkExtra = WifiFeatures.EXTRA_CARRIER,
+        titleRes = R.string.feat_wifi_carrier,
+        descriptionRes = R.string.feat_wifi_carrier_description,
+        iconRes = R.drawable.ic_wifi,
+        group = GROUP,
+        phoneTest = "WF",
+        extraInAnyDebugLaunch = true,
+    )
+
+    /** Sub-switch of [wifiCarrier]: greyed out and off while the carrier switch is off. */
+    val wifiWiderReach = FeatureSpec(
+        id = WifiFeatures.ID_WIDER_REACH,
+        prefKey = WifiFeatures.PREF_WIDER_REACH,
+        defaultEnabled = ConnectivityFeatureDefaults.WIFI_WIDER_REACH,
+        benchmarkExtra = WifiFeatures.EXTRA_WIDER_REACH,
+        titleRes = R.string.feat_wifi_wider_reach,
+        descriptionRes = R.string.feat_wifi_wider_reach_description,
+        iconRes = R.drawable.ic_wifi,
+        group = GROUP,
+        dependsOn = listOf(WifiFeatures.ID_CARRIER),
+        phoneTest = "WF",
+        extraInAnyDebugLaunch = true,
+    )
+
+    val wifiDirect = FeatureSpec(
+        id = WifiFeatures.ID_DIRECT,
+        prefKey = WifiFeatures.PREF_DIRECT,
+        defaultEnabled = ConnectivityFeatureDefaults.WIFI_DIRECT,
+        benchmarkExtra = WifiFeatures.EXTRA_DIRECT,
+        titleRes = R.string.feat_wifi_direct,
+        descriptionRes = R.string.feat_wifi_direct_description_unnamed,
+        iconRes = R.drawable.ic_wifi,
+        group = GROUP,
+        dependsOn = listOf(WifiFeatures.ID_CARRIER),
+        phoneTest = "WF",
+        extraInAnyDebugLaunch = true,
+    )
+
+    /** The Wi-Fi card, in its Settings order. Parents first (the catalog registers dependencies first). */
+    val wifi: List<FeatureSpec> = listOf(wifiCarrier, wifiWiderReach, wifiDirect)
+
     /** In Settings order. */
     val all: List<FeatureSpec> = listOf(
         classicWithoutPairing, cocAutoGatt, dualListening, iphoneDiscovery, findPcs, pcStreams, nativeOpus, shareAppNearby, bmh3, bmh3Pseudonyms,
+        wifiCarrier, wifiWiderReach, wifiDirect,
     )
 
     /** Idempotent: an activity can be recreated. Rotating IDs first: `find_pcs` and `bmh3_pseudonyms` depend on it. */

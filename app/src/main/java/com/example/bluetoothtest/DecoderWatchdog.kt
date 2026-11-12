@@ -126,7 +126,7 @@ internal class DecoderStallDetector(
 /**
  * What to do about repeated stalls of one decoder instance: log only, rebuild the same decoder once,
  * then exclude the component for the session and rebuild with the next candidate, and give up (log
- * only) after [maxStalls]. Recovery is the Experimental `test_decoder_stall_recovery` arm; without it
+ * only) after [maxStalls]. Recovery is the `test_decoder_stall_recovery` switch (default on; false is the DEBUG control arm); without it
  * every stall is only logged.
  */
 internal class DecoderStallEscalation(private val maxStalls: Int = 3) {

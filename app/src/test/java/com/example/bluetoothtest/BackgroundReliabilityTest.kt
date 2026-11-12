@@ -122,7 +122,7 @@ class BackgroundReliabilityTest {
     @Test
     fun benchmarkPhonesGetTheirMakersGuidance() {
         val expected = mapOf("s24" to "samsung", "s22" to "samsung", "m31" to "samsung", "a55" to "samsung",
-            "asus" to "asus", "a15s" to "oppo", "xiaomi" to "xiaomi")
+            "asus" to "asus", "a15s" to "oppo", "xiaomi" to "xiaomi", "realme" to "realme")
         for (known in KnownDeviceTraits.load()) {
             val guidance = DeviceFamilyPolicy.resolve(known.traits, emptySet()).effects<OemBackgroundGuidance>()
             assertEquals(known.alias, listOf(expected.getValue(known.alias)), guidance.map { it.vendorKey })

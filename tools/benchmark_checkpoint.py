@@ -1,14 +1,21 @@
-"""Check or checkpoint exact offline state and its derived index; never contact phones."""
+"""Check or checkpoint exact offline state and its derived index; never contact phones.
+
+State files are streamed (benchmark_state_io): a full inventory has hundreds of thousands of rows, so no step
+holds the previous state, the new state and a serialized copy in memory at once.
+"""
 import argparse
 import collections
 import copy
-import hashlib
 import json
 from pathlib import Path
+import shutil
 import tempfile
 
 from benchmark_results import LEDGER, ROOT, render
 from benchmark_layout import resolve
+from benchmark_state_io import file_sha256, iter_state_rows, read_members, state_header
+
+HISTORY_FIELDS = ("last_result", "last_measured_result", "last_verified_apk", "last_verified_apk_evidence")
 
 
 def read(path, root=ROOT):
@@ -17,12 +24,10 @@ def read(path, root=ROOT):
 
 def reference(path, root):
     path = resolve(path, root=root)
-    return {"path": path.relative_to(root).as_posix(),
-            "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    return {"path": path.relative_to(root).as_posix(), "sha256": file_sha256(path)}
 
 
-def impacts(state):
-    changes = state["changes"] if "changes" in state else [item for row in state["cases"] for item in row.get("changes", [])]
+def _definitions(changes):
     result = {}
     for change in changes:
         change = {key: value for key, value in change.items() if key != "needs_retest"}
@@ -32,35 +37,79 @@ def impacts(state):
     return result
 
 
-def validate_state(ledger, root, state=None):
-    from run_benchmark_suite import load_jobs, request_key, select_remaining, verify_result
+def state_impacts(path):
+    """Change definitions by ID from a state file: its change table, else the rows' embedded changes."""
+    header = state_header(path)
+    if "changes" in header:
+        return _definitions(header["changes"])
+    return _definitions(item for row in iter_state_rows(path) for item in row.get("changes", []))
+
+
+def validate_state(ledger, root, state_path=None):
+    """Validate the exact state against the bundle, streaming rows and jobs; returns (inventory, header, counts, ids)."""
+    from run_benchmark_suite import iter_jobs, request_key, verify_result
+    from benchmark_case_state import PRIORITY
     current = ledger["current_inventory"]
-    inventory = read(root / current["inventory"]["path"], root)
-    if state is None:
-        state = read(root / current["state"]["path"], root)
-    if state.get("schema") != "benchmark-case-state-v1":
-        raise ValueError("Unsupported case-state schema")
+    inventory = read_members(root / current["inventory"]["path"], keys=(
+        "required_phones", "selected_phones", "extension_phones", "capability_provenance",
+        "retired_requirements", "remaining"))
+    state_path = Path(state_path) if state_path is not None else resolve(current["state"]["path"], root=root)
+    header = state_header(state_path)
     if not set(inventory["required_phones"]) <= set(inventory["selected_phones"]):
         raise ValueError("Shared checkpoints require the complete required phone inventory")
     registry = read(root / "tools/benchmark_devices.json", root)["devices"]
-    jobs = load_jobs(root / current["bundle"]["path"], registry)
-    rows = {row["case_id"]: row for row in state["cases"]}
-    if len(rows) != len(state["cases"]) or set(rows) != {job["case"]["id"] for job in jobs}:
+    index, counts, duplicate, unknown = {}, collections.Counter(), False, None
+    for row in iter_state_rows(state_path):
+        counts[row["state"]] += 1
+        if row["case_id"] in index:
+            duplicate = True
+        # Only a PASS needs its full row later (verification); every other row needs a few small facts.
+        index[row["case_id"]] = (row["request_key"], frozenset(row["phones"]), row["state"], row.get("freshness"),
+                                 row if row["state"] == "PASS" else None)
+        if unknown is None and row.get("state") not in {*PRIORITY, "PASS", "BLOCKED"}:
+            unknown = row
+    mismatch, problem, seen = duplicate, None, 0
+    for job in iter_jobs(root / current["bundle"]["path"], registry):
+        seen += 1
+        entry = index.get(job["case"]["id"])
+        if entry is None:
+            mismatch = True
+            continue
+        key, phones, state, freshness, full = entry
+        if problem is None:
+            if key != request_key(job["case"]) or phones != set(job["phones"]):
+                problem = f"Current state request differs: {job['case']['id']}"
+            elif state == "PASS" and freshness == "NEEDS RETEST":
+                problem = f"Stale result cannot be a current PASS: {job['case']['id']}"
+            elif state == "PASS" and not verify_result(full.get("last_result") or {}, job,
+                                                        expected_apk=header.get("candidate_apk_sha256")):
+                problem = f"Unverified current PASS: {job['case']['id']}"
+    if mismatch or seen != len(index):
         raise ValueError("Current state must contain every exact generated case once")
-    select_remaining(state, ())  # Validates states; an empty selection never means completion.
-    for job in jobs:
-        row = rows[job["case"]["id"]]
-        if row["request_key"] != request_key(job["case"]) or set(row["phones"]) != set(job["phones"]):
-            raise ValueError(f"Current state request differs: {job['case']['id']}")
-        if row["state"] == "PASS" and row.get("freshness") == "NEEDS RETEST":
-            raise ValueError(f"Stale result cannot be a current PASS: {job['case']['id']}")
-        if row["state"] == "PASS" and not verify_result(row.get("last_result") or {}, job,
-                                                          expected_apk=state.get("candidate_apk_sha256")):
-            raise ValueError(f"Unverified current PASS: {job['case']['id']}")
-    counts = dict(collections.Counter(row["state"] for row in state["cases"]))
-    if counts != state["summary"]:
+    if unknown is not None:  # An empty selection never means completion; unknown states are never skipped.
+        raise ValueError(f"Unknown or unfinished checkpoint state for {unknown.get('case_id')}: "
+                         f"{unknown.get('state')}; regenerate case state")
+    if problem is not None:
+        raise ValueError(problem)
+    counts = dict(counts)
+    if counts != header["summary"]:
         raise ValueError("Exact state summary disagrees with its cases")
-    return inventory, state, counts
+    return inventory, header, counts, set(index)
+
+
+def previous_history(state_path):
+    """Case IDs and the measured-history facts of a state, without keeping its rows."""
+    ids, history = set(), {}
+    for row in iter_state_rows(state_path):
+        ids.add(row["case_id"])
+        present = {field for field in HISTORY_FIELDS if row.get(field)}
+        if present:
+            history[row["case_id"]] = (row.get("request_key"), present)
+    return ids, history
+
+
+def freshness_counts(state_path):
+    return dict(collections.Counter(row.get("freshness", "NOT RUN") for row in iter_state_rows(state_path)))
 
 
 def checkpoint(ledger_path, output, state_path=None, inventory_dir=None, reports=(), root=ROOT,
@@ -72,9 +121,9 @@ def checkpoint(ledger_path, output, state_path=None, inventory_dir=None, reports
     render(ledger_path, output, root, ledger)  # Reject changed earlier evidence before updating anything.
     candidate = copy.deepcopy(ledger)
     current = candidate["current_inventory"]
-    state_bytes = None
     state_target = resolve(current["state"]["path"], root=root)
-    previous_state_bytes = state_target.read_bytes()
+    previous_sha = file_sha256(state_target)
+    prepared = None  # a new state file that is not yet at the ledger's state pointer
     if state_path is None and (inventory_dir is not None or reports):
         raise ValueError("An update requires a freshly joined exact state")
     if state_path is not None:
@@ -83,33 +132,38 @@ def checkpoint(ledger_path, output, state_path=None, inventory_dir=None, reports
                           ("input_requirements", "input_requirements.json")):
             current[key] = reference(directory / name, root)
         if replace_state:
-            state_bytes = resolve(state_path, root=root).read_bytes()
-            current["state"] = {"path": state_target.relative_to(root).as_posix(),
-                                "sha256": hashlib.sha256(state_bytes).hexdigest()}
+            prepared = resolve(state_path, root=root)
+            current["state"] = {"path": state_target.relative_to(root).as_posix(), "sha256": file_sha256(prepared)}
         else:
             current["state"] = reference(state_path, root)
-    inventory, state, counts = validate_state(candidate, root, json.loads(state_bytes) if state_bytes is not None else None)
-    previous_state = json.loads(previous_state_bytes)
-    previous_rows = {row["case_id"]: row for row in previous_state["cases"]}
-    for row in state["cases"]:
-        previous = previous_rows.get(row["case_id"], {})
-        history_fields = ("last_result", "last_measured_result", "last_verified_apk", "last_verified_apk_evidence")
-        if previous.get("request_key") == row["request_key"] and any(
-                previous.get(field) and not row.get(field) for field in history_fields):
-            raise ValueError("Checkpoint would discard a last measured result; join prior reports as well")
-    candidate_impacts = impacts(state)
-    if any(candidate_impacts.get(key) != value for key, value in impacts(previous_state).items()):
-        raise ValueError("Checkpoint would discard prior change impacts; join the accumulated changes as well")
-    if not set(ledger["current_inventory"]["required_phones"]) <= set(inventory["required_phones"]):
+    inventory, header, counts, new_ids = validate_state(candidate, root, prepared)
+    if state_path is not None:
+        new_file = prepared or resolve(current["state"]["path"], root=root)
+        old_ids, history = previous_history(state_target)
+        for row in iter_state_rows(new_file):
+            previous = history.get(row["case_id"])
+            if previous is not None and previous[0] == row["request_key"] and any(
+                    not row.get(field) for field in previous[1]):
+                raise ValueError("Checkpoint would discard a last measured result; join prior reports as well")
+        candidate_impacts = state_impacts(new_file)
+        if any(candidate_impacts.get(key) != value for key, value in state_impacts(state_target).items()):
+            raise ValueError("Checkpoint would discard prior change impacts; join the accumulated changes as well")
+    else:
+        old_ids = new_ids
+    # A required phone may move to the inventory's `extension_phones` (still compiled, no longer needed by a run);
+    # it cannot leave the inventory.
+    if not set(ledger["current_inventory"]["required_phones"]) <= (
+            set(inventory["required_phones"]) | set(inventory.get("extension_phones", []))):
         raise ValueError("Required phones cannot disappear from a shared checkpoint")
     if current["bundle"] != ledger["current_inventory"]["bundle"]:
-        removed = {row["case_id"] for row in previous_state["cases"]} - {row["case_id"] for row in state["cases"]}
+        removed = old_ids - new_ids
         retired = {row["id"] for row in inventory.get("retired_requirements", []) if row.get("reason", "").strip()}
         if removed - retired:
             raise ValueError("Removed exact requests require explicit retired_requirements with reasons")
+    new_file = prepared or resolve(current["state"]["path"], root=root)
     current.update(required_phones=inventory["required_phones"], selected_phones=inventory["selected_phones"],
-                   case_count=len(state["cases"]), states=counts, candidate_apk_sha256=state.get("candidate_apk_sha256"),
-                   freshness=dict(collections.Counter(row.get("freshness", "NOT RUN") for row in state["cases"])))
+                   case_count=len(new_ids), states=counts, candidate_apk_sha256=header.get("candidate_apk_sha256"),
+                   freshness=freshness_counts(new_file))
     if state_path is not None:
         candidate.setdefault("historical_capability_bases", copy.deepcopy(candidate.get("capability_bases", {})))
         candidate["capability_bases"] = inventory["capability_provenance"]
@@ -132,7 +186,7 @@ def checkpoint(ledger_path, output, state_path=None, inventory_dir=None, reports
                 candidate.setdefault("unified_reports", []).append({**pointer, "state_counts": report["state_counts"],
                     "scope": "Recorded analysis; only exact case/request matches may update current state"})
                 indexed.add(pointer["path"])
-    page, result = render(ledger_path, output, root, candidate, state_bytes=state_bytes)
+    page, result = render(ledger_path, output, root, candidate, state_path=prepared)
     if state_path is None:
         return {"action": "CHECKED", **result, "phone_operations": 0}
     # Both complete documents are prepared and verified before either canonical file changes.
@@ -141,16 +195,21 @@ def checkpoint(ledger_path, output, state_path=None, inventory_dir=None, reports
         output.parent.mkdir(parents=True, exist_ok=True)
         documents = [(ledger_path, (json.dumps(candidate, indent=2, allow_nan=False) + "\n").encode("utf-8")),
                      (output, page.encode("utf-8"))]
-        if state_bytes is not None:
-            documents.insert(0, (state_target, state_bytes))
-            if phones is not None:
-                from benchmark_case_state import select_remaining
-                documents.insert(1, (state_target.with_name("remaining.json"), json.dumps({
-                    "state": "NOT RUN", "case_ids": [row["case_id"] for row in select_remaining(state, phones)],
-                    "available_owned_phones": sorted(phones),
-                    "blocked_cases": [row["case_id"] for row in state["cases"] if row["state"] == "BLOCKED"],
-                    "reason": "Selection is not execution; BLOCKED cases require a newly proved prerequisite."
-                }, indent=2, allow_nan=False).encode("utf-8")))
+        if prepared is not None and phones is not None:
+            from benchmark_case_state import select_remaining
+            ready = select_remaining({"cases": iter_state_rows(prepared)}, phones)
+            blocked = [row["case_id"] for row in iter_state_rows(prepared) if row["state"] == "BLOCKED"]
+            documents.insert(0, (state_target.with_name("remaining.json"), json.dumps({
+                "state": "NOT RUN", "case_ids": [row["case_id"] for row in ready],
+                "available_owned_phones": sorted(phones), "blocked_cases": blocked,
+                "reason": "Selection is not execution; BLOCKED cases require a newly proved prerequisite."
+            }, indent=2, allow_nan=False).encode("utf-8")))
+        if prepared is not None:
+            temporary = state_target.with_name(state_target.name + ".checkpoint.tmp")
+            staged.append((temporary, state_target))
+            shutil.copyfile(prepared, temporary)
+            if file_sha256(temporary) != current["state"]["sha256"]:
+                raise ValueError("Staged state differs from the verified candidate")
         for target, raw in documents:
             temporary = target.with_name(target.name + ".checkpoint.tmp")
             with temporary.open("xb") as handle:
@@ -158,7 +217,7 @@ def checkpoint(ledger_path, output, state_path=None, inventory_dir=None, reports
                 handle.write(raw)
         if ledger_path.read_bytes() != original:
             raise ValueError("Ledger changed during preparation; retry under exclusive root ownership")
-        if state_target.read_bytes() != previous_state_bytes:
+        if file_sha256(state_target) != previous_sha:
             raise ValueError("State changed during preparation; retry under exclusive root ownership")
         for temporary, target in staged:
             temporary.replace(target)
@@ -169,18 +228,16 @@ def checkpoint(ledger_path, output, state_path=None, inventory_dir=None, reports
             "ledger": reference(ledger_path, root), "index": reference(output, root)}
 
 
-def join_indexed(ledger, phones, reports=(), changes=(), expected_apk=None, root=ROOT, inventory_dir=None):
-    """Reuse all indexed results and impacts; availability never shrinks the inventory."""
-    from benchmark_case_state import build_state
-    from run_benchmark_suite import load_jobs
+def _join_inputs(ledger, phones, reports, changes, expected_apk, root, inventory_dir):
+    """Jobs, lazily read reports, accumulated changes and the availability hook for an indexed refresh."""
+    from run_benchmark_suite import iter_jobs
     root = Path(root).resolve()
     current = ledger["current_inventory"]
     registry = read(root / "tools/benchmark_devices.json", root)["devices"]
     phones = set(phones)
     if phones - set(registry):
         raise ValueError(f"Unknown available aliases: {sorted(phones - set(registry))}")
-    previous = read(current["state"]["path"], root)
-    accumulated = impacts(previous)
+    accumulated = state_impacts(resolve(current["state"]["path"], root=root))
     for change in [item for path in changes for item in read(path, root)["changes"]]:
         change = {key: value for key, value in change.items() if key != "needs_retest"}
         if change["id"] in accumulated and accumulated[change["id"]] != change:
@@ -189,12 +246,30 @@ def join_indexed(ledger, phones, reports=(), changes=(), expected_apk=None, root
     paths = {resolve(item["path"], root=root) for item in ledger.get("unified_reports", [])}
     paths.update(resolve(path, root=root) for path in reports)
     bundle = resolve(inventory_dir, root=root) / "benchmark-bundle.json" if inventory_dir else resolve(current["bundle"]["path"], root=root)
-    state = build_state(load_jobs(bundle, registry), [read(path, root) for path in sorted(paths)],
-                        list(accumulated.values()), expected_apk=expected_apk or current["candidate_apk_sha256"])
-    for row in state["cases"]:
+
+    def availability(row):
         row["availability"] = {"all_participants_available": set(row["phones"]) <= phones,
                                "missing_phones": sorted(set(row["phones"]) - phones), "preflight": "UNMEASURED"}
-    return state
+
+    # Reports are read one at a time while the state is built; only recorded executions stay resident.
+    return (iter_jobs(bundle, registry), (read(path, root) for path in sorted(paths)), list(accumulated.values()),
+            expected_apk or current["candidate_apk_sha256"], availability)
+
+
+def join_indexed(ledger, phones, reports=(), changes=(), expected_apk=None, root=ROOT, inventory_dir=None):
+    """Reuse all indexed results and impacts; availability never shrinks the inventory. Returns the v2 state."""
+    from benchmark_case_state import build_state
+    jobs, lazy_reports, accumulated, apk, availability = _join_inputs(
+        ledger, phones, reports, changes, expected_apk, root, inventory_dir)
+    return build_state(jobs, lazy_reports, accumulated, expected_apk=apk, row_hook=availability)
+
+
+def join_indexed_to_file(ledger, phones, path, reports=(), changes=(), expected_apk=None, root=ROOT, inventory_dir=None):
+    """The same join, written row by row to ``path`` (no full state in memory)."""
+    from benchmark_case_state import stream_state
+    jobs, lazy_reports, accumulated, apk, availability = _join_inputs(
+        ledger, phones, reports, changes, expected_apk, root, inventory_dir)
+    return stream_state(path, jobs, lazy_reports, accumulated, expected_apk=apk, row_hook=availability)
 
 
 def main(argv=None):
@@ -206,6 +281,7 @@ def main(argv=None):
     parser.add_argument("--changes", type=Path, action="append", default=[], help="Additional change impacts (repeatable)")
     parser.add_argument("--inventory", type=Path, help="New complete inventory; defaults to the indexed inventory")
     parser.add_argument("--report", action="append", type=Path, default=[], help="Append finalized suite-result.json (repeatable)")
+    parser.add_argument("--scratch", type=Path, help="Directory for the prepared state file (default: the OS temporary directory)")
     args = parser.parse_args(argv)
     if args.action == "update" and (args.state is None) == (args.phones is None):
         parser.error("Update requires either --phones for indexed refresh or --state for an explicit join")
@@ -220,11 +296,10 @@ def main(argv=None):
         else:
             checkpoint(LEDGER, ROOT / "benchmarks/index.html")
             phones = set(filter(None, (name.strip() for name in args.phones.split(","))))
-            state = join_indexed(read(LEDGER), phones, args.report, args.changes, args.apk_sha256,
-                                 inventory_dir=args.inventory)
-            with tempfile.TemporaryDirectory(prefix="bluetooth-state-") as scratch:
+            with tempfile.TemporaryDirectory(prefix="bluetooth-state-", dir=args.scratch) as scratch:
                 path = Path(scratch) / "state.json"
-                path.write_text(json.dumps(state, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+                join_indexed_to_file(read(LEDGER), phones, path, args.report, args.changes, args.apk_sha256,
+                                     inventory_dir=args.inventory)
                 result = checkpoint(LEDGER, ROOT / "benchmarks/index.html", path, args.inventory, args.report,
                                     replace_state=True, phones=phones)
     except (ValueError, KeyError, OSError) as error:

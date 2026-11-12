@@ -10,10 +10,15 @@ from pathlib import Path
 from urllib.parse import quote
 
 from benchmark_layout import ROOT, LEDGER, resolve
+from benchmark_state_io import file_sha256, iter_state_rows, read_members, state_header
 
 
-def render(ledger_path, output, root=ROOT, ledger=None, state_bytes=None):
-    """Validate all indexed evidence and prepare the view without changing files."""
+def render(ledger_path, output, root=ROOT, ledger=None, state_path=None):
+    """Validate all indexed evidence and prepare the view without changing files.
+
+    ``state_path`` is a prepared state that is not yet at the ledger's state pointer (a checkpoint candidate);
+    its bytes must hash to the candidate pointer. State and inventory are streamed, never loaded whole.
+    """
     root, output = Path(root).resolve(), Path(output).resolve()
     if output.name != "index.html":
         raise ValueError("The derived view must be named index.html; original reports are not overwritten")
@@ -23,10 +28,15 @@ def render(ledger_path, output, root=ROOT, ledger=None, state_bytes=None):
 
     def verified(pointer):
         path = resolve(pointer["path"], root=root)
-        raw = state_bytes if pointer is ledger["current_inventory"]["state"] and state_bytes is not None else path.read_bytes()
-        if hashlib.sha256(raw).hexdigest() != pointer["sha256"]:
+        if hashlib.sha256(path.read_bytes()).hexdigest() != pointer["sha256"]:
             raise ValueError(f"Indexed evidence changed: {path}")
-        return path, json.loads(raw)
+        return path, json.loads(path.read_text(encoding="utf-8"))
+
+    def verified_large(pointer, source=None):
+        path = resolve(pointer["path"], root=root)
+        if file_sha256(source or path) != pointer["sha256"]:
+            raise ValueError(f"Indexed evidence changed: {path}")
+        return path
 
     def link(path, label):
         path = resolve(path, root=root)
@@ -36,12 +46,16 @@ def render(ledger_path, output, root=ROOT, ledger=None, state_bytes=None):
         return f'<a href="{html.escape(target, quote=True)}">{html.escape(str(label))}</a>'
 
     current = ledger["current_inventory"]
-    pointers = {key: verified(current[key]) for key in ("inventory", "bundle", "input_requirements", "state")}
-    state = pointers["state"][1]
-    if state.get("schema") != "benchmark-case-state-v1":
-        raise ValueError("Unsupported case-state schema")
-    counts = dict(collections.Counter(row["state"] for row in state["cases"]))
-    if counts != state["summary"] or counts != current["states"] or len(state["cases"]) != current["case_count"]:
+    pointers = {key: verified_large(current[key], state_path if key == "state" else None)
+                for key in ("inventory", "bundle", "input_requirements", "state")}
+    state_file = state_path or pointers["state"]
+    state = state_header(state_file)
+    counts, total = collections.Counter(), 0
+    for row in iter_state_rows(state_file):
+        counts[row["state"]] += 1
+        total += 1
+    counts = dict(counts)
+    if counts != state["summary"] or counts != current["states"] or total != current["case_count"]:
         raise ValueError("Ledger and exact case state disagree; refresh the ledger first")
     if state.get("candidate_apk_sha256") != current["candidate_apk_sha256"]:
         raise ValueError("Ledger and exact state candidate APK disagree; refresh the ledger first")
@@ -78,8 +92,8 @@ def render(ledger_path, output, root=ROOT, ledger=None, state_bytes=None):
                       for key, section in sorted(audit.items()) if key.startswith("evidence_retirement_")) +
             f"{link(path, 'Media retirement evidence')}</p>")
     status = " · ".join(f"{html.escape(name)}: {count:,}" for name, count in sorted(counts.items()))
-    data_links = " · ".join(link(path, key.replace("_", " ").title()) for key, (path, _) in pointers.items())
-    remaining = "".join(f"<li>{html.escape(reason)}</li>" for reason in pointers["inventory"][1].get("remaining", []))
+    data_links = " · ".join(link(path, key.replace("_", " ").title()) for key, path in pointers.items())
+    remaining = "".join(f"<li>{html.escape(reason)}</li>" for reason in read_members(pointers["inventory"], keys=("remaining",)).get("remaining", []))
     page = f"""<!doctype html><html lang="en"><meta charset="utf-8">
 <meta name="benchmark-view" content="benchmark-index-v1"><title>Bluetooth benchmark results</title>
 <style>body{{font:16px system-ui;max-width:1200px;margin:32px auto;padding:0 20px;color:#222}}
@@ -111,7 +125,7 @@ th{{background:#f0f3f6}}a{{color:#075fa5}}input{{padding:8px;width:90%;margin:12
 for(const row of document.querySelectorAll('#history tbody tr'))row.hidden=!row.textContent.toLowerCase().includes(query);}});</script></html>"""
     if output.exists() and 'content="benchmark-index-v1"' not in output.read_text(encoding="utf-8"):
         raise ValueError("Refusing to replace an unrelated HTML file")
-    return page, {"cases": len(state["cases"]), "states": counts, "historical_executions": len(historical), "unified_reports": len(reports)}
+    return page, {"cases": total, "states": counts, "historical_executions": len(historical), "unified_reports": len(reports)}
 
 
 def generate(ledger_path, output, root=ROOT):

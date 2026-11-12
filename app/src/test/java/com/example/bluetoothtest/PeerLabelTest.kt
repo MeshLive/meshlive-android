@@ -51,12 +51,11 @@ class PeerLabelTest {
     @Test
     fun selfClaimedNameIsQuotedBesideTheFullHandleAndClearedWithTheSession() {
         val prefix = "a1b2c3d4e5f6"
-        SessionPeerLabels.update(prefix) { it.copy(selfName = "Asha", callSubject = "Water") }
+        SessionPeerLabels.update(prefix) { it.copy(selfName = "Asha") }
         try {
             val label = PeerLabels.forPeer(prefix)
             assertEquals(PeerLabel.NameKind.SELF_NAMED, label.nameKind)
             assertEquals("\u201CAsha\u201D \u00B7 M6SC7-N75YR", label.listName())
-            assertEquals("Water", label.callSubject)
             // A verified contact's own label always wins over the claimed name.
             assertEquals("Mum", PeerLabels.forPeer(prefix, "Mum").listName())
         } finally {

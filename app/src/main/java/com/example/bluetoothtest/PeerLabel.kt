@@ -9,7 +9,7 @@ package com.example.bluetoothtest
  *   contact's own label. The handle is a UI rendering only: logs and host tools keep 12-hex (R10).
  * - [name]: your own label for a verified contact (CONTACT) or, after the signed-label wire change,
  *   a self-claimed name (SELF_NAMED); otherwise null and the handle is the name.
- * - [callSubject] / [streamTitle]: optional signed labels; a title read from an advert stays
+ * - [streamTitle]: optional signed label; a title read from an advert stays
  *   unconfirmed ([streamTitleConfirmed] false) until the stream is joined.
  * The OS Bluetooth name is never used as a name (it is public, forgeable and often a real name).
  */
@@ -17,7 +17,6 @@ internal data class PeerLabel(
     val handle: String,
     val name: String? = null,
     val nameKind: NameKind = NameKind.NONE,
-    val callSubject: String? = null,
     val streamTitle: String? = null,
     val streamTitleConfirmed: Boolean = false,
     /**
@@ -89,7 +88,6 @@ internal object DefaultPeerLabelProvider : PeerLabelProvider {
             PeerLabel(handle)
         }
         return base.copy(
-            callSubject = session?.callSubject,
             streamTitle = session?.streamTitle,
             streamTitleConfirmed = session?.streamTitle != null,
             lookAlikeOf = base.name.takeIf { base.nameKind == PeerLabel.NameKind.SELF_NAMED }
@@ -103,7 +101,7 @@ internal object DefaultPeerLabelProvider : PeerLabelProvider {
  * (experimental peer labels). Cleared when the session ends: strangers' names are never cached.
  */
 internal object SessionPeerLabels {
-    data class Entry(val selfName: String? = null, val callSubject: String? = null, val streamTitle: String? = null)
+    data class Entry(val selfName: String? = null, val streamTitle: String? = null)
 
     private val entries = java.util.concurrent.ConcurrentHashMap<String, Entry>()
 
@@ -130,7 +128,7 @@ internal object SessionPeerLabels {
             if (old == null) {
                 moved
             } else {
-                Entry(old.selfName ?: moved.selfName, old.callSubject ?: moved.callSubject, old.streamTitle ?: moved.streamTitle)
+                Entry(old.selfName ?: moved.selfName, old.streamTitle ?: moved.streamTitle)
             }
         }
     }

@@ -91,13 +91,19 @@ class ScanPolicyTest {
     @Test
     fun theOffSwitchWorksWhetherOrNotTheRootHasAddedTheEntries() {
         assertTrue(ScanPolicy.enabled("scan-silence-watchdog"))
+        assertTrue(ScanPolicy.isOff("x", setOf("x")))
+        assertFalse(ScanPolicy.isOff("x", setOf("y")))
+        if (!BuildConfig.DEBUG) {
+            // test_device_policy_off is DEBUG-only: a release build always keeps every entry.
+            DebugTunables.devicePolicyOff = setOf("all")
+            assertTrue(ScanPolicy.enabled("scan-silence-watchdog") && ScanPolicy.enabled("bluetooth-process-restart-recovery"))
+            return
+        }
         DebugTunables.devicePolicyOff = setOf("scan-silence-watchdog")
         assertFalse(ScanPolicy.enabled("scan-silence-watchdog"))
         assertTrue(ScanPolicy.enabled("bluetooth-process-restart-recovery"))
         DebugTunables.devicePolicyOff = setOf("all")
         assertFalse(ScanPolicy.enabled("bluetooth-process-restart-recovery"))
-        assertTrue(ScanPolicy.isOff("x", setOf("x")))
-        assertFalse(ScanPolicy.isOff("x", setOf("y")))
     }
 
     @Test
@@ -117,7 +123,9 @@ class ScanPolicyTest {
             ),
             asked,
         )
-        assertTrue(ScanSwitches.renewalAll && ScanSwitches.staleRestart && ScanSwitches.probeUngated)
+        // A release build ignores launch extras: every experiment stays off.
+        assertEquals(BuildConfig.DEBUG, ScanSwitches.renewalAll && ScanSwitches.staleRestart && ScanSwitches.probeUngated)
+        assertTrue(BuildConfig.DEBUG || !(ScanSwitches.renewalAll || ScanSwitches.staleRestart || ScanSwitches.probeUngated))
         ScanSwitches.applyLaunchExtras(null) // a launch without extras restores every default
         assertFalse(ScanSwitches.renewalAll || ScanSwitches.staleRestart || ScanSwitches.softwareFilterFallback)
     }
@@ -161,19 +169,22 @@ class ScanPolicyTest {
     }
 
     @Test
-    fun noDiscoveryScanUsesLowPowerExceptTheIdleRelayHelper() {
-        assertFalse(source("GapNameProbe.kt").contains("SCAN_MODE_LOW_POWER"))
-        assertFalse(source("InboundProbe.kt").contains("SCAN_MODE_LOW_POWER"))
-        val control = source("BleL2capControl.kt")
-        assertEquals(1, Regex("SCAN_MODE_LOW_POWER").findAll(control).count())
-        // That one use is the `lowPower` branch, taken only by the idle relay helper (RelayedCallsController).
-        assertTrue(control.contains("} else if (lowPower) {\n            ScanSettings.SCAN_MODE_LOW_POWER"))
-        val sites = listOf(
-            "AndroidPrivateVideoCall.kt", "MainActivity.kt", "ReceiverStreamForwarder.kt", "RelayedCallsController.kt",
-        ).filter { name ->
-            Regex("lowPower\\s*=\\s*[^\\n]*").findAll(source(name)).any { !it.value.contains("false") }
-        }
-        assertEquals(listOf("RelayedCallsController.kt"), sites)
+    fun aDiscoveryScanIsLowPowerOnlyForTheIdleRelayHelperAndNeverWhileAPersonWaits() {
+        // android.bluetooth.le.ScanSettings: SCAN_MODE_LOW_POWER 0, SCAN_MODE_BALANCED 1, SCAN_MODE_LOW_LATENCY 2.
+        assertEquals(2, DiscoveryScanPlan.mode(startLowLatency = true, lowPower = false))
+        assertEquals("a waiting person outranks the helper's saving", 2, DiscoveryScanPlan.mode(startLowLatency = true, lowPower = true))
+        assertEquals(1, DiscoveryScanPlan.mode(startLowLatency = false, lowPower = false))
+        assertEquals(0, DiscoveryScanPlan.mode(startLowLatency = false, lowPower = true))
+        // The helper asks for low power only when its phone is idle: screen off and not charging (RelayHelperPolicy).
+        val idle = RelayHelperInputs(
+            featureOn = true, helpOn = true, rotatingIdsOn = false, leTransport = true, bluetoothReady = true, callReady = true,
+            batteryPercent = 80, charging = false, batterySaver = false, thermalSevere = false, ownActivity = false, screenOn = false,
+        )
+        fun scanMode(inputs: RelayHelperInputs) =
+            DiscoveryScanPlan.mode(startLowLatency = false, lowPower = RelayHelperPolicy.plan(inputs).scan == HelperScan.LOW_POWER)
+        assertEquals(0, scanMode(idle))
+        assertEquals(1, scanMode(idle.copy(screenOn = true)))
+        assertEquals(1, scanMode(idle.copy(charging = true)))
     }
 
 }

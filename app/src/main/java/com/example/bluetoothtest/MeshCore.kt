@@ -86,6 +86,15 @@ object MeshEnvelopeCodec {
             ByteArray(payloadSize).also(input::readFully),
         )
     }
+
+    /** The sequence of a mesh envelope without allocating its payload (A7: the hop's cutover sequence). */
+    fun sequenceOf(bytes: ByteArray): Long {
+        val input = DataInputStream(ByteArrayInputStream(bytes))
+        val receivedMagic = ByteArray(magic.size).also(input::readFully)
+        require(receivedMagic.contentEquals(magic)) { "Invalid mesh packet" }
+        input.skipBytes(16 + NodeId.BYTE_COUNT)
+        return input.readLong()
+    }
 }
 
 data class MeshFrameKey(

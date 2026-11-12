@@ -39,6 +39,63 @@
     <string name="feat_bmh3_description">Adds privacy protection when connecting to other phones. Older versions or phones with this protection turned off may not connect. Accepting a call can still let the other person recognise your phone.</string>
     <!-- Pseudonymous stranger identities on top of the BMH3 handshake (Bmh3Pseudonyms.kt, phone test T15). On by default since 0.2.0-beta. -->
     <string name="feat_bmh3_pseudonyms">New identity for each stranger</string>
-    <string name="feat_bmh3_pseudonyms_description">Uses a temporary ID with people you haven\'t verified. Verified contacts, and whoever holds a call you accept (which may be a relaying phone), receive your usual ID. Both phones need compatible settings. Message exchanges require verified contacts; livestream viewers can still recognise the broadcaster\'s phone.</string>
+    <string name="feat_bmh3_pseudonyms_description">Uses a temporary ID with people you haven\'t verified. Verified contacts, and whoever holds a call you accept (which may be a relaying phone), receive your usual ID. Both phones need compatible settings. Message exchanges require verified contacts. Live streams are not covered: while you send, watch or pass on a stream, anyone nearby with radio equipment can record your usual ID.</string>
     <string name="call_verify_after_reveal">You can verify this person once they have answered and their identity is confirmed.</string>
+    <!-- Wi-Fi carriers (Design WF, WifiFeatures.kt). Master 00-MASTER section 6 text. -->
+    <string name="settings_card_wifi">Wi-Fi</string>
+    <string name="feat_wifi_carrier">Use Wi-Fi when it helps</string>
+    <string name="feat_wifi_carrier_description">When both phones support it, calls and live streams move to Wi-Fi after they connect. Bluetooth still finds and connects, and takes over if Wi-Fi stops. Turned on during a call or live stream, it works from the next one. While a call or stream moves to Wi-Fi, both phones briefly advertise a one-time Wi-Fi name. While a Wi-Fi link is open, the other phone can reach other apps on this phone that accept network connections from any network. On a live stream that other phone can be any stranger who watches your stream or whose stream you watch, so keep this off when you stream with people you do not know. While it is on, anyone listening near a live stream you take part in, and the phones next to this one when it relays a call, can see which MeshLive version you use.</string>
+    <!-- Shown only on Android 11 and 12 (API 30-32), appended to the description after one space [R M-12]. -->
+    <string name="feat_wifi_carrier_needs_wider_reach">On this Android version it also needs Wider reach.</string>
+    <string name="feat_wifi_wider_reach">Wider reach over Wi-Fi</string>
+    <string name="feat_wifi_wider_reach_description">Also finds and connects to people over Wi-Fi, further away and faster, even when Bluetooth is blocked. Uses more battery. Nearby Wi-Fi devices can see that this phone uses Wi-Fi Aware. Its Wi-Fi name changes at least every 30 minutes; while a Wi-Fi link is open, its Wi-Fi address may not change. Any nearby phone can open a Wi-Fi link to it before proving who it is, and while a Wi-Fi link is open the other phone can reach other apps on this phone that accept network connections from any network.</string>
+    <string name="feat_wifi_direct">Wi-Fi Direct for phones and PCs without Wi-Fi Aware</string>
+    <string name="feat_wifi_direct_description">Lets this phone connect over Wi-Fi Direct. Nearby devices can see this phone\'s Wi-Fi Direct name \"%1$s\" and may recognise it across calls by its Wi-Fi Direct address. While a Wi-Fi Direct link is open, its network name has a pattern that identifies MeshLive, and a nearby device can send this phone an invitation to connect. While a Wi-Fi link is open, the other phone can reach other apps on this phone that accept network connections from any network.</string>
+    <string name="feat_wifi_direct_description_unnamed">Lets this phone connect over Wi-Fi Direct. Nearby devices can see this phone\'s Wi-Fi Direct name and may recognise it across calls by its Wi-Fi Direct address. While a Wi-Fi Direct link is open, its network name has a pattern that identifies MeshLive, and a nearby device can send this phone an invitation to connect. While a Wi-Fi link is open, the other phone can reach other apps on this phone that accept network connections from any network.</string>
+    <!-- Drafted by A6: permission and Location prompts of the Wi-Fi switches (reviewer approves wording). -->
+    <string name="wifi_permission_denied">Permission needed. The Wi-Fi option stays off. You can allow it in this app\'s settings.</string>
+    <string name="wifi_permission_precise">Precise location is needed. On this Android version, Wi-Fi discovery works only with precise location; the app never reads where you are. The Wi-Fi option stays off. You can allow it in this app\'s settings.</string>
+    <string name="wifi_open_app_settings">Open app settings</string>
+    <!-- Reviewer amendment 4: a stored ON whose permission or Location is missing. -->
+    <string name="wifi_needs_permission">Not active: a permission is missing. Turn this off and on again to allow it.</string>
+    <string name="wifi_needs_location">Not active: Location is off. Turn on Location to use it.</string>
+    <!-- Android 11 and 12 only, the carrier switch on and Wider reach off [R M-12]. -->
+    <string name="wifi_needs_wider_reach">Not active on this Android version without Wider reach over Wi-Fi.</string>
+    <string name="wifi_location_title">Turn on Location</string>
+    <string name="wifi_location_message">On Android 10 to 12, Android allows Wi-Fi discovery and Wi-Fi Direct only while Location is on. The app never reads where you are. Turn Location on, then switch this option on again.</string>
+    <string name="wifi_location_open">Open Location settings</string>
+    <!-- F-12: a Wi-Fi Direct group whose removal was not confirmed. -->
+    <string name="wifi_direct_group_stuck">A Wi-Fi Direct group could not be closed. Turn Wi-Fi off and on to close it.</string>
+    <!-- Drafted by A6: calls list and Link health. -->
+    <string name="people_reach_wifi">Nearby, over Wi-Fi</string>
+    <string name="link_health_connection_wifi">Connection: Wi-Fi, Bluetooth %1$s on standby</string>
+    <string name="link_health_connection_wifi_only">Connection: Wi-Fi only, Bluetooth is not connected</string>
+    <!-- UI-W7: Link health, a call that stays on Bluetooth. %1$s is one of the wifi_not_used_* sentences. -->
+    <string name="link_health_wifi_not_used">Wi-Fi not used: %1$s</string>
+    <string name="wifi_not_used_switched_off">\"Use Wi-Fi when it helps\" is switched off in Settings.</string>
+    <string name="wifi_not_used_wider_reach_off">on this Android version it needs \"Wider reach over Wi-Fi\" in Settings.</string>
+    <string name="wifi_not_used_wifi_off">Wi-Fi is turned off on this phone.</string>
+    <string name="wifi_not_used_hotspot">this phone\'s hotspot is on.</string>
+    <string name="wifi_not_used_battery_saver">battery saver is on.</string>
+    <string name="wifi_not_used_battery_low">the battery is low.</string>
+    <string name="wifi_not_used_heat">this phone is too hot.</string>
+    <string name="wifi_not_used_network_24ghz">this phone is on a 2.4 GHz Wi-Fi network. A 5 GHz network or Wi-Fi off works better.</string>
+    <string name="wifi_not_used_needs_permission">MeshLive does not have the permission it needs for Wi-Fi.</string>
+    <string name="wifi_not_used_needs_location">Location is off, and Android needs it for Wi-Fi on this version.</string>
+    <string name="wifi_not_used_this_phone_unsupported">this phone cannot do it.</string>
+    <string name="wifi_not_used_busy">this phone\'s Wi-Fi is busy with something else.</string>
+    <string name="wifi_not_used_recent_problem">Wi-Fi had a problem a moment ago and is paused for a while.</string>
+    <string name="wifi_not_used_other_no_wifi">the other phone does not offer Wi-Fi.</string>
+    <string name="wifi_not_used_other_busy">the other phone\'s Wi-Fi is busy.</string>
+    <string name="wifi_not_used_other_wifi_off">Wi-Fi is not available on the other phone.</string>
+    <string name="wifi_not_used_other_battery_or_heat">the other phone is saving battery or is too hot.</string>
+    <string name="wifi_not_used_other_network_24ghz">the other phone is on a 2.4 GHz Wi-Fi network.</string>
+    <string name="wifi_not_used_other_declined">the other phone did not take it up.</string>
+    <string name="wifi_not_used_no_common_way">the two phones do not share a Wi-Fi way to connect.</string>
+    <string name="wifi_not_used_did_not_hold">Wi-Fi did not hold up on this call, so it stays on Bluetooth.</string>
+    <!-- UI-W7: the confirmation before Wi-Fi Direct is switched on. %1$s is this phone's own Wi-Fi Direct name. -->
+    <string name="wifi_direct_confirm_title">Turn on Wi-Fi Direct?</string>
+    <string name="wifi_direct_confirm_message">When a call can use Wi-Fi Direct, this phone and the other phone briefly set up a small Wi-Fi network of their own. Phones nearby can see this phone as \"%1$s\" (its Wi-Fi Direct name) and may recognise it from one call to the next. While the link is open, the other phone can reach other apps on this phone that accept network connections. Bluetooth stays as the backup.</string>
+    <string name="wifi_direct_confirm_message_unnamed">When a call can use Wi-Fi Direct, this phone and the other phone briefly set up a small Wi-Fi network of their own. Phones nearby can see this phone by its Wi-Fi Direct name (shown in Android\'s Wi-Fi Direct settings) and may recognise it from one call to the next. While the link is open, the other phone can reach other apps on this phone that accept network connections. Bluetooth stays as the backup.</string>
+    <string name="wifi_direct_confirm_turn_on">Turn on</string>
 </resources>

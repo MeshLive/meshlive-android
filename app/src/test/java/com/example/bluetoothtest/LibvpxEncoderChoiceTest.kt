@@ -65,7 +65,8 @@ class LibvpxEncoderChoiceTest {
     @Test
     fun preferLibvpxOffNeverPicksLibvpxAutomaticallyButKeepsItSelectable() {
         preferLibvpx(false)
-        assertFalse(VideoCodecSwitches.preferLibvpx)
+        // test_prefer_libvpx is DEBUG-only: a release build keeps the shipped constant.
+        assertEquals(if (BuildConfig.DEBUG) false else ConnectivityFeatureDefaults.LIBVPX_AUTOMATIC, VideoCodecSwitches.preferLibvpx)
         val legacyA15s = listOf(libaom, swAv1, libvpx).sortedBy(VideoCodec::selectionPriority)
         val off = switches(preferLibvpx = false)
         // Automatic (stream and call) is exactly the list without libvpx; the picker offers libvpx last.

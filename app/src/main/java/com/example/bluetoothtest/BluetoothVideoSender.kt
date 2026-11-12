@@ -94,6 +94,8 @@ class BluetoothVideoSender(
     @Volatile private var typicalVideoBytes = 0L
     private val offeredWindowBytes = AtomicLong()
     private val running = AtomicBoolean(false)
+    /** Wider reach: the native streams this sender dialled (closed by closeRawLink and close). */
+    @Volatile private var wifiConnection: WifiNativeConnection? = null
     private val streamPaused = AtomicBoolean(false)
     private val ending = AtomicBoolean(false)
     private val withdrawingForCapacity = AtomicBoolean(false)
@@ -108,8 +110,10 @@ class BluetoothVideoSender(
     @Volatile private var controlThread: Thread? = null
     @Volatile private var flushThread: Thread? = null
     @Volatile private var lastHeartbeatReceivedNs = 0L
-    @Volatile private var linkLoad: NodeLinkLoad.Handle? = null
+    @Volatile private var linkLoad: HopSendLoad? = null
     @Volatile private var periodicChildHeartbeatExpected = false
+    @Volatile private var hopLink: HopLink? = null
+    @Volatile private var targetStreamKbps = 0
 
     /**
      * What [noteStreamPhyLoss] needs once the link is gone. Created when the GATT link opens (the peer is then known only by
@@ -186,6 +190,8 @@ class BluetoothVideoSender(
         selectedRotatingRequest: DiscoveryAnnouncement? = null,
         /** Experimental audio-only live stream: no video codec, header BTL1, every record signed by the source. */
         audioLiveConfig: AudioLiveSendConfig? = null,
+        /** Wider reach (A8): dials a Wi-Fi-only viewer; the returned streams replace the Bluetooth socket. */
+        wifiDial: (() -> WifiNativeConnection)? = null,
         onConnected: () -> Unit,
     ) {
         audioLive = audioLiveConfig
@@ -208,6 +214,12 @@ class BluetoothVideoSender(
         workerThread = thread(name = "BluetoothConnect") {
             try {
                 val identity = AndroidNodeIdentityStore().getOrCreate()
+                val wifi = wifiDial?.invoke()
+                wifiConnection = wifi
+                if (wifi != null && ending.get()) {
+                    runCatching { wifi.close() }
+                    return@thread
+                }
                 val capabilities = LocalNodeCapabilities.forTransport(transport)
                 var classicSession: SecureBluetoothSession? = null
                 // Adaptive PHY memory: 1M from the start for a hop peer remembered bad on 2M.
@@ -215,7 +227,11 @@ class BluetoothVideoSender(
                     ?.takeIf { transport != BluetoothTransportOption.CLASSIC_RFCOMM }
                     ?.let { AdaptivePhyMemory.phyFor(transport, it, phyPreference, "stream") }
                     ?: phyPreference
-                val connectedSocket = when (transport) {
+                // Experimental test_phy_direction_split: a peer remembered with one failing 2M direction starts split (GATT).
+                val linkSplit = expectedPeerNodeIdPrefix
+                    ?.takeIf { transport == BluetoothTransportOption.BLE_GATT && linkPhy == phyPreference }
+                    ?.let { AdaptivePhyMemory.splitFor(transport, AdaptivePhyMemory.prefixLabel(it), "stream") }
+                val connectedSocket = if (wifi != null) null else when (transport) {
                     BluetoothTransportOption.CLASSIC_RFCOMM -> {
                         val adapter = requireNotNull(context.getSystemService(BluetoothManager::class.java).adapter) {
                             "Bluetooth is unavailable"
@@ -239,6 +255,7 @@ class BluetoothVideoSender(
                                     BufferedOutputStream(candidateSocket.mediaOutputStream(), ioConfig.bufferBytes),
                                     identity,
                                     capabilities,
+                                    raiseTag = true,
                                 )
                             },
                             verify = { candidateSession ->
@@ -265,13 +282,17 @@ class BluetoothVideoSender(
                     BluetoothTransportOption.BLE_GATT -> null
                 }
                 socket = connectedSocket
-                onStatus("Connecting to ${device.name ?: device.address} over ${transport.shortLabel}…")
-                // CoC sockets come back connected (BleCocClient).
-                if (transport != BluetoothTransportOption.CLASSIC_RFCOMM && connectedSocket?.isConnected == false) {
-                    connectedSocket.connect()
-                }
-                if (transport == BluetoothTransportOption.BLE_L2CAP) {
-                    onStatus("Keeping the GATT control connection active for CoC link priority.")
+                if (wifi != null) {
+                    onStatus("Connecting over Wi-Fi…")
+                } else {
+                    onStatus("Connecting to ${device.name ?: device.address} over ${transport.shortLabel}…")
+                    // CoC sockets come back connected (BleCocClient).
+                    if (transport != BluetoothTransportOption.CLASSIC_RFCOMM && connectedSocket?.isConnected == false) {
+                        connectedSocket.connect()
+                    }
+                    if (transport == BluetoothTransportOption.BLE_L2CAP) {
+                        onStatus("Keeping the GATT control connection active for CoC link priority.")
+                    }
                 }
 
                 val gattPriority = DebugTunables.sourceGattPriority
@@ -284,7 +305,7 @@ class BluetoothVideoSender(
                 // peer is authenticated, so the memory is read by the authenticated node (a rotating advertised prefix cannot
                 // be looked up) and the hop handshake runs on 1M.
                 val deferPhy = DebugTunables.phyAfterAuth && transport == BluetoothTransportOption.BLE_GATT
-                val activeGattConnection = if (transport == BluetoothTransportOption.BLE_GATT) {
+                val activeGattConnection = if (wifi == null && transport == BluetoothTransportOption.BLE_GATT) {
                     GattVideoClient.open(
                         context,
                         device,
@@ -293,6 +314,7 @@ class BluetoothVideoSender(
                         onStatus,
                         deferPhy = deferPhy,
                         onPhyMove = ::skipBacklogAfterPhyMove,
+                        phySplit = linkSplit,
                         onWriteTiming = if (BuildConfig.DEBUG && debugGattWriteTiming) {
                             { summary -> android.util.Log.i("BluetoothVideo", summary) }
                         } else {
@@ -314,9 +336,9 @@ class BluetoothVideoSender(
                             ?.let(AdaptivePhyMemory::prefixLabel),
                     )
                 }
-                val rawInput = activeGattConnection?.inputStream ?: connectedSocket?.inputStream
+                val rawInput = wifi?.input ?: activeGattConnection?.inputStream ?: connectedSocket?.inputStream
                     ?: error("Bluetooth input is unavailable")
-                val rawOutput = activeGattConnection?.outputStream ?: connectedSocket?.mediaOutputStream()
+                val rawOutput = wifi?.output ?: activeGattConnection?.outputStream ?: connectedSocket?.mediaOutputStream()
                     ?: error("Bluetooth output is unavailable")
 
                 onStatus("Authenticating the ${transport.shortLabel} link…")
@@ -329,6 +351,7 @@ class BluetoothVideoSender(
                     BufferedOutputStream(rawOutput, ioConfig.bufferBytes),
                     identity,
                     linkCapabilities,
+                    raiseTag = true,
                 )
                 require(session.peerCapabilities.transportMask and transport.capabilityMask != 0) {
                     "Peer did not authenticate support for ${transport.shortLabel}"
@@ -366,7 +389,22 @@ class BluetoothVideoSender(
                     ) { "Peer identity changed between discovery and connection" }
                 }
                 secureSession = session
-                AdaptivePhyMemory.bind(device.address, transport, session.peerNodeId.shortLabel())
+                if (wifi == null) AdaptivePhyMemory.bind(device.address, transport, session.peerNodeId.shortLabel())
+                wifi?.admitted?.invoke()   // [AM 12] F-3: the BMH3/BMH2 handshake on these streams succeeded
+                val sendLoad = HopSendLoad { NodeLinkLoad.open(transport, LinkDirection.SEND) }
+                linkLoad = sendLoad
+                val hop = HopLink(
+                    role = HopCapsPlan.HopRole.STREAM_PARENT,
+                    session = session,
+                    closeRaw = ::closeRawLink,
+                    anyLocalSwitchOn = WifiSwitchHub::anyOn,
+                    log = WifiLog::emit,
+                    owner = sourceHopOwner(sendLoad),
+                    newAgent = ::newHopAgent,
+                    carrier0IsBluetooth = session.peerCapabilities.maxChildren <= 1 && wifi == null,
+                )
+                hopLink = hop
+                targetStreamKbps = settings.bitRate / 1_000
                 phyLossProbe?.let { probe ->
                     probe.node = session.peerNodeId.shortLabel()
                     probe.peerRelays = session.peerCapabilities.maxChildren > 0
@@ -386,6 +424,13 @@ class BluetoothVideoSender(
                 bleControlConnection?.requestPhyAfterConnect("stream")
 
                 onStatus("Authenticating the final video receiver…")
+                // SEC-B2: only the DEBUG manual relay may be a group hop (a peer cannot claim it to relay the handshake).
+                StreamHopPeerBinding.requireGroupAllowed(
+                    "source",
+                    rotatingSelection != null,
+                    session.peerCapabilities.maxChildren,
+                    "Peer identity changed between discovery and connection",
+                )
                 val groupSession = if (session.peerCapabilities.maxChildren > 1) {
                     require(audioLiveConfig == null) { "A group relay cannot take an audio-only stream" }
                     BroadcastGroupHandshake.initiate(
@@ -407,15 +452,23 @@ class BluetoothVideoSender(
                 val labelsOn = PeerLabelFeature.enabled
                 val contentSession = if (groupSession == null) {
                     EndToEndVideoHandshake.initiate(session, identity, PeerLabelFeature.advertise(capabilities, labelsOn)).also { endpoint ->
+                        // SEC-B2: the end-to-end peer is the link peer on every offer version and transport (the
+                        // v2 branch above checks only the link prefix), so a phone that dialled the viewer's request
+                        // cannot relay the viewer's handshake. Only the DEBUG manual relay is exempt.
+                        StreamHopPeerBinding.requireBound(
+                            "source",
+                            rotatingSelection != null,
+                            session.peerNodeId,
+                            endpoint.peerNodeId,
+                            session.peerCapabilities.maxChildren,
+                            "Peer identity changed between discovery and connection",
+                        )
                         require(audioLiveConfig != null || endpoint.peerCapabilities.decodeCodecMask and codec.capabilityMask != 0) {
                             "Final receiver cannot decode ${codec.displayName.substringBefore(" - ")}"
                         }
                         // Security review 2026-10-27 (item 14): a blocked person neither watches nor forwards this stream.
                         require(!PersonPolicy.blockedNode(endpoint.peerNodeId)) { "Viewer refused" }
                         endToEndSession = endpoint
-                        require(rotatingSelection == null || endpoint.peerNodeId == session.peerNodeId) {
-                            "Peer identity changed between discovery and connection"
-                        }
                     }
                 } else {
                     null
@@ -462,7 +515,7 @@ class BluetoothVideoSender(
                     )
                 }
                 val streamWriter = EndToEndStreamWriter(
-                    session.writer,
+                    hop.writer,
                     groupSession?.streamSealer ?: requireNotNull(contentSession).sealer,
                     identity.nodeId,
                     // An audio-only stream is always a mesh stream with one shared stream ID, so the source signs
@@ -485,7 +538,7 @@ class BluetoothVideoSender(
                             PeerLabelFeature.localStreamTitle,
                         ),
                     )
-                    LabelRecords.write(session.writer, contentSession.sealer, labels)
+                    LabelRecords.write(hop.writer, contentSession.sealer, labels)
                     android.util.Log.i("BluetoothVideo", "BENCHMARK peer_labels stream_tx: count=${labels.size} | peer=${contentSession.peerNodeId.shortLabel()}")
                 }
                 if (audioLiveConfig != null) {
@@ -498,7 +551,7 @@ class BluetoothVideoSender(
                         includeAudio,
                     )
                 }
-                session.writer.flush()
+                hop.writer.flush()
                 if (BuildConfig.DEBUG && corruptFirstVideoRecordForTest) {
                     (groupSession?.streamSealer ?: requireNotNull(contentSession).sealer)
                         .corruptNextRecordForTest()
@@ -515,7 +568,7 @@ class BluetoothVideoSender(
                     android.util.Log.i("BluetoothVideo", "BENCHMARK direct GATT heartbeat expect enabled childMaxChildren=${session.peerCapabilities.maxChildren}")
                 }
                 running.set(true)
-                startPeriodicFlusher(session, ioConfig.flushPolicy)
+                startPeriodicFlusher(hop, ioConfig.flushPolicy)
                 onStatus(
                     if (audioLiveConfig != null) {
                         "Connected over ${transport.shortLabel}. Starting an audio-only stream…"
@@ -535,9 +588,9 @@ class BluetoothVideoSender(
                     onStatus("Mesh stream $it uses serialized identity, sequence, and TTL.")
                 }
                 if (groupSession != null) {
-                    startGroupSourceControlReader(session, groupSession)
+                    startGroupSourceControlReader(hop, groupSession)
                 } else {
-                    startSourceControlReader(session, requireNotNull(contentSession))
+                    startSourceControlReader(session, hop, requireNotNull(contentSession))
                 }
                 streamConnectedAtMs = SystemClock.elapsedRealtime()
                 onConnected()
@@ -555,7 +608,7 @@ class BluetoothVideoSender(
                 var lastReportedShed = shedFramesTotal.get()
                 offeredWindowBytes.set(0L)
                 childDelivery = PeerDeliveryEstimate()
-                linkLoad = NodeLinkLoad.open(transport, LinkDirection.SEND)
+                sendLoad.start()
                 // Pace from the first write; the child's first arrival report replaces the seed.
                 LinkPacerSeed.seed(pacer, transport, session.peerNodeId.shortLabel())?.let { kbps ->
                     Log.i("BluetoothVideo", "Link pacer seeded at $kbps kbps until the child's first report (${transport.shortLabel})")
@@ -628,7 +681,7 @@ class BluetoothVideoSender(
                         flushPending.set(false)
                         bytesPendingFlush.set(0)
                         val flushStartedNs = System.nanoTime()
-                        session.writer.flush()
+                        hop.writer.flush()
                         flushLatency.recordNanos(System.nanoTime() - flushStartedNs)
                     }
                     if (packet.streamState == StreamLifecycleState.ENDED) {
@@ -759,6 +812,8 @@ class BluetoothVideoSender(
                 linkLoad?.close()
                 linkLoad = null
                 clearPackets()
+                hopLink?.close()
+                hopLink = null
                 closeSocket()
                 closeSecureSession()
                 closeBleControlConnection()
@@ -991,13 +1046,13 @@ class BluetoothVideoSender(
         timeoutHandler.postDelayed(forcedClose, ROUTE_WITHDRAWAL_ACK_TIMEOUT_MS)
         thread(name = "BluetoothCapacityWithdrawal") {
             try {
-                val session = secureSession
-                if (running.get() && session != null) {
-                    session.writer.write(
+                val hop = hopLink
+                if (running.get() && hop != null) {
+                    hop.sendHopControl(
                         SecureRecordType.ROUTE_CONTROL,
                         StreamRouteControlProtocol.encode(StreamRouteWithdrawal.LOCAL_CAPACITY),
                     )
-                    session.writer.flush()
+                    hop.writer.flush()
                     if (!routeWithdrawalAcknowledgement.await(
                             (deadlineNs - System.nanoTime()).coerceAtLeast(0L), TimeUnit.NANOSECONDS,
                         ) &&
@@ -1024,10 +1079,13 @@ class BluetoothVideoSender(
         running.set(false)
         clearPackets()
         workerThread?.interrupt()
+        hopLink?.close()
+        hopLink = null
         closeSocket()
         closeSecureSession()
         closeBleControlConnection()
         closeGattConnection()
+        runCatching { wifiConnection?.close?.invoke() }
         controlThread?.interrupt()
         controlThread = null
         flushThread?.interrupt()
@@ -1044,6 +1102,13 @@ class BluetoothVideoSender(
         }
     }
 
+    private fun closeRawLink() {
+        closeSocket()
+        closeBleControlConnection()
+        closeGattConnection()
+        runCatching { wifiConnection?.close?.invoke() }
+    }
+
     private fun closeBleControlConnection() {
         bleControlConnection?.close()
         bleControlConnection = null
@@ -1056,6 +1121,7 @@ class BluetoothVideoSender(
 
     private fun startSourceControlReader(
         session: SecureBluetoothSession,
+        hop: HopLink,
         contentSession: EndToEndVideoSession,
     ) {
         // Experimental test_relay_join_key_frame (off): a relay child's request after a calm gap is a likely downstream join.
@@ -1065,7 +1131,7 @@ class BluetoothVideoSender(
             try {
                 while (running.get()) {
                     when (EndToEndStreamProtocol.readSourceControl(
-                        session.reader,
+                        hop.reader,
                         contentSession.opener,
                         ::onPeerCapacityReport,
                     )) {
@@ -1158,8 +1224,11 @@ class BluetoothVideoSender(
         }
         val previous = peerMeasuredKbps
         peerMeasuredKbps = kbps
-        LinkCapacity.recordProbe(transport, kbps)
-        secureSession?.peerNodeId?.shortLabel()?.let { LinkCapacity.recordPeerLinkKbps(transport, it, kbps) }
+        val hop = hopLink
+        if (hop == null || learnsBluetoothCapacity(hop.acceptKind, hop.sendKind)) {
+            LinkCapacity.recordProbe(transport, kbps)
+            secureSession?.peerNodeId?.shortLabel()?.let { LinkCapacity.recordPeerLinkKbps(transport, it, kbps) }
+        }
         if (DebugTunables.linkPacing) pacer.setMeasuredLinkKbps(kbps)
         if (previous == 0 || kotlin.math.abs(kbps - previous) * 10 >= previous) {
             onStatus("Child measured this ${transport.shortLabel} link at $kbps kbps")
@@ -1167,13 +1236,13 @@ class BluetoothVideoSender(
     }
 
     private fun startGroupSourceControlReader(
-        session: SecureBluetoothSession,
+        hop: HopLink,
         groupSession: BroadcastGroupSourceSession,
     ) {
         controlThread = thread(name = "BluetoothGroupSourceControl") {
             try {
                 while (running.get()) {
-                    val record = session.reader.read()
+                    val record = hop.reader.read()
                     when (record.type) {
                         SecureRecordType.LINK_HEARTBEAT -> {
                             SecureLinkControlProtocol.requireHeartbeat(record)?.let(::onPeerCapacityReport)
@@ -1241,7 +1310,39 @@ class BluetoothVideoSender(
         }
     }
 
+    /** A7: what the hop's carrier switch reports back to this source. */
+    private fun sourceHopOwner(sendLoad: HopSendLoad): HopOwner = object : HopOwner {
+        override fun sendCarrierChanged(kind: CarrierKind) {
+            LinkChangeEvents.carrierChanged()
+            // This hop's own accounting object: after the worker closed it (any order), a late change reopens nothing.
+            sendLoad.onSendCarrier(kind)
+            val transport = linkTransport ?: return
+            LinkPacerSeed.seed(pacer, transport, secureSession?.peerNodeId?.shortLabel(), kind)
+        }
+
+        override fun localKeyframeNeeded() = onRemoteKeyFrameNeeded()
+
+        override fun peerKeyframeNeeded() = Unit
+
+        override fun reassertState() = Unit
+
+        override fun hopEnded(reason: String) {
+            if (running.compareAndSet(true, false)) {
+                onStatus("The child's link closed: $reason")
+                clearPackets()
+                workerThread?.interrupt()
+            }
+        }
+
+        override fun bluetoothBudgetKbps(): Int? =
+            linkTransport?.let { LinkCapacity.measuredLinkKbps(it, CarrierKind.BLUETOOTH) }
+
+        override fun targetKbps(): Int? = targetStreamKbps
+    }
+
     private fun closeSecureSession() {
+        hopLink?.close()
+        hopLink = null
         broadcastGroupSession?.close()
         broadcastGroupSession = null
         endToEndSession?.close()
@@ -1252,7 +1353,7 @@ class BluetoothVideoSender(
     }
 
     private fun startPeriodicFlusher(
-        session: SecureBluetoothSession,
+        hop: HopLink,
         policy: VideoFlushPolicy,
     ) {
         if (policy.periodicFlushMs <= 0) return
@@ -1267,7 +1368,7 @@ class BluetoothVideoSender(
                     if (!flushPending.compareAndSet(true, false)) continue
                     bytesPendingFlush.getAndSet(0)
                     val flushStartedNs = System.nanoTime()
-                    session.writer.flush()
+                    hop.writer.flush()
                     flushLatency.recordNanos(System.nanoTime() - flushStartedNs)
                 }
             } catch (interrupted: InterruptedException) {

@@ -233,6 +233,23 @@ class BenchmarkCheckpointTest(unittest.TestCase):
                 self.update(new_state, inventory_dir=self.root / "subset")
             self.assertEqual(before, self.ledger_path.read_bytes())
 
+    def save_moved_inventory(self, **inventory):
+        self.save("moved/inventory.json", {**self.inventory, **inventory})
+        self.save("moved/suite.json", {"cases": [self.case]})
+        self.save("moved/benchmark-bundle.json", {"suites": [{"path": str(self.root / "moved/suite.json")}]})
+        self.save("moved/input_requirements.json", {})
+
+    def test_a_required_phone_may_move_to_extension_phones(self):
+        self.save_moved_inventory(required_phones=["a"], extension_phones=["b"])
+        result = self.update(inventory_dir=self.root / "moved")
+        self.assertEqual("UPDATED", result["action"])
+        self.assertEqual(["a"], json.loads(self.ledger_path.read_text())["current_inventory"]["required_phones"])
+
+    def test_a_required_phone_cannot_leave_the_inventory(self):
+        self.save_moved_inventory(required_phones=["a"])
+        with self.assertRaisesRegex(ValueError, "cannot disappear"):
+            self.update(inventory_dir=self.root / "moved")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1192,18 +1192,6 @@
                         android:textAppearance="@style/TextAppearance.App.BodyLarge"
                         android:textColor="@color/text_secondary"
                         tools:text="Incoming video call" />
-
-                    <TextView
-                        android:id="@+id/callPartySubject"
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:layout_marginTop="12dp"
-                        android:gravity="center"
-                        android:maxLines="2"
-                        android:ellipsize="end"
-                        android:textColor="@android:color/white"
-                        android:textSize="16sp"
-                        android:visibility="gone" />
                 </LinearLayout>
 
                 <!-- Experimental voice calls: shown instead of the video area while no video flows either
@@ -1973,6 +1961,19 @@
 
                     </LinearLayout>
 
+                    <!-- The one home of the Wi-Fi switches (UI-W7): "Use Wi-Fi when it helps", with Wider reach and Wi-Fi Direct under it. -->
+                    <LinearLayout style="@style/Widget.App.SettingsCard" android:id="@+id/wifiCard">
+
+                    <LinearLayout
+                        android:id="@+id/wifiFeaturesContainer"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="vertical"
+                        android:divider="@drawable/settings_divider"
+                        android:showDividers="middle" />
+
+                    </LinearLayout>
+
                     <TextView
                         style="@style/Widget.App.SectionLabel"
                         android:text="@string/advanced_title" />
@@ -2522,6 +2523,32 @@
                                 android:src="@drawable/ic_chevron_right"
                                 app:tint="@color/text_secondary" />
                         </LinearLayout>
+
+                        <!-- The saved block list cannot be read (CallBlockingUi.refreshBlockListNote; design decision 2026-11-06). -->
+                        <LinearLayout
+                            android:id="@+id/blockedPeopleProblemRow"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:gravity="center_vertical"
+                            android:minHeight="56dp"
+                            android:orientation="horizontal"
+                            android:visibility="gone">
+
+                            <ImageView
+                                style="@style/Widget.App.RowIcon"
+                                android:src="@drawable/ic_warning" />
+
+                            <TextView
+                                style="@style/Widget.App.RowTitle"
+                                android:text="@string/block_list_unreadable_title" />
+
+                            <com.google.android.material.button.MaterialButton
+                                android:id="@+id/blockedPeopleResetButton"
+                                style="@style/Widget.App.Button.Text"
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:text="@string/blocked_people_reset_action" />
+                        </LinearLayout>
                     </LinearLayout>
 
                     </LinearLayout>
@@ -2530,162 +2557,8 @@
                     
                     <LinearLayout style="@style/Widget.App.SettingsCard">
 
-                    <LinearLayout
-                        android:id="@+id/privacyRowAdvanced"
-                        style="@style/Widget.App.Row"
-                        android:contentDescription="@string/settings_privacy_advanced_title">
-
-                        <ImageView
-                            style="@style/Widget.App.RowIcon"
-                            android:src="@drawable/ic_verified_user" />
-
-                        <TextView
-                            style="@style/Widget.App.RowTitle"
-                            android:importantForAccessibility="no"
-                            android:text="@string/settings_privacy_advanced_title" />
-
-                        <ImageView
-                            android:layout_width="24dp"
-                            android:layout_height="24dp"
-                            android:importantForAccessibility="no"
-                            android:src="@drawable/ic_chevron_right"
-                            app:tint="@color/text_secondary" />
-                    </LinearLayout>
-
-
-                    </LinearLayout>
-                    </LinearLayout>
-                </ScrollView>
-
-                <ScrollView
-                    android:id="@+id/settingsPagePrivacyAdvanced"
-                    android:layout_width="match_parent"
-                    android:layout_height="match_parent"
-                    android:fillViewport="true"
-                    android:visibility="gone"
-                    android:scrollbars="none">
-
-                    <LinearLayout
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:orientation="vertical"
-                        android:paddingStart="@dimen/screen_gutter"
-                        android:paddingTop="8dp"
-                        android:paddingEnd="@dimen/screen_gutter"
-                        android:paddingBottom="32dp">
-
-                    <LinearLayout style="@style/Widget.App.SettingsCard">
-
-                    <LinearLayout
-                        android:id="@+id/privacyFeaturesContainer"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:orientation="vertical"
-                        android:divider="@drawable/settings_divider"
-                        android:showDividers="middle" />
-
                     <!-- Messaging v2 (phase 1c): Read receipts, Download files automatically (shown with the feature on). -->
                     <include layout="@layout/view_mv2_privacy_rows" />
-
-                    <!-- Naming v2: friendly names, public stream title, name before answer (NamingFeatures.settingsRows). -->
-                    <LinearLayout
-                        android:id="@+id/namingFeaturesContainer"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:orientation="vertical"
-                        android:divider="@drawable/settings_divider"
-                        android:showDividers="middle" />
-
-                    <!-- Visible by name (only while that switch is on): start or stop the ten-minute window. -->
-                    <LinearLayout
-                        android:id="@+id/visibleByNameButton"
-                        style="@style/Widget.App.Row"
-                        android:visibility="gone"
-                        android:contentDescription="@string/visible_name_row">
-
-                        <com.example.bluetoothtest.TitleValueLayout
-                            android:layout_width="0dp"
-                            android:layout_height="wrap_content"
-                            android:layout_weight="1">
-
-                            <TextView
-                                style="@style/Widget.App.RowTitle"
-                                android:importantForAccessibility="no"
-                                android:text="@string/visible_name_row" />
-
-                            <TextView
-                                android:id="@+id/visibleByNameValue"
-                                android:layout_width="wrap_content"
-                                android:layout_height="wrap_content"
-                                android:layout_marginEnd="4dp"
-                                android:importantForAccessibility="no"
-                                android:textAppearance="@style/TextAppearance.App.Body"
-                                />
-                        </com.example.bluetoothtest.TitleValueLayout>
-
-                        <ImageView
-                            android:layout_width="24dp"
-                            android:layout_height="24dp"
-                            android:importantForAccessibility="no"
-                            android:src="@drawable/ic_chevron_right"
-                            app:tint="@color/text_secondary" />
-                    </LinearLayout>
-
-                    <LinearLayout
-                        android:id="@+id/experimentalRotatingIdsSwitchRow"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:gravity="center_vertical"
-                        android:orientation="horizontal">
-
-                        <ImageView
-                            style="@style/Widget.App.RowIcon"
-                            android:src="@drawable/ic_refresh" />
-                        <LinearLayout
-                            android:layout_width="0dp"
-                            android:layout_height="wrap_content"
-                            android:layout_weight="1"
-                            android:gravity="center_vertical"
-                            android:orientation="horizontal">
-                            <com.example.bluetoothtest.InfoLabelView
-                                android:id="@+id/experimentalRotatingIdsSwitchInfo"
-                                android:layout_width="wrap_content"
-                                android:layout_height="wrap_content"
-                                android:minHeight="56dp"
-                                android:gravity="center_vertical"
-                                android:background="?attr/selectableItemBackground"
-                                android:textAppearance="@style/TextAppearance.App.RowLabel"
-                                android:text="@string/experimental_rotating_ids"
-                                android:paddingTop="16dp"
-                                android:paddingBottom="16dp"/>
-                        </LinearLayout>
-                        <com.google.android.material.materialswitch.MaterialSwitch
-                            android:id="@+id/experimentalRotatingIdsSwitch"
-                            android:layout_width="wrap_content"
-                            android:layout_height="wrap_content"
-                            android:contentDescription="@string/experimental_rotating_ids"
-                            android:minHeight="56dp" />
-
-                    </LinearLayout>
-
-                    <TextView
-                        android:id="@+id/experimentalRotatingIdsDescriptionText"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:textAppearance="@style/TextAppearance.App.Body"
-                        android:visibility="gone"
-                        android:text="@string/experimental_rotating_ids_description"
-                        />
-
-                    <com.google.android.material.button.MaterialButton
-                        android:id="@+id/rotatingIdsVisibleButton"
-                        app:icon="@drawable/ic_visibility"
-                        app:iconTint="@color/text_secondary"
-                        app:iconPadding="16dp"
-                        style="@style/Widget.App.Button.Row"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:text="@string/rotating_ids_visible_button" />
 
                     <com.google.android.material.button.MaterialButton
                         android:id="@+id/rotatingIdsResetKeyButton"
@@ -2707,7 +2580,6 @@
                         />
 
                     </LinearLayout>
-
                     </LinearLayout>
                 </ScrollView>
 
@@ -2805,7 +2677,8 @@
                         android:paddingEnd="@dimen/screen_gutter"
                         android:paddingBottom="32dp">
 
-                    <LinearLayout style="@style/Widget.App.SettingsCard" android:showDividers="none">
+                    <!-- Developer rows (UI-W7): the whole card is shown in DEBUG builds, and in a release build only when a non-default transport is stored (so it can be changed back); the summaries are DEBUG only. -->
+                    <LinearLayout style="@style/Widget.App.SettingsCard" android:id="@+id/connectionTransportCard" android:showDividers="none">
 
                     <TextView
                         style="@style/Widget.App.FieldLabel"
@@ -2848,6 +2721,12 @@
                             android:text="@string/refresh_devices" />
                     </LinearLayout>
 
+                    <LinearLayout
+                        android:id="@+id/connectionSummaries"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="vertical">
+
                     <TextView
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
@@ -2882,6 +2761,8 @@
                         android:textAppearance="@style/TextAppearance.App.Body"
                         android:text="Automatic device-compatible call profile"
                         />
+
+                    </LinearLayout>
 
                     </LinearLayout>
 
@@ -3273,6 +3154,60 @@
                         android:orientation="vertical"
                         android:divider="@drawable/settings_divider"
                         android:showDividers="middle" />
+
+                    <!-- Naming v2: "Visible by name" (experimental, NamingFeatures.settingsRows) and its ten-minute window. -->
+                    <LinearLayout
+                        android:id="@+id/namingFeaturesContainer"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="vertical"
+                        android:divider="@drawable/settings_divider"
+                        android:showDividers="middle" />
+
+                    <!-- Visible by name (only while that switch is on): start or stop the ten-minute window. -->
+                    <LinearLayout
+                        android:id="@+id/visibleByNameButton"
+                        style="@style/Widget.App.Row"
+                        android:visibility="gone"
+                        android:contentDescription="@string/visible_name_row">
+
+                        <com.example.bluetoothtest.TitleValueLayout
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1">
+
+                            <TextView
+                                style="@style/Widget.App.RowTitle"
+                                android:importantForAccessibility="no"
+                                android:text="@string/visible_name_row" />
+
+                            <TextView
+                                android:id="@+id/visibleByNameValue"
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:layout_marginEnd="4dp"
+                                android:importantForAccessibility="no"
+                                android:textAppearance="@style/TextAppearance.App.Body"
+                                />
+                        </com.example.bluetoothtest.TitleValueLayout>
+
+                        <ImageView
+                            android:layout_width="24dp"
+                            android:layout_height="24dp"
+                            android:importantForAccessibility="no"
+                            android:src="@drawable/ic_chevron_right"
+                            app:tint="@color/text_secondary" />
+                    </LinearLayout>
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/rotatingIdsVisibleButton"
+                        app:icon="@drawable/ic_visibility"
+                        app:iconTint="@color/text_secondary"
+                        app:iconPadding="16dp"
+                        style="@style/Widget.App.Button.Row"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="@string/rotating_ids_visible_button" />
 
                     <LinearLayout
                         android:id="@+id/experimentalTemporalLayersSwitchRow"

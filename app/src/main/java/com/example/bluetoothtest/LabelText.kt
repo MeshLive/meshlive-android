@@ -4,17 +4,23 @@ import java.text.Normalizer
 import java.util.Locale
 
 /**
- * Text rules for peer labels (names, stream titles, call subjects), naming design 3.2 with review
+ * Text rules for peer labels (names and stream titles), naming design 3.2 with review
  * fixes R6/R7. One function for the sender ([normalize]) and the receiver ([isCanonical]): a
  * received label is shown only when it is already in the form [normalize] would produce.
  */
 internal enum class LabelKind(val wireValue: Int, val maxBytes: Int) {
     PERSON_NAME(1, 32),
     STREAM_TITLE(2, 48),
-    CALL_SUBJECT(3, 64),
     ;
 
     companion object {
+        /**
+         * Kind 3 was the call subject, retired 2026-11-05 (PROTOCOL "Peer labels"): never sent, never shown, never
+         * reused. An older build may still send one; [fromWire] returns null for it, so [LabelInbox] skips it silently
+         * like any unknown kind and the call goes on.
+         */
+        const val RETIRED_CALL_SUBJECT = 3
+
         fun fromWire(value: Int): LabelKind? = entries.firstOrNull { it.wireValue == value }
     }
 }

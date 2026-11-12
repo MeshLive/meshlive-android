@@ -296,6 +296,8 @@ def validate_adapter(entry, manifest, manifest_path, base):
     if source not in senders or source == device and kind in {"visual_markers", "audio_sync", "screen_geometry", "physical_av"}:
         raise ValueError("Measurement source/direction is not an executed media path")
     profile = scenario["profiles"][source] if "profiles" in scenario else scenario["profile"]
+    if profile.get("profile_source") == "app_default" and kind == "visual_markers":
+        raise ValueError("Marker reference needs a declared native profile; an app_default endpoint declares none")
     spec_path, spec_record = record(entry["spec"], base)
     spec = json.loads(spec_path.read_text(encoding="utf-8-sig"))
     if not isinstance(spec, dict):

@@ -36,20 +36,47 @@ internal object ComposerAction {
     fun forText(text: CharSequence?): Action = if (text?.isNotBlank() == true) Action.SEND else Action.VOICE
 }
 
-/** Muted chats (a local list in app preferences): a muted chat keeps its unread count but posts no notification. */
+/**
+ * Muted chats: a muted chat keeps its unread count but posts no notification. The list holds the node IDs of those chats,
+ * so it is sealed at rest ([SealedRecords], verified-contacts Keystore key). Audit 2026-11-10 (docs truth pass, beside
+ * SEC-05): earlier builds kept it in the plain `chat_mute` preferences; it is moved once and that file is deleted.
+ */
 internal object ChatMute {
     private const val PREFS = "chat_mute"
     private const val KEY = "muted"
+    internal const val FILE = "chat-mute.bin"
 
-    fun isMuted(context: Context, peerHex: String): Boolean =
-        peerHex.lowercase() in context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getStringSet(KEY, emptySet()).orEmpty()
+    /** Explicit choices: never evicted (review of 040a8c2e, finding 2). */
+    private val store = SealedRecordsSlot(FILE, maxEntries = null) { app -> plainList(app) }
 
-    fun setMuted(context: Context, peerHex: String, muted: Boolean) {
-        val prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val next = toggled(prefs.getStringSet(KEY, emptySet()).orEmpty(), peerHex, muted)
-        prefs.edit().putStringSet(KEY, next).apply()
+    /** Opens the list at process start, so an earlier build's plain copy is moved even if Chats is off. */
+    fun open(context: Context) {
+        store.get(context)
     }
 
-    fun toggled(current: Set<String>, peerHex: String, muted: Boolean): Set<String> =
-        if (muted) current + peerHex.lowercase() else current - peerHex.lowercase()
+    /** The plain list of an earlier build: deleted once the sealed copy is on the disk, confirmed gone from the disk. */
+    private fun plainList(app: Context) = object : LegacyPlain {
+        override fun read(): Map<String, SealedRecords.Record> {
+            val now = System.currentTimeMillis()
+            return app.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getStringSet(KEY, emptySet()).orEmpty()
+                .associate { it.lowercase() to SealedRecords.Record("", now) }
+        }
+
+        override fun clean() = PlainPreferences.deleteFile(app, PREFS)
+
+        override val cache = false
+    }
+
+    /** False until the sealed list is read; a notification waits for it ([whenLoaded], re-review S3). */
+    fun isLoaded(context: Context): Boolean = store.get(context).isLoaded()
+
+    /** Runs [action] once the list is read (at once if it is; else on the sealed-memory worker). */
+    fun whenLoaded(context: Context, action: () -> Unit) = store.get(context).whenLoaded(action)
+
+    fun isMuted(context: Context, peerHex: String): Boolean = store.get(context).get(peerHex.lowercase()) != null
+
+    fun setMuted(context: Context, peerHex: String, muted: Boolean) {
+        val sealed = store.get(context)
+        if (muted) sealed.put(peerHex.lowercase(), "") else sealed.remove(listOf(peerHex.lowercase()))
+    }
 }

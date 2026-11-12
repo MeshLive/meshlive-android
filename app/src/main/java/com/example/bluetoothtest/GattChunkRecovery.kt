@@ -240,7 +240,7 @@ internal class RollingBytes(windowNs: Long = 1_000_000_000L, private val buckets
  * idle. A NACK cannot preempt a data value already handed to the stack (an outstanding acknowledged write finishes first).
  */
 internal class GattChunkRecovery(
-    private val link: String,
+    val link: String,
     private val nanoTime: () -> Long = System::nanoTime,
     private val log: (String) -> Unit = { line -> Log.i("BluetoothVideo", "BENCHMARK gatt_recovery: $line") },
     private val startThread: Boolean = true,

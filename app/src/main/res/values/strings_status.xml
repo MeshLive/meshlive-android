@@ -27,6 +27,7 @@
     <!-- Watching -->
     <string name="watch_rejoining">Found another way to reach the stream. Reconnecting…</string>
     <string name="watch_connection_lost">Connection lost. Looking for the stream again…</string>
+    <string name="watch_stream_lost">The stream was lost. Showing nearby broadcasts.</string>
     <string name="watch_cannot_play">This phone can\'t play this stream.</string>
     <string name="watch_stream_full">This stream is full right now. It shows as available when there\'s room.</string>
     <string name="watch_joining">Joining %1$s…</string>

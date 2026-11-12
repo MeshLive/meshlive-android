@@ -15,9 +15,10 @@ import java.io.OutputStream
 internal fun BluetoothSocket.mediaOutputStream(forwarding: Boolean = false): OutputStream {
     if (connectionType != BluetoothSocket.TYPE_L2CAP) return outputStream
     // Central links whose control connection is open are measured for the adaptive PHY (AdaptivePhy).
-    val socketOutput = AdaptivePhyRegistry.forAddress(runCatching { remoteDevice?.address }.getOrNull())
-        ?.let { AdaptivePhyOutputStream(outputStream, it) }
-        ?: outputStream
+    val socketOutput = CocPrimeGates.takeIf { CocSwitches.primeAsync }?.pending(this)
+        // Experimental test_coc_prime_async: the prime and reattach still run; bulk writes wait for them (bounded).
+        ?.let { gate -> PrimeGatedOutputStream(gate, outputStream) { measuredOutputStream() } }
+        ?: measuredOutputStream()
     val maxTransmit = runCatching { maxTransmitPacketSize }.getOrDefault(0)
     val maxReceive = runCatching { maxReceivePacketSize }.getOrDefault(0)
     val coalesce = CocSduCoalescing.effective()
@@ -32,6 +33,11 @@ internal fun BluetoothSocket.mediaOutputStream(forwarding: Boolean = false): Out
     chunk ?: return socketOutput
     return CocSduOutputStream(socketOutput, chunk, maxTransmit, maxReceive)
 }
+
+private fun BluetoothSocket.measuredOutputStream(): OutputStream =
+    AdaptivePhyRegistry.forAddress(runCatching { remoteDevice?.address }.getOrNull())
+        ?.let { AdaptivePhyOutputStream(outputStream, it) }
+        ?: outputStream
 
 /**
  * Largest SDU this phone writes. Each write on the SEQPACKET CoC socket is one SDU (AOSP

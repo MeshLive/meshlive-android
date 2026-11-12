@@ -21,7 +21,6 @@ import javax.crypto.spec.SecretKeySpec
  */
 object RotatingDiscoveryFeature {
     const val EXTRA = "test_rotating_ids"
-    const val PREF = "experimental_rotating_ids"
 
     /**
      * The one default constant (SWITCHES register "Rotating discovery IDs"): what a user launch without a stored choice
@@ -31,13 +30,14 @@ object RotatingDiscoveryFeature {
     const val DEFAULT_ENABLED = true
 
     /**
-     * Resolved by the shared rule ([FeatureCatalog.resolve]). The stored choice is honoured with or without the Advanced
-     * settings view, so leaving Advanced after turning the feature off does not turn it back on. Its switch is the Advanced
-     * privacy row (not a generated row); `bmh3_pseudonyms` and `find_pcs` depend on it.
+     * Resolved by the shared rule ([FeatureCatalog.resolve]) as a constant: no Settings switch since 2026-11-04 (owner
+     * decision), and the "off" that 0.4.4 and older stored under `experimental_rotating_ids` is ignored, because a phone
+     * with it off could not find phones that had it on (release 0.4.4, two phones: "No one found yet" while the other phone
+     * listed it). `bmh3_pseudonyms` and `find_pcs` depend on it; the DEBUG benchmark arm [EXTRA] stays.
      */
     val spec = FeatureSpec(
         id = "rotating_ids",
-        prefKey = PREF,
+        prefKey = null,
         defaultEnabled = DEFAULT_ENABLED,
         benchmarkExtra = EXTRA,
         group = ConnectivityFeatures.GROUP,

@@ -429,16 +429,25 @@ internal object DevicePolicyRegistry {
             id = "qcom-legacy-call-relay-gatt-acknowledged-writes",
             area = PolicyArea.BLUETOOTH_TRANSPORT,
             validation = PolicyValidation.EXPERIMENTAL,
-            title = "Legacy Qualcomm call-relay GATT writes with response",
+            title = "Legacy Qualcomm call-relay GATT writes with response (Experimental arm: applied only with test_relay_gatt_acknowledged_writes=true)",
             matcher = QCOM_LEGACY_FAMILY,
             effects = listOf(CallRelayAcknowledgedGattWrites),
-            behaviour = "The hidden one-hop call relay opens its downstream GATT link with acknowledged writes paced at 24 KB/s.",
+            behaviour = "Only with the Experimental arm test_relay_gatt_acknowledged_writes=true (DEBUG): the hidden one-hop " +
+                "call relay opens its downstream GATT link with acknowledged writes paced at 24 KB/s. Off by default: the " +
+                "relay writes without response, as on every other phone.",
             sources = emptyList(),
             sourceStatus = EVIDENCE_ONLY,
-            evidence = listOf("none located: the rule predates the git history and no retained run has a legacy-Qualcomm call relay"),
+            evidence = listOf(
+                "none located for the rule itself: it predates the git history and no retained run before 2026-11-10 has a legacy-Qualcomm call relay",
+                "benchmarks/runs/l2q27ab-20261110g: relayed calls S22 -> ASUS -> A15s, interleaved A/B on one build; rule on (control) 0 of 3 calls held 60 s, " +
+                    "each with the A15s dropping write responses (\"Sending response failed\"), \"GATT video write timed out\", 25-43 records forwarded, relay closed at 18-26 s; " +
+                    "rule off (test_device_policy_off) 2 of 3 held 60 s with 4023-4034 records forwarded and none of those symptoms, the third failed on the other hop " +
+                    "(S22-ASUS notification status 129); ASUS -> S22 -> A15s (S22 relays, rule does not match) held 2 of 2",
+            ),
             confidence = LOW,
             reviewed = REVIEWED,
             origin = "BluetoothPrivateCallRelay: legacyQualcommGattCallFlushIntervalMs(...) > 0 as acknowledgedWrites",
+            arm = PolicyArm("test_relay_gatt_acknowledged_writes=true") { GattSwitches.relayAcknowledgedWrites },
         ),
         DevicePolicyEntry(
             id = "qcom-msmnile-classic-source-balanced-scan",
@@ -881,6 +890,7 @@ internal object DevicePolicyRegistry {
         CameraPolicy.entries,
         AdvertisingPolicy.entries,
         PhyLinkPolicy.entries,
+        WifiFamilyPolicy.entries,
         // Batch plug-in point (append one line per batch). Not listed here because an area already
         // concatenates them: GattLinkPolicy (inside BluetoothTransportPolicy), DecoderPolicyEntries
         // (inside CodecPolicy), BackgroundOem (inside BackgroundPolicy), ThermalFamilyEntries (inside MemoryThermalPolicy).

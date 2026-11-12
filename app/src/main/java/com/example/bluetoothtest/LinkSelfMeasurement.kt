@@ -653,7 +653,14 @@ internal object LinkPacerSeed {
     fun kbps(transport: BluetoothTransportOption, probeKbps: Int?, le2MPhy: Boolean?, peerLinkKbps: Int? = null): Int =
         peerLinkKbps?.takeIf { it > 0 } ?: probeKbps?.takeIf { it > 0 } ?: priorKbps(transport, le2MPhy)
 
-    fun seed(pacer: LinkPacer, transport: BluetoothTransportOption, peer: String? = null): Int? {
+    fun seed(
+        pacer: LinkPacer,
+        transport: BluetoothTransportOption,
+        peer: String? = null,
+        /** A Wi-Fi carrier is not paced: it has no Bluetooth airtime to conserve. */
+        carrier: CarrierKind = CarrierKind.BLUETOOTH,
+    ): Int? {
+        if (carrier.isWifi) return null
         if (!DebugTunables.linkPacing || !DebugTunables.linkPacerSeed) return null
         val peerKbps = peer?.takeIf { DebugTunables.experimentalPeerLinkSeed }
             ?.let { LinkCapacity.peerLinkKbps(transport, it) }

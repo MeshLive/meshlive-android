@@ -229,4 +229,43 @@ class AdaptivePhyMemoryTest {
             AdaptivePhyMemory.relayedCallViaKeys(keys),
         )
     }
+
+    @Test
+    fun aSlowAuthenticated2mHopSetupPastTheArmIsTreatedAsAStall() {
+        // AP7 F2: q14/hb late-but-successful 2M setups (789, 1115, 2267, 2359 ms) released the 3 s guard and died later.
+        assertTrue(slowAuthStall(thresholdMs = 500, hopAuthMs = 500, onTwoM = true))
+        assertTrue(slowAuthStall(thresholdMs = 500, hopAuthMs = 501, onTwoM = true))
+        assertTrue(slowAuthStall(thresholdMs = 500, hopAuthMs = 2_359, onTwoM = true))
+        assertFalse(slowAuthStall(thresholdMs = 500, hopAuthMs = 499, onTwoM = true))
+    }
+
+    @Test
+    fun theSlowAuthArmIsOffAtZeroAndNeverOnOneM() {
+        assertFalse(slowAuthStall(thresholdMs = 0, hopAuthMs = 60_000, onTwoM = true))
+        assertFalse(slowAuthStall(thresholdMs = 500, hopAuthMs = 60_000, onTwoM = false))
+    }
+
+    @Test
+    fun theSlowAuthArmStaysBelowTheExistingSetupGuard() {
+        // At or above the 3 s arm the existing guard claims the attempt first; the switch can never pre-empt it.
+        assertTrue(500L < AdaptivePhyMemory.SETUP_STALL_MS)
+        assertTrue(AdaptivePhyMemory.SETUP_STALL_MS >= 2 * 1_050L)
+    }
+
+    @Test
+    fun theSlowAuthArmIsOffAtZeroDebugOnlyAndClampedToTheExistingGuard() {
+        DebugTunables.stallSlowAuthMs = 500L
+        if (!BuildConfig.DEBUG) {
+            // A release build ignores the launch extra: the experiment stays off.
+            assertEquals(0L, DebugTunables.stallSlowAuthMs)
+            return
+        }
+        assertEquals(500L, DebugTunables.stallSlowAuthMs)
+        DebugTunables.stallSlowAuthMs = 10_000L
+        assertEquals(AdaptivePhyMemory.SETUP_STALL_MS, DebugTunables.stallSlowAuthMs)
+        DebugTunables.stallSlowAuthMs = -1L
+        assertEquals(0L, DebugTunables.stallSlowAuthMs)
+        DebugTunables.stallSlowAuthMs = 0L
+        assertEquals(0L, DebugTunables.stallSlowAuthMs)
+    }
 }

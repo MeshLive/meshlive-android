@@ -33,13 +33,16 @@ USER_THRESHOLDS = {
     "version": V4,
     "max_stall_ms_call": 500,
     "max_stall_ms_stream": 1000,
+    # Q-STARTUP-GATE (owner, 2026-11-06): the 3 s join gate measures selection-to-first-surface; launch-to-first-surface
+    # (cold start plus browsing, about 5 s) is a reported non-gating metric. device-run-v3 keeps the launch basis.
+    "join_gate_basis": "selection",
     "max_frozen_time_share_percent": 1.0,
     # Cadence (Q6, 2026-10-14): a clean report interval is "below" when its visible FPS is under this fraction of the
     # FPS in force; the gate passes when the below intervals are at most the share of scored time. The slowest-window
     # rule (every interval at or above the fraction) stays computable as the labelled legacy comparison field.
     "effective_fps_fraction": 0.95,
     "effective_fps_below_share_percent": 5.0,
-    # Provisional (root, 2026-10-09), matching the bounded media-age experiment's budgets; revisit
+    # Provisional (2026-10-09), matching the bounded media-age experiment's budgets; revisit
     # with A/B and acoustic evidence (DECISIONS "Product direction").
     "max_media_age_p95_ms_call": 400,
     "max_media_age_p95_ms_stream": 2000,

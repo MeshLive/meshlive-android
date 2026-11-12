@@ -36,7 +36,18 @@ class Bmh3InitiatorOptions(
     val strangerIdentity: SigningIdentity? = null,
     /** One log line per handshake, no identifiers (see [Bmh3Log]). */
     val log: (String) -> Unit = {},
-)
+    /**
+     * Wi-Fi upgrade: sign the `WIFI` build marker in this initiator's LINK block. Default false (the bytes of every
+     * handshake are unchanged). Set by [Bmh3AttemptPlan] (step 4) and by the relay-duty call sites through
+     * [Bmh3Wiring.initiator] / [Bmh3Wiring.relayHop] (package A7), never for an end-to-end handshake. [R M-3]
+     */
+    val wifiMarker: Boolean = false,
+) {
+    /** The same options with the marker set as asked; every other field is shared. */
+    fun withWifiMarker(on: Boolean): Bmh3InitiatorOptions = if (on == wifiMarker) this else Bmh3InitiatorOptions(
+        contactTag, checkResponder, entropy, identityOverride, strangerIdentity, log, on,
+    )
+}
 
 /** What a responder needs besides its identity. */
 class Bmh3ResponderOptions(
@@ -160,6 +171,7 @@ internal object Bmh3Driver {
         val config = Bmh3Config(
             purpose, identity, capabilities, options.entropy, buildTag,
             stranger = options.strangerIdentity?.let { Bmh3Presentation.stranger(it, capabilities, purpose, responder = false) },
+            wifiMarker = options.wifiMarker && purpose == Bmh3Purpose.LINK,
         )
         val expected = options.contactTag?.expectedPeer
         val initiator = Bmh3Initiator(
@@ -258,7 +270,7 @@ internal object Bmh3LinkHandshake {
             layer = "link",
             buildTag = buildTag,
         )
-        return session(input, output, result, initiator = true)
+        return session(input, output, result, initiator = true, ownWifiMarker = options.wifiMarker)
     }
 
     fun respond(
@@ -280,10 +292,10 @@ internal object Bmh3LinkHandshake {
             layer = "link",
             buildTag = buildTag,
         )
-        return session(input, output, result, initiator = false)
+        return session(input, output, result, initiator = false, ownWifiMarker = false)
     }
 
-    private fun session(input: InputStream, output: OutputStream, result: Bmh3Result, initiator: Boolean): SecureBluetoothSession {
+    private fun session(input: InputStream, output: OutputStream, result: Bmh3Result, initiator: Boolean, ownWifiMarker: Boolean): SecureBluetoothSession {
         // As in BMH2 (SecureBluetoothHandshake.session): the tag reaches the notice only from a link THIS phone opened,
         // and bit 7 never reaches the rest of the app. Here the tag came from the peer's encrypted, signed block.
         val tag = result.peer.buildTag
@@ -299,8 +311,12 @@ internal object Bmh3LinkHandshake {
             peerBuildTag = tag,
             peerPseudonymous = result.peer.pseudonymous,
             ownPseudonymous = result.ownPseudonymous,
+            ownPseudonymNodeId = result.ownSpki.takeIf { result.ownPseudonymous && it.isNotEmpty() }?.let(NodeId::fromPublicKey),
             qrTagMatched = result.qrTagMatched,
             peerRelaySeek = result.peer.relaySeek,
+            ownWifiMarker = ownWifiMarker,
+            peerWifiMarker = result.peer.wifiMarker,
+            hopWifiKey = WifiHopPlumbing.hopUwOrNull(result.sendKey, result.receiveKey),
         ).also { result.wipe() }
     }
 }
@@ -414,6 +430,9 @@ internal object Bmh3EndpointHandshake {
             } else {
                 null
             },
+            // Wi-Fi upgrade: derived here because the exporter is wiped on the next line; always derived (kept for the call,
+            // zeroed at call end and by the emergency wipe). [R M-5][API]
+            wifiKey = WifiHopPlumbing.callUwOrNull(result.exporter),
         ).also { result.wipe() }
     }
 }

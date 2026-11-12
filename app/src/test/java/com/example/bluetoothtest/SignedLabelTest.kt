@@ -26,9 +26,16 @@ class SignedLabelTest {
         error.reason
     }
 
+    /** A kind 3 call subject exactly as an older build (before 2026-11-05) signs it. */
+    private fun olderBuildSubject(identity: SigningIdentity, binding: LabelBinding, text: String): ByteArray {
+        val unsigned = SignedLabelCodec.signedPart(LabelKind.RETIRED_CALL_SUBJECT, identity.publicKeyEncoded, 0, binding, text)
+        val signature = identity.sign(SignedLabelCodec.DOMAIN + unsigned)
+        return unsigned + byteArrayOf((signature.size shr 8).toByte(), signature.size.toByte()) + signature
+    }
+
     @Test
     fun signedPartMatchesTheProtocolVector() {
-        // PROTOCOL "Experimental peer labels" vector: kind 3, SPKI 30 01, sequence 0, call binding, "Hi".
+        // PROTOCOL "Experimental peer labels" vector: kind 3 (the retired call subject), SPKI 30 01, sequence 0, call binding, "Hi".
         val unsigned = SignedLabelCodec.signedPart(3, byteArrayOf(0x30, 0x01), 0, LabelBinding.call(callId), "Hi")
         assertEquals(
             "424e4c31" + "01" + "03" + "0002" + "3001" + "00000000" + "01" +
@@ -44,14 +51,15 @@ class SignedLabelTest {
 
     @Test
     fun roundTripVerifiesSignerBindingAndText() {
-        val encoded = SignedLabelCodec.sign(alice, LabelKind.CALL_SUBJECT, LabelBinding.call(callId), "Water at the school")
+        val encoded = SignedLabelCodec.sign(alice, LabelKind.STREAM_TITLE, LabelBinding.call(callId), "Water at the school")
         val label = SignedLabelCodec.decode(encoded)
-        assertEquals(LabelKind.CALL_SUBJECT, SignedLabelCodec.verify(label, alice.nodeId, LabelBinding.call(callId)))
+        assertEquals(LabelKind.STREAM_TITLE, SignedLabelCodec.verify(label, alice.nodeId, LabelBinding.call(callId)))
         assertEquals("Water at the school", label.text)
         assertArrayEquals(encoded, label.encoded)
-        // At most 259 bytes with a 91-byte P-256 SPKI and a 64-byte text (design C.2).
-        val longest = SignedLabelCodec.sign(alice, LabelKind.CALL_SUBJECT, LabelBinding.call(callId), "a".repeat(64))
+        // At most 259 bytes with a 91-byte P-256 SPKI and a 64-byte text (design C.2), which an older build's subject can be.
+        val longest = olderBuildSubject(alice, LabelBinding.call(callId), "a".repeat(64))
         assertTrue(longest.size <= 259)
+        assertEquals("a".repeat(64), SignedLabelCodec.decode(longest).text)
     }
 
     @Test
@@ -124,9 +132,32 @@ class SignedLabelTest {
         val name = SignedLabelCodec.encodeContainer(listOf(SignedLabelCodec.sign(alice, LabelKind.PERSON_NAME, binding, "Asha")))
         assertEquals(1, inbox.accept(name, alice.nodeId, binding, "test").size)
         now += 500
-        val subject = SignedLabelCodec.encodeContainer(listOf(SignedLabelCodec.sign(alice, LabelKind.CALL_SUBJECT, binding, "Hi")))
-        assertTrue(inbox.accept(subject, alice.nodeId, binding, "test").isEmpty()) // second within 2 s ignored
-        assertNull(inbox.text(LabelKind.CALL_SUBJECT))
+        val renamed = SignedLabelCodec.encodeContainer(listOf(SignedLabelCodec.sign(alice, LabelKind.PERSON_NAME, binding, "Ravi", 1)))
+        assertTrue(inbox.accept(renamed, alice.nodeId, binding, "test").isEmpty()) // second within 2 s ignored
+        assertEquals("Asha", inbox.text(LabelKind.PERSON_NAME))
+    }
+
+    @Test
+    fun aCallSubjectFromAnOlderBuildIsDroppedSilentlyAndTheCallsNameStillArrives() {
+        // Kind 3 was retired on 2026-11-05: an older build may still send its subject beside its name.
+        val binding = LabelBinding.call(callId)
+        val inbox = LabelInbox()
+        val container = SignedLabelCodec.encodeContainer(
+            listOf(
+                olderBuildSubject(alice, binding, "Water at the school"),
+                SignedLabelCodec.sign(alice, LabelKind.PERSON_NAME, binding, "Asha"),
+            ),
+        )
+        assertEquals(setOf(LabelKind.PERSON_NAME), inbox.accept(container, alice.nodeId, binding, "test"))
+        assertEquals("Asha", inbox.text(LabelKind.PERSON_NAME))
+        // Never shown, never kept for forwarding: only the name's bytes are held.
+        assertEquals(1, inbox.verifiedEncoded().size)
+        assertEquals(LabelKind.PERSON_NAME, SignedLabelCodec.decode(inbox.verifiedEncoded().single()).kind)
+        // A container holding only a subject changes nothing and is no error.
+        val later = LabelInbox()
+        val subjectOnly = SignedLabelCodec.encodeContainer(listOf(olderBuildSubject(alice, binding, "Hi")))
+        assertTrue(later.accept(subjectOnly, alice.nodeId, binding, "test").isEmpty())
+        assertTrue(later.verifiedEncoded().isEmpty())
     }
 
     @Test

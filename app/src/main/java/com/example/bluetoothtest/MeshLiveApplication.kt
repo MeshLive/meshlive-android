@@ -14,6 +14,22 @@ class MeshLiveApplication : Application() {
         runCatching { PersonPolicy.install(this) }
         // B2: hide the call-offer/viewer-request sets again as soon as the Bluetooth name leaves "Phone".
         runCatching { DiscoverableWhenNeutral.install(this) }
+        // Wi-Fi radio: stores the context only; no thread, receiver or platform call until a Wi-Fi switch is on (X4).
+        runCatching { WifiRadio.attach(this) }
+        // The attempt owner's PowerManager seam: stores the manager only; no platform call while every switch is off.
+        runCatching { RealWifiEnv.attach(this) }
+        // Both production switch sources read the catalog lazily; non-blocking, exception = all off [R M-4] [R M-7] [X6].
+        runCatching {
+            WifiSwitchHub.isPublishThread = { android.os.Looper.myLooper() == android.os.Looper.getMainLooper() }
+            WifiHopGate.switchSource = { WifiSwitchHub.current() }                 // A2: the effective own BMH2 build tag [R M-4] [X6]
+            WifiRadio.switchSource = WifiSwitchSource { WifiSwitchHub.current() }  // A4: the facts reader reads it on every call [R M-7]
+        }
+        // A9: the Direct factory stores the context only; the sweep reads the sealed file's presence on this thread.
+        runCatching { DirectBearerFactory.attach(this) }
+        runCatching { DirectStartupSweep.run(this) }
+        // PRIV1: opens the sealed peer memories on their worker thread (an earlier build's plain copies are moved and
+        // deleted even when the feature is never used); nothing runs while a wipe is pending.
+        runCatching { PeerMemoryStartup.run(this) }
     }
 
     companion object {

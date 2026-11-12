@@ -105,18 +105,30 @@ object CocAutoGatt {
  */
 class CocRegistrationLedger {
     private var countValue = 0
+    private var carriedValue = 0
     private var generationValue = 0
 
-    val count: Int @Synchronized get() = countValue
+    /** This process's registrations plus those carried from earlier app processes ([carry]; 0 unless persisted). */
+    val count: Int @Synchronized get() = countValue + carriedValue
     val generation: Int @Synchronized get() = generationValue
 
     /** Records one registration and returns the new count. */
     @Synchronized
-    fun record(): Int = ++countValue
+    fun record(): Int {
+        countValue++
+        return countValue + carriedValue
+    }
+
+    /** Experimental `test_coc_ledger_persist` (CocBudget): registrations of earlier app processes on this Bluetooth process. */
+    @Synchronized
+    fun carry(registrations: Int) {
+        carriedValue = registrations.coerceAtLeast(0)
+    }
 
     @Synchronized
     fun reset() {
         countValue = 0
+        carriedValue = 0
         generationValue++
     }
 }
@@ -271,6 +283,7 @@ object CocRegistrations {
     /** Logs and counts one LE CoC listen or outgoing connect ([kind] is "listen" or "connect"). */
     fun note(kind: String, owner: String): Int {
         val count = ledger.record()
+        CocBudget.onCount(count)
         val settings = CocAutoGatt.current
         Log.i(
             "BluetoothVideo",
@@ -285,6 +298,7 @@ object CocRegistrations {
     fun install(context: Context) {
         if (installed) return
         installed = true
+        CocBudget.install(context, ledger)
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
                 val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
@@ -292,6 +306,7 @@ object CocRegistrations {
                 val before = ledger.count
                 ledger.reset()
                 session.reset()
+                CocBudget.clear(if (state == BluetoothAdapter.STATE_ON) "adapter_on" else "adapter_off")
                 CocListeners.resetAll(if (state == BluetoothAdapter.STATE_ON) "adapter_on" else "adapter_off")
                 Log.i(
                     "BluetoothVideo",

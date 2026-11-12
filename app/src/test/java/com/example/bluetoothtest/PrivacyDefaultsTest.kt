@@ -59,14 +59,15 @@ class PrivacyDefaultsTest {
     }
 
     @Test
-    fun eachSettingsSwitchIsTheOffSwitchAndTurningHiddenIdentitiesOffTurnsPseudonymsOff() {
-        val off = userLaunch(stored = mapOf(Bmh3Feature.PREF to false))
-        assertFalse(off.isOn("bmh3"))
-        assertFalse("a child follows its parent", off.isOn("bmh3_pseudonyms"))
-        val childOff = userLaunch(stored = mapOf(Bmh3PseudonymFeature.PREF to false))
-        assertTrue(childOff.isOn("bmh3"))
-        assertFalse(childOff.isOn("bmh3_pseudonyms"))
-        assertFalse(FeatureCatalog.resolve(RotatingDiscoveryFeature.spec, false, { false }) { if (it == RotatingDiscoveryFeature.PREF) false else null })
+    fun anOffStoredByAnOlderBuildNoLongerTurnsHiddenIdentitiesOrPseudonymsOff() {
+        // No Settings switch since 2026-11-04 (owner): a person who once turned them off is protected again.
+        val off = userLaunch(stored = mapOf(Bmh3Feature.PREF to false, Bmh3PseudonymFeature.PREF to false))
+        assertTrue(off.isOn("bmh3"))
+        assertTrue(off.isOn("bmh3_pseudonyms"))
+        // The DEBUG launch extra still runs either arm of an A/B.
+        assertTrue(benchmarkLaunch(extras = setOf(Bmh3Feature.EXTRA)).isOn("bmh3"))
+        // Private Bluetooth ID has no switch: what an older build stored is ignored.
+        assertTrue(FeatureCatalog.resolve(RotatingDiscoveryFeature.spec, false, { false }) { if (it == "experimental_rotating_ids") false else null })
     }
 
     @Test
@@ -91,5 +92,13 @@ class PrivacyDefaultsTest {
         assertTrue(ConnectivityFeatureDefaults.BMH3_PSEUDONYMS)
         assertEquals(ConnectivityFeatureDefaults.BMH3, ConnectivityFeatures.bmh3.defaultEnabled)
         assertEquals(ConnectivityFeatureDefaults.BMH3_PSEUDONYMS, ConnectivityFeatures.bmh3Pseudonyms.defaultEnabled)
+    }
+
+    @Test
+    fun friendlyNamesAreOnForUsersEvenWhenAnOlderBuildStoredOffAndTheBenchmarkArmStays() {
+        val names = NamingFeatures.GENERATED_NAMES
+        assertTrue(FeatureCatalog.resolve(names, false, { null }) { if (it == "feature_generated_names") false else null })
+        assertFalse(FeatureCatalog.resolve(names, true, { null }) { true })
+        assertTrue(FeatureCatalog.resolve(names, true, { if (it == names.benchmarkExtra) true else null }) { false })
     }
 }

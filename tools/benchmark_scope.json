@@ -5,15 +5,59 @@
     "s22",
     "m31",
     "asus",
-    "xiaomi",
-    "a55"
+    "a15s"
   ],
+  "extension_phones": [
+    "xiaomi",
+    "a55",
+    "realme"
+  ],
+  "required_phones_change": {
+    "at": "2026-11-12",
+    "from": ["s24", "s22", "m31", "asus", "a15s", "realme"],
+    "to": ["s24", "s22", "m31", "asus", "a15s"],
+    "reason": "The owner released the Realme for good on 2026-11-11 and decided its retirement from the required phones on 2026-11-12. It stays registered and compiled as an extension phone, so every request id that names it is unchanged (retired_requirements stays empty); its carrier_eligibility and provenance entries stay as measured history.",
+    "effects": "Realme requests stay compiled as an extension phone, IDs unchanged; no run needs the Realme. The inventory's required_phones lists the five; extension_phones lists Xiaomi, A55 and the Realme.",
+    "previous": {
+      "at": "2026-11-10",
+      "from": ["s24", "s22", "m31", "asus", "xiaomi", "a55"],
+      "to": ["s24", "s22", "m31", "asus", "a15s", "realme"],
+      "reason": "The owner's fixed required phones are the six on the bench: S24, S22, M31, ASUS, A15s and Realme (AGENTS.md 'Case inventory', owner 2026-11-10). Xiaomi and A55 stay registered and compiled as extension_phones, so every request id that names them is unchanged (retired_requirements stays empty); a run needs only the required phones, and availability stays a per-run fact.",
+      "effects": "Adds every request that names the A15s or the Realme; removes none. The inventory's required_phones lists the six; extension_phones lists Xiaomi and A55."
+    }
+  },
   "registry": "tools/benchmark_devices.json",
   "transports": [
     "classic",
     "ble",
     "gatt"
   ],
+  "carriers": ["wifi_aware", "wifi_aware_wider", "wifi_direct", "wifi_aware_native"],
+  "carrier_eligibility": {
+    "wifi_aware": ["s24", "s22"],
+    "wifi_aware_wider": ["s22", "asus"],
+    "wifi_direct": ["s24", "s22", "m31", "asus", "xiaomi", "a55", "a15s", "realme"],
+    "wifi_aware_native": ["s22", "asus"]
+  },
+  "carrier_eligibility_provenance": {
+    "wifi_direct": {
+      "a15s": {
+        "capability": "benchmarks/catalog/capabilities/a15s-20261109.json",
+        "evidence": [
+          "u6wd-20261110s (frozen APK d72a25e256bb7ca7): 6 user-launch calls S22<->A15s, carrier wifi_direct, 90 s; both phones log BENCHMARK wifi_upgrade event=ready | carrier=direct | group=ready | freq_band=5 | same_channel=true and a bearer on freqMhz=5745, then carrier_added kind=WIFI_DIRECT",
+          "l2w1pa-20261110e (frozen APK 05d2f42a0e653b28): ASUS<->A15s wifi_direct calls, group freq_band=5"
+        ]
+      },
+      "realme": {
+        "capability": "benchmarks/catalog/capabilities/realme-20261109.json",
+        "evidence": [
+          "ul3-20261110n (frozen APK 31219a4d2c12cceb): 6 user-launch calls Realme<->M31, carrier wifi_direct, 90 s; group ready on freq_band=5 (5200 MHz hosted by the M31, 5745 MHz hosted by the Realme), carrier_added kind=WIFI_DIRECT",
+          "w1sr-20261109i (frozen APK 05d2f42a0e653b28): S24<->Realme wifi_direct calls, group freq_band=5"
+        ]
+      }
+    },
+    "method": "Per run, the manifest's logs were searched for the app's own wifi_upgrade ready line (freq_band, freq_source=group) and a completed call; the capability file gives the phone's identity (node prefix, fingerprint). A phone is listed for a carrier only after a call of that carrier held a group with it, so a listing is a measured capability, never an assumption."
+  },
   "duration_s": 90,
   "lifecycle_duration_s": 120,
   "settings_sweep": {
@@ -36,6 +80,18 @@
         "xiaomi"
       ],
       [
+        "asus",
+        "a15s"
+      ],
+      [
+        "a15s",
+        "realme"
+      ],
+      [
+        "realme",
+        "s24"
+      ],
+      [
         "xiaomi",
         "a55"
       ],
@@ -46,14 +102,16 @@
     ]
   },
   "retired_requirements": [],
+  "retired_requirement_files": ["tools/benchmark_retired_requirements.json"],
   "capabilities": {
-    "s24": "benchmarks/catalog/capabilities/s24.json",
-    "s22": "benchmarks/catalog/capabilities/s22.json",
-    "m31": "benchmarks/catalog/capabilities/m31-20261005.json",
-    "asus": "benchmarks/catalog/capabilities/asus.json",
+    "s24": "benchmarks/catalog/capabilities/s24-20261107.json",
+    "s22": "benchmarks/catalog/capabilities/s22-20261112.json",
+    "m31": "benchmarks/catalog/capabilities/m31-20261112.json",
+    "asus": "benchmarks/catalog/capabilities/asus-20261107.json",
     "xiaomi": "benchmarks/catalog/capabilities/xiaomi.json",
     "a55": "benchmarks/catalog/capabilities/a55.json",
-    "a15s": "benchmarks/catalog/capabilities/a15s.json"
+    "a15s": "benchmarks/catalog/capabilities/a15s-20261112.json",
+    "realme": "benchmarks/catalog/capabilities/realme-20261109.json"
   },
   "acceptance_profile": "device-run-v4-user"
 }

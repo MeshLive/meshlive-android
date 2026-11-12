@@ -511,4 +511,61 @@ class ReachTableTest {
         t.observePage(page(r1, entry(d, 1, ageUnits = 31)), "BB:10")
         assertEquals(0, t.advertisable().size)
     }
+
+    @Test
+    fun aCallerPinChoosesOnlyItsHelperAndNeverTheDirectOffer() {
+        val t = table(ReachConfig(maxRelays = 4))
+        t.observeOffer("r1", offer(r1, helper = true, consent = false), "AA:10", rssi = -90)
+        t.observeOffer("r2", offer(r2, helper = true, consent = false), "AA:20", rssi = -50)
+        seenTwice {
+            t.observePage(page(r1, entry(d, 1)), "BB:10")
+            t.observePage(page(r2, entry(d, 1)), "BB:20")
+        }
+        t.observeOffer("direct", offer(d, consent = false), "AA:01")
+        // Today the direct offer leads, then the stronger helper.
+        assertEquals(listOf("direct", "r2", "r1"), t.callerRoutes(d).map { it.hop.peer })
+        // The pin keeps only its helper and drops the direct fallback, even though r2 is stronger.
+        assertEquals(listOf("r1"), t.callerRoutes(d, firstHopPin = r1).map { it.hop.peer })
+        // A caller pin that equals the target prefix still never allows the direct route.
+        assertTrue(t.callerRoutes(d, firstHopPin = d).isEmpty())
+        // A pin that names no helper is no route at all (never the direct offer or another helper).
+        assertTrue(t.callerRoutes(d, firstHopPin = byteArrayOf(9, 9, 9, 9, 9, 9)).isEmpty())
+        // A rejected (malformed) pin matches nothing.
+        assertTrue(t.callerRoutes(d, firstHopPin = ByteArray(0)).isEmpty())
+    }
+
+    @Test
+    fun aHelperNextHopPinAcceptsOnlyThePinnedRelayOrTarget() {
+        val t = table(ReachConfig(maxRelays = 4))
+        t.observeOffer("r1", offer(r1, helper = true, consent = false), "AA:10", rssi = -90)
+        t.observeOffer("r2", offer(r2, helper = true, consent = false), "AA:20", rssi = -50)
+        seenTwice {
+            t.observePage(page(r1, entry(d, 1)), "BB:10")
+            t.observePage(page(r2, entry(d, 1)), "BB:20")
+        }
+        // Without a pin the stronger r2 is the helper's next hop.
+        assertEquals("r2", t.setupRoute(d, 2)!!.hop.peer)
+        // The pin chooses r1 even though r2 is stronger.
+        val pinned = t.setupRoute(d, 2, nextHopPin = r1)!!
+        assertEquals("r1", pinned.hop.peer)
+        assertEquals(r1.toList(), pinned.nextHop!!.toList())
+        // A pin that names no next hop is no route.
+        assertNull(t.setupRoute(d, 2, nextHopPin = byteArrayOf(9, 9, 9, 9, 9, 9)))
+        assertNull(t.setupRoute(d, 2, nextHopPin = ByteArray(0)))
+        // A consenting direct target is accepted only when the pin is the target prefix; a relay pin skips it.
+        t.observeOffer("direct", offer(d), "AA:01")
+        val direct = t.setupRoute(d, 2, nextHopPin = d)!!
+        assertNull(direct.nextHop)
+        assertEquals("direct", direct.hop.peer)
+        assertEquals("r1", t.setupRoute(d, 2, nextHopPin = r1)!!.hop.peer)
+    }
+
+    @Test
+    fun aPinAllowsOnlyItsExactSignedPrefixAndAnEmptyPinNothing() {
+        assertTrue(relayPinAllows(null, null))
+        assertTrue(relayPinAllows(r1, r1))
+        assertFalse(relayPinAllows(r1, r2))
+        assertFalse(relayPinAllows(r1, null))
+        assertFalse(relayPinAllows(ByteArray(0), r1))
+    }
 }

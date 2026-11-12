@@ -5,6 +5,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Test
 
@@ -118,6 +119,8 @@ class LinkChangeRollbackTest {
 
     @Test
     fun theGateSwitchRemembersOnlyAPhyChangeWithinFiveSeconds() {
+        // The gate and rollback switches are Experimental DEBUG arms; withBothSwitchesOff... states the release behaviour.
+        assumeTrue("DEBUG arm", BuildConfig.DEBUG)
         PhySwitches.llGate = true
         LinkChangeRollbacks.onLinkLost("p", listOf(change(LinkChangeKind.MTU, 0)), 1_000, 8, 5_000)
         assertFalse(LinkChangeRollbacks.isDowngraded("p", LinkChangeKind.MTU, 5_001))
@@ -129,6 +132,8 @@ class LinkChangeRollbackTest {
 
     @Test
     fun theRollbackSwitchRemembersMtuPhyAndPriorityWithinTenSecondsAndOffersTheDowngrades() {
+        // The gate and rollback switches are Experimental DEBUG arms; withBothSwitchesOff... states the release behaviour.
+        assumeTrue("DEBUG arm", BuildConfig.DEBUG)
         PhySwitches.linkChangeRollback = true
         val now = System.currentTimeMillis()
         LinkChangeRollbacks.onLinkLost("p", listOf(change(LinkChangeKind.MTU, 0)), 9_900, 8, now)

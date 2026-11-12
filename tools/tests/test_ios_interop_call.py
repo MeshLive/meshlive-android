@@ -57,6 +57,9 @@ class ParsingTest(unittest.TestCase):
         self.assertEqual(summary["ended"], {"reason": "Call ended", "time": "10-10 05:03:57.807",
                                             "reason_ui": "Call ended"})
         self.assertEqual(summary["link_peer"]["prefix"], "1e2e3e4e5e6e")
+        named = interop.summarize(interop.parse_records(REAL.replace(
+            "Private call ended: Call ended", "Private call ended: Call ended | callId=" + CALL)))
+        self.assertEqual(named["ended"]["reason"], "Call ended")
         self.assertEqual(summary["remote"]["width"], 240)
         media = summary["media"]
         self.assertEqual((media["audio_tx_packets"], media["video_tx_packets"]), (2289, 667))

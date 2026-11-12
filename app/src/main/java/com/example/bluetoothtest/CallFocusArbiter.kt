@@ -60,8 +60,8 @@ internal class CallFocusArbiter(
     private val onAction: (FocusAction) -> Unit,
     private val retryDelayMs: Long = RETRY_DELAY_MS,
 ) {
-    private var retryUsed = false
-    private var cancelRetry: (() -> Unit)? = null
+    @Volatile private var retryUsed = false
+    @Volatile private var cancelRetry: (() -> Unit)? = null
 
     /** Requests focus; true when it was granted right away. */
     fun request(): Boolean {

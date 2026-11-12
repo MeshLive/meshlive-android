@@ -195,7 +195,18 @@ class RecentCallsTest {
             org.junit.Assert.assertFalse(RecentCalls.record(context, RecentCall(a, true, 1)))
             org.junit.Assert.assertFalse(RecentCalls.recordBlocked(context, 2))
             org.junit.Assert.assertFalse(RecentCalls.promoteStranger(context, "gold fox", fingerprint))
-            LocalReporting.hideStream(context, 1234)
+            val stream = ByteArray(6) { 1 }.let { prefix ->
+                DiscoveryAnnouncement(
+                    nodeIdPrefix = prefix,
+                    flags = DiscoveryAnnouncement.FLAG_STREAM_AVAILABLE,
+                    capabilitySummary = 1,
+                    streamToken = StreamRouteToken.forAdvertiser(1234, prefix),
+                    routeCost = 0,
+                    sequence = 0,
+                    version = DiscoveryAnnouncement.FIXED_PREFIX_VERSION,
+                )
+            }
+            org.junit.Assert.assertFalse(LocalReporting.hideStream(context, stream, "00:11:22:33:44:55", hopAuthenticated = true))
             org.junit.Assert.assertTrue(phone.preferences(RecentCalls.PREFERENCES).all.isEmpty())
             org.junit.Assert.assertTrue(phone.preferences(CallFeatureDefaults.APP_SETTINGS_PREFERENCES).all.isEmpty())
         } finally {

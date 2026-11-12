@@ -45,13 +45,6 @@ class ChatUiTest {
     }
 
     @Test
-    fun muteIsALocalToggle() {
-        val muted = ChatMute.toggled(emptySet(), peerHex.uppercase(), muted = true)
-        assertEquals(setOf(peerHex), muted)
-        assertEquals(emptySet<String>(), ChatMute.toggled(muted, peerHex, muted = false))
-    }
-
-    @Test
     fun yourOwnLastMessageReadsYou() {
         val peer = NodeId.fromBytes(ByteArray(NodeId.BYTE_COUNT) { 0x11 })
         fun summary(incoming: Boolean) = ConversationSummary(

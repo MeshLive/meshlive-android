@@ -38,6 +38,10 @@ internal object KnownDeviceTraits {
             "benchmarks/runs/a15s-opusfix-5a2d93a7/0001-4b5ecaf7784b/physical/manifest.json"),
         "xiaomi" to Platform("23053RN02I", "mt6768", "mt6768", "Mediatek", "MT6769V/CZ",
             "benchmarks/runs/20261002-205648-asus-xiaomi-gatt500/manifest.json"),
+        // Realme RMX5256 (the sixth bench phone); traits are the app's own `BENCHMARK device_policy` line from the launch log
+        // (an interop run's launch log, 2026-11-07).
+        "realme" to Platform("RMX5256", "mt6835", "k6835v2_64", "Mediatek", "MT6835",
+            "benchmarks/catalog/capabilities/realme-20261109.json"),
     )
 
     data class Known(val alias: String, val traits: DeviceTraits, val model: String, val capabilityFile: String)

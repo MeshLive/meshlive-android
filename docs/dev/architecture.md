@@ -189,6 +189,23 @@ close on Android 10/11, a shared LE CoC listener on Android 10, a fresh ACL for 
 retries on Android 13+, the scan start quota and others) are entries in the device policy registry described
 below, each with an upstream source.
 
+### Carriers: Bluetooth and, optionally, Wi-Fi
+
+A **hop** (a call link, a stream parent-to-child link, a relayed-call hop) is authenticated over Bluetooth as always. With
+the Wi-Fi switches on, a hop may add a second **carrier**, a Wi-Fi Aware (or Wi-Fi Direct) socket that carries the same
+sealed records; the Bluetooth link stays as the standby. One `CarrierSet` per hop owns the carriers, one writer and one
+reader thread per carrier and one ordered consumer; a pure `CarrierCutover` state machine decides the switch and the
+fallback (hold 1 s, no switch while the old queue is late, 30 s cooldown after a fallback, at most two fallbacks). Two
+quality fallbacks (counted even when this direction never moved) end Wi-Fi attempts for the call.
+`WifiRadio` owns the phone-wide Wi-Fi resources on one handler thread; `WifiEligibility` is a pure function from facts to
+what this phone may do now. Bluetooth discovery is unchanged; with *Wider reach* a Wi-Fi Aware discovery plane carries the
+same announcement and a phone seen only over Wi-Fi can be called or joined over Wi-Fi (the hop then starts on Wi-Fi). Every
+Wi-Fi switch is off by default and listed in [switches.md](switches.md#wi-fi-carriers-and-wider-reach-design-wf-all-off-by-default).
+
+**Hop carriers.** A stream parent-to-child hop and each hop of a relayed call are a `HopLink`: a pass-through to the raw Bluetooth session until both ends' `CAPS` prove a feasible Wi-Fi tuple, then the same `CarrierSet` and `CarrierCutover` as a call link. `HopLink` is activated once, lazily, on the thread that reads the hop, and from then on reads all carriers through one ordered delivery queue; a fallback leaves the stream or relay running on Bluetooth. A relay terminates two independent `HopLink`s (upstream and downstream), each with its own keys, attempts and `CarrierSet`. Closing a hop closes its raw link before the session wipes its keys, and a closed record writer or reader refuses to seal or open, so no record ever leaves under a wiped key; an activation that races the close is torn down by whichever side sees the other, and a failure while activating leaves the hop on Bluetooth. A hop's send-side Bluetooth load accounting follows the carrier it sends on, so Wi-Fi bytes never teach the Bluetooth capacity keys.
+
+**Wi-Fi Direct carrier.** `DirectGroup` runs one attempt's group on the radio thread (create or join by derived credentials, band check, address, teardown); `DirectBearerDriver` plugs it into the per-hop attempt owner and the carrier it hands over is the same socket carrier as for Wi-Fi Aware; one group per phone (the radio ledger refuses a second one, and refuses it while a Wi-Fi Aware link is held; Share app nearby takes the same claim); a sealed list of the group names the app created lets it remove a stranded group after a crash without touching another app's group. A group counts as gone only when the platform reports that no group is formed: below Android 13 the group read returns nothing while the app is in the background or Location is off, so an unreadable group is removed only when this run of the app created or joined it, and is otherwise kept in the quarantine until a read can tell. After a removal the phone re-reads for up to two seconds before it quarantines the group.
+
 ## The sender pipeline
 
 ```text
@@ -610,6 +627,10 @@ confidence by itself).
 - `DozeWatchdog` observes Doze, light Doze and Low Power Standby and shows "Phone is in deep sleep; calls may be
   delayed." It changes no behaviour.
 - Thermal limits reduce FPS and rate at source on Android's thermal status; a critical status stops streaming.
+  Calls are never refused for heat: at a critical status a phone still places and answers voice calls, a video call
+  placed or answered there goes on as voice (the callee answers with `ACCEPT, CAMERA_OFF`), a running call's camera
+  turns off through the camera-off path and turning it back on is refused with the heat text (DECISIONS "Calls at
+  critical heat").
   Requested and effective settings stay visible.
 - FIFO audio, immutable GATT buffers, codec-configuration and keyframe recovery, and capture-age-preserving
   timestamp conversion are compatibility invariants covered by focused regression tests.

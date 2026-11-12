@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 SPEC = importlib.util.spec_from_file_location("benchmark_case_state", Path(__file__).parents[1] / "benchmark_case_state.py")
 state = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(state)
+from benchmark_state_io import ChangeTable  # noqa: E402
 APK = "a" * 64
 V3, V4 = "device-run-v3", "device-run-v4-user"
 CHANGE = {"id": "acceptance-device-run-v4-user", "at": "2026-10-10T09:00:00+05:30", "files": ["tools/score_device_run.py"],
@@ -67,9 +68,9 @@ class AcceptanceStateTest(unittest.TestCase):
         self.assertEqual(V3, rows["scored"]["last_measured_thresholds_version"])
         self.assertIn(V3, rows["scored"]["reason"])
         self.assertIn(V4, rows["scored"]["reason"])
-        self.assertTrue(rows["scored"]["changes"][0]["needs_retest"])
+        self.assertTrue(ChangeTable(built).expand(rows["scored"])[0]["needs_retest"])
         self.assertEqual("NOT RUN", rows["untested"]["state"])
-        self.assertFalse(rows["untested"]["changes"][0]["needs_retest"])
+        self.assertFalse(ChangeTable(built).expand(rows["untested"])[0]["needs_retest"])
         self.assertEqual(before, reports)
 
     def test_unrecorded_profile_is_conservative(self):
@@ -82,13 +83,14 @@ class AcceptanceStateTest(unittest.TestCase):
         item = job("rescored")
         original = self.execution(item, V3)
         rescored = self.execution(item, V4, host_end_ns=None)
-        built = state.build_state([item], [self.report(original, version=V3),
+        whole = state.build_state([item], [self.report(original, version=V3),
                                            self.report(rescored, version=V4, generated_at="2026-10-10T10:00:00+05:30")],
-                                  [CHANGE])["cases"][0]
+                                  [CHANGE])
+        built = whole["cases"][0]
         self.assertEqual("PASS", built["state"])
         self.assertEqual("CURRENT", built["freshness"])
         self.assertEqual(V4, built["last_measured_thresholds_version"])
-        self.assertFalse(built["changes"][0]["needs_retest"])
+        self.assertFalse(ChangeTable(whole).expand(built)[0]["needs_retest"])
 
     def test_report_level_thresholds_version_applies_when_the_result_has_none(self):
         item = job("report-level")

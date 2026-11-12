@@ -204,6 +204,16 @@ class MicrophoneOpusEncoder(
         }
     }
 
+    /**
+     * Always queued behind the commands already on the audio command thread, whatever the off-main switch says (JT2 camera-first:
+     * after the call's queued `call_audio_open`, so the capture opens in the call's audio mode). [onResult] runs on that thread.
+     */
+    fun startQueued(onResult: (Throwable?) -> Unit) {
+        AudioCommandQueue.shared.postForResult("mic_encoder_start", { start() }) { result ->
+            onResult(result.exceptionOrNull())
+        }
+    }
+
     private fun createMediaCodecOpusEncoder(format: MediaFormat): Pair<String, MediaCodec> {
         val encoderName = MediaCodecList(MediaCodecList.ALL_CODECS).findEncoderForFormat(format)
             ?: error("This phone has no Opus audio encoder")

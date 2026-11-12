@@ -37,4 +37,27 @@ class CallsQuietTest {
         assertFalse(CallsQuiet.emptyHintVisible(CallsQuiet.EMPTY_HINT_AFTER_MS - 1))
         assertTrue(CallsQuiet.emptyHintVisible(CallsQuiet.EMPTY_HINT_AFTER_MS))
     }
+
+    @Test
+    fun aPhoneLeftOnNearbyStopsSpinningOnceTheSearchSettles() {
+        val longWait = 30 * 60_000L
+        assertTrue("today: spins for as long as discovery runs", CallsQuiet.indicatorVisible(true, true, longWait, settles = false))
+        assertTrue("a fresh search still shows it", CallsQuiet.indicatorVisible(true, true, 0L, settles = true))
+        assertFalse("a phone waiting on Nearby stops redrawing", CallsQuiet.indicatorVisible(true, true, longWait, settles = true))
+        for (settles in listOf(false, true)) {
+            assertFalse("not off Nearby", CallsQuiet.indicatorVisible(false, true, 0L, settles))
+            assertFalse("not without discovery", CallsQuiet.indicatorVisible(true, false, 0L, settles))
+        }
+    }
+
+    @Test
+    fun onlyADebugLaunchCanKeepTheIndicatorSpinning() {
+        try {
+            DebugTunables.callsIndicatorSettles = false
+            assertEquals("the control arm exists only in DEBUG", !BuildConfig.DEBUG, DebugTunables.callsIndicatorSettles)
+        } finally {
+            DebugTunables.callsIndicatorSettles = true
+        }
+        assertTrue("a person's launch settles", DebugTunables.callsIndicatorSettles)
+    }
 }

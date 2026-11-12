@@ -93,6 +93,8 @@ internal data class ReachabilityInputs(
     val batterySaver: Boolean = false,
     /** [ReachableWhileBrowsingFeature]: off plans [ReachabilityScreen.LIVE_BROWSING] exactly like [ReachabilityScreen.WATCH]. */
     val reachableWhileBrowsing: Boolean = true,
+    /** Wider reach (A8 step 13): Bluetooth is unusable but the endpoint may listen over Wi-Fi only. */
+    val wifiNativeReady: Boolean = false,
 )
 
 internal data class ReachabilityPlan(
@@ -130,6 +132,20 @@ internal data class ReachabilityPlan(
 internal object CallReachability {
     const val LOW_BATTERY_PERCENT = 20
 
+    /**
+     * Bluetooth-off reachability over Wider reach (A8 step 13): claimed only when something can really be on air and a
+     * call can really arrive: the switch, the endpoint permissions, the adapter off, Wi-Fi Aware eligible now (Wi-Fi on,
+     * and Location on for Android 11-12) and native hops possible on this phone (A8 review P2-4, P2-3).
+     */
+    fun wifiNativeReady(
+        widerReach: Boolean,
+        bluetoothReady: Boolean,
+        permissionsGranted: Boolean,
+        adapterOff: Boolean,
+        awareEligible: () -> Boolean,
+        nativeHopsPossible: Boolean,
+    ): Boolean = widerReach && !bluetoothReady && permissionsGranted && adapterOff && nativeHopsPossible && awareEligible()
+
     fun plan(inputs: ReachabilityInputs): ReachabilityPlan {
         val batteryNote = when {
             inputs.batteryLow && inputs.batterySaver -> " (low battery + saver: calls stay on, relay helping pauses)"
@@ -143,9 +159,9 @@ internal object CallReachability {
             // endpoint and the foreground service it starts on success.
             ReachabilityScreen.CALL_BROWSER -> ReachabilityPlan(
                 AdvertisingRole.CALL_AVAILABLE,
-                endpoint = inputs.bluetoothReady,
+                endpoint = inputs.bluetoothReady || inputs.wifiNativeReady,
                 discoveryScan = inputs.bluetoothReady && inputs.foreground,
-                reachable = inputs.bluetoothReady,
+                reachable = inputs.bluetoothReady || inputs.wifiNativeReady,
                 reason = "call_screen$batteryNote",
             )
             ReachabilityScreen.LIVE -> ReachabilityPlan(AdvertisingRole.LIVE_STREAM, false, false, false, "stream_owns_advertising")
@@ -165,7 +181,7 @@ internal object CallReachability {
      */
     private fun idleEndpoint(inputs: ReachabilityInputs, name: String, batteryNote: String): ReachabilityPlan = when {
         !inputs.featureEnabled -> ReachabilityPlan(AdvertisingRole.NONE, false, false, false, "flag_off")
-        !inputs.bluetoothReady -> ReachabilityPlan(AdvertisingRole.NONE, false, false, false, "bluetooth_or_permissions")
+        !inputs.bluetoothReady && !inputs.wifiNativeReady -> ReachabilityPlan(AdvertisingRole.NONE, false, false, false, "bluetooth_or_permissions")
         !inputs.foreground && !inputs.foregroundServiceHeld ->
             ReachabilityPlan(AdvertisingRole.NONE, false, false, false, "background_without_foreground_service")
         else -> ReachabilityPlan(

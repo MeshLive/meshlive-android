@@ -65,4 +65,13 @@ class SwitchInertTest {
         )
         assertEquals("playout_time_target=false", inert("test_playout_time_budget_ms" to 3_000).single().parent)
     }
+
+    @Test
+    fun aWifiArmWithoutTheCarrierSwitchIsReportedInert() {
+        assertEquals(
+            listOf(SwitchInert.Inert("wifi_icm", "wifi_carrier=false")),
+            inert("test_wifi_icm" to true),
+        )
+        assertTrue(inert("test_wifi_carrier" to true, "test_wifi_icm" to true).isEmpty())
+    }
 }

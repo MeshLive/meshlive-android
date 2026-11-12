@@ -70,6 +70,15 @@ class VoiceCallPromotionTest {
     }
 
     @Test
+    fun noRingbackWhileABlockedCallWaitsForItsOrdinaryEnd() {
+        assertTrue(RingbackPolicy.plays(enabled = true, phase = PrivateCallPhase.OUTGOING_RINGING, blockedEndScheduled = false))
+        assertFalse(RingbackPolicy.plays(enabled = true, phase = PrivateCallPhase.OUTGOING_RINGING, blockedEndScheduled = true))
+        assertFalse(RingbackPolicy.plays(enabled = false, phase = PrivateCallPhase.OUTGOING_RINGING, blockedEndScheduled = false))
+        assertFalse(RingbackPolicy.plays(enabled = true, phase = PrivateCallPhase.ACTIVE, blockedEndScheduled = false))
+        assertFalse(RingbackPolicy.plays(enabled = true, phase = null, blockedEndScheduled = false))
+    }
+
+    @Test
     fun aMuteHeldByAnotherCallSurvivesAHoldToTalkPress() {
         // The activity maps talking to onUserMuted(!talking): while another call holds the microphone the
         // effective mute stays on, and releasing mutes the user again.

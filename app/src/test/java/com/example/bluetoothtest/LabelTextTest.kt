@@ -60,8 +60,6 @@ class LabelTextTest {
         assertEquals("too long", rejected(LabelKind.PERSON_NAME, "\u20AC".repeat(11))) // 33 bytes
         assertNull(rejected(LabelKind.STREAM_TITLE, "a".repeat(48)))
         assertEquals("too long", rejected(LabelKind.STREAM_TITLE, "a".repeat(49)))
-        assertNull(rejected(LabelKind.CALL_SUBJECT, "a".repeat(64)))
-        assertEquals("too long", rejected(LabelKind.CALL_SUBJECT, "a".repeat(65)))
     }
 
     @Test

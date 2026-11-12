@@ -254,6 +254,50 @@ class FidelityTest(unittest.TestCase):
         self.assertNotIn("media_age_ms", gates)
 
 
+class JoinGateTest(unittest.TestCase):
+    """Q-STARTUP-GATE (owner, 2026-11-06): the join gate is selection-to-first-surface; launch is only reported."""
+
+    LAUNCH = {"selection_events": [{"device": "test", "time": "10-02 19:12:00.000", "action": "launch"}]}
+
+    def join(self, thresholds, selected_ms=None, launch_surface_at=5.0):
+        text = line(launch_surface_at, surface(1)) + line(launch_surface_at + 10, surface(150))
+        if selected_ms is not None:
+            text += line(launch_surface_at, f"Receiver startup: selection-to-first-surface {selected_ms} ms")
+        result = score(text, thresholds, self.LAUNCH)
+        launch = next(item for item in result["actions"] if item["action"] == "launch")["first_surface_ms"]
+        return result, launch
+
+    def test_slow_launch_with_fast_selection_passes_the_join_gate(self):
+        result, launch = self.join(V4, selected_ms=2100.0)
+        self.assertEqual(("PASS", 2100.0), (result["gates"]["selection_to_first_surface_ms"]["status"],
+                                           result["gates"]["selection_to_first_surface_ms"]["value"]))
+        # Launch-to-first-surface (5.0 s) is still computed and shown, but no longer decides.
+        self.assertEqual(("DIAGNOSTIC", "FAIL", 5000.0), (launch["status"], launch["measured_status"], launch["value"]))
+        self.assertEqual("launch_to_first_surface_ms", launch["metric"])
+        self.assertEqual("PASS", result["lifecycle_status"])
+        self.assertNotEqual("FAIL", result["overall_status"])
+
+    def test_a_slow_selection_still_fails_the_join_gate(self):
+        result, _ = self.join(V4, selected_ms=3200.0)
+        self.assertEqual("FAIL", result["gates"]["selection_to_first_surface_ms"]["status"])
+        self.assertEqual("FAIL", result["overall_status"])
+
+    def test_no_selection_timestamp_is_unmeasured_not_a_pass(self):
+        result, _ = self.join(V4, selected_ms=None)
+        self.assertEqual("UNMEASURED", result["gates"]["selection_to_first_surface_ms"]["status"])
+        self.assertEqual("UNMEASURED", result["overall_status"])
+
+    def test_a_connection_timeout_is_still_a_failure_under_the_selection_basis(self):
+        timeout = {"selection_events": [{"device": "test", "time": "10-02 19:12:01.000", "action": "connection_timeout"}]}
+        result = score(line(2, surface(1)), V4, timeout)
+        self.assertEqual("FAIL", result["actions"][0]["first_surface_ms"]["status"])
+        self.assertEqual("FAIL", result["overall_status"])
+
+    def test_v3_keeps_launch_to_first_surface_as_its_gate(self):
+        _, launch = self.join(None, selected_ms=2100.0)
+        self.assertEqual(("FAIL", 5000.0), (launch["status"], launch["value"]))
+
+
 class RunnerSelectionTest(unittest.TestCase):
     def test_manifest_scoring_records_the_profile_and_cli_selects_it(self):
         manifest = {"run_id": "r", "logs": []}

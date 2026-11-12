@@ -80,6 +80,7 @@ class SetupDeadline(
  * | [setupStallMs] | `test_setup_stall_ms` | the first-2M stall guard's arm (0 = [AdaptivePhyMemory.SETUP_STALL_MS]) |
  * | [relayedBudgetFromHopAuth] | `test_relayed_budget_from_hop_auth` | the relayed SETUP budget starts at hop authentication |
  * | [unified] | `test_unified_connect_policy` | the proposed single rule ([UnifiedConnectRule]); replaces the four dial rules above |
+ * | [fastFirstRedial] | `test_fast_first_redial` | the ordinary rule's first redial after a fast 133/0x3E waits 200 ms, not 500 ([FastFirstRedial]) |
  *
  * `test_relay_establish_budget` ([RelayEstablishBudget]) stays a per-open request (`establishBudget`), because only relay
  * child connects ask for it; [ConnectAttempts] applies it first, exactly as before, also under [unified].
@@ -93,6 +94,7 @@ data class ConnectRetryConfig(
     val setupStallMs: Long = 0L,
     val relayedBudgetFromHopAuth: Boolean = false,
     val unified: Boolean = false,
+    val fastFirstRedial: Boolean = false,
 ) {
     /** The first-2M stall guard's arm when the guard is on. */
     fun stallGuardMs(): Long = setupStallMs.takeIf { it > 0L } ?: AdaptivePhyMemory.SETUP_STALL_MS
@@ -109,6 +111,7 @@ data class ConnectRetryConfig(
             setupStallMs = DebugTunables.setupStallMs,
             relayedBudgetFromHopAuth = DebugTunables.relayedBudgetFromHopAuth,
             unified = DebugTunables.unifiedConnectPolicy,
+            fastFirstRedial = DebugTunables.fastFirstRedial,
         )
     }
 }
@@ -298,7 +301,16 @@ internal class ConnectAttempts(
             nextAttemptMs = link.retryDelayMs + link.attemptTimeoutMs,
             remainingBudgetMs = deadline?.ordinaryRemainingMs(nowMs),
         )
-        return ordinary(allowed, error, linkReached, lines)
+        // test_fast_first_redial (promoted 2026-11-12, default on): only the first attempt's fast 133/0x3E, only where the ordinary rule redials.
+        val fastFirstMs = if (allowed) {
+            FastFirstRedial.delayMs(config.fastFirstRedial, attempt, leSetupStatus(error.message), nowMs - attemptStartedMs)
+        } else {
+            null
+        }
+        if (fastFirstMs != null) {
+            lines += FastFirstRedial.line(link.budgetLabel, peerTail, nowMs - attemptStartedMs, fastFirstMs, link.retryDelayMs)
+        }
+        return ordinary(allowed, error, linkReached, lines, fastFirstMs ?: link.retryDelayMs)
     }
 
     private fun unified(
@@ -337,7 +349,13 @@ internal class ConnectAttempts(
         return ordinary(allowed, error, linkReached, lines)
     }
 
-    private fun ordinary(allowed: Boolean, error: IOException, linkReached: Boolean, lines: List<String>): Decision {
+    private fun ordinary(
+        allowed: Boolean,
+        error: IOException,
+        linkReached: Boolean,
+        lines: List<String>,
+        delayMs: Long = link.retryDelayMs,
+    ): Decision {
         if (!allowed) return Decision.GiveUp(carryLinkReached(error, linkReached), lines)
         if (leSetupStatus(error.message)?.let { it != BluetoothTransportPolicy.GATT_ERROR_133 } == true) extendedRetries++
         val notice = when {
@@ -346,11 +364,35 @@ internal class ConnectAttempts(
             else -> leSetupRetryNotice(link.notice, error.message, "retrying once")
         }
         attempt += 1
-        return Decision.Dial(link.retryDelayMs, notice, lines)
+        return Decision.Dial(delayMs, notice, lines)
     }
 
     private fun dial(delayMs: Long, error: IOException, retrying: String, lines: List<String>): Decision {
         attempt += 1
         return Decision.Dial(delayMs, leSetupRetryNotice(link.notice, error.message, retrying), lines)
     }
+}
+
+/**
+ * `test_fast_first_redial` (promoted 2026-11-12 on mechanism, default on; join-latency P4a). The ordinary rule waits [ConnectAttempts.Link.retryDelayMs]
+ * (500 ms) before every redial. That spacing is for a peer whose old link is still going down; on the FIRST dial of an
+ * open there is no old link, and a GATT 133 / HCI 0x3E that comes back within the shared fast-establishment class
+ * ([ConnectDurationClass.isFastEstablishment], 1.5 s; 0.40-0.45 s in rem-u/rem-s, 1.326 s in a JT2 first connect: the
+ * peer missed the connect request) is redialed after [DELAY_MS]. (Until 2026-11-10 this rule had its own 1.0 s window.) Later attempts, slow failures and every other
+ * status keep 500 ms; the attempt count and budget rules are unchanged. Line `BENCHMARK fast_first_redial`.
+ */
+internal object FastFirstRedial {
+    const val DELAY_MS = 200L
+
+    /** The redial delay for this failure, or null when the ordinary delay applies. */
+    fun delayMs(enabled: Boolean, attempt: Int, status: Int?, attemptElapsedMs: Long): Long? =
+        if (enabled && attempt == 1 && attemptElapsedMs >= 0 && ConnectDurationClass.isFastEstablishment(status, attemptElapsedMs)) {
+            DELAY_MS
+        } else {
+            null
+        }
+
+    fun line(link: String, peerTail: String, attemptElapsedMs: Long, delayMs: Long, ordinaryDelayMs: Long): String =
+        "BENCHMARK fast_first_redial: link=$link | peer=...$peerTail | failedAttempt=1 | attemptMs=$attemptElapsedMs | " +
+            "delayMs=$delayMs | ordinaryDelayMs=$ordinaryDelayMs"
 }

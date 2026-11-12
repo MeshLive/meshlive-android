@@ -3,6 +3,7 @@ package com.example.bluetoothtest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -24,6 +25,8 @@ class ReleaseLaunchExtrasTest {
                 BenchmarkLaunch.EXTRA_OFFLINE_BENCHMARK,
                 RotatingDiscoveryFeature.EXTRA,
                 RelayedCallsFeature.EXTRA,
+                RelayedCallsFeature.EXTRA_HELPER_PIN,
+                RelayedCallsFeature.EXTRA_NEXT_HOP_PIN,
                 CallReachabilityFeature.EXTRA,
                 IntercomFeatureSettings.EXTRA_VOICE_CALLS,
                 IntercomFeatureSettings.EXTRA_PUSH_TO_TALK,
@@ -88,5 +91,18 @@ class ReleaseLaunchExtrasTest {
         assertEquals(GattPhySplit.TX_1M_RX_2M, armed.gattPhySplit)
         assertEquals(GattPhySplit.TX_1M_RX_2M, armed.adaptivePhySplit)
         assertTrue(armed.phyAfterAuth)
+    }
+
+    @Test
+    fun releaseBuildsIgnoreTheRelayedHelperPins() {
+        // AP8 DEBUG benchmark control: a release launch resolves both extras to null, and the DEBUG parser accepts
+        // exactly 12 hex digits (malformed values become a pin that matches no route).
+        assertNull(RelayedCallsFeature.resolvePin(benchmarkLaunch = false, "0a0b0c0d0e0f"))
+        assertNull(RelayedCallsFeature.resolvePin(benchmarkLaunch = false, "not-hex"))
+        assertEquals(
+            "0a0b0c0d0e0f",
+            RelayedCallsFeature.pinLabel(RelayedCallsFeature.resolvePin(benchmarkLaunch = true, "0a0b0c0d0e0f")),
+        )
+        assertEquals("invalid", RelayedCallsFeature.pinLabel(RelayedCallsFeature.resolvePin(benchmarkLaunch = true, "bad")))
     }
 }

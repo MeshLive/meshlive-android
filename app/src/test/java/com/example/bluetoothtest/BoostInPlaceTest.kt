@@ -87,7 +87,8 @@ class BoostInPlaceTest {
         AdvertisingSwitches.reset()
         assertTrue(AdvertisingSwitches.inPlaceBoost)
         AdvertisingSwitches.applyExtras({ name, default -> if (name == "test_adv_inplace_boost") false else default }, { _, default -> default })
-        assertFalse(AdvertisingSwitches.inPlaceBoost)
+        // =false is the DEBUG control arm: a release build keeps the promoted boost on.
+        assertEquals(!BuildConfig.DEBUG, AdvertisingSwitches.inPlaceBoost)
         AdvertisingSwitches.reset()
         assertTrue(AdvertisingSwitches.inPlaceBoost)
     }

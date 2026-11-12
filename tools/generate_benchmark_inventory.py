@@ -14,6 +14,10 @@ from run_private_call_benchmark import validate_call_case
 ROOT = Path(__file__).resolve().parents[1]
 TIERS = ("low", "high")
 CALL_TIERS = (("low", "low"), ("high", "high"), ("low", "high"), ("high", "low"))
+
+# Wi-Fi carrier dimension (Design WF). Absent carrier = the earlier Bluetooth-only request (identity unchanged).
+CARRIERS = ("wifi_aware", "wifi_aware_wider", "wifi_direct", "wifi_aware_native")
+NATIVE_PROFILE_TRANSPORT = "gatt"  # a Wi-Fi-native hop has no Bluetooth transport; the lowest cap (no rate is raised, D8) is its reference
 SWEEP_FAMILIES = acceptance.SWEEP_FAMILIES[acceptance.V3]  # v3 default; scope acceptance_profile selects another
 
 # Fractions scale only the declared control schedule, never media settings.
@@ -242,16 +246,47 @@ def input_requirements(cases):
             "Network impairments", "Optical latency", "Acoustic/A-V synchronization", "Endurance"]}
 
 
+def retired_requirements(scope):
+    """The scope's inline ``retired_requirements`` plus every ``retired_requirement_files`` entry.
+
+    A retirement file is ``{"reason": "...", "ids": ["request-id", ...]}``: one reason for many request IDs
+    that no longer exist (for example after a capability refresh changed the sampled profiles), so the scope
+    stays small. Each ID becomes an ordinary ``{"id", "reason"}`` row in the inventory.
+    """
+    rows = list(scope.get("retired_requirements", []))
+    for name in scope.get("retired_requirement_files", []):
+        group = read(name)
+        reason, ids = group.get("reason"), group.get("ids")
+        if (not isinstance(reason, str) or not reason.strip() or not isinstance(ids, list) or
+                any(not isinstance(item, str) or not item.strip() for item in ids)):
+            raise ValueError(f"Retirement file {name} needs one explicit reason and a list of request identities")
+        rows.extend({"id": item, "reason": reason} for item in ids)
+    return rows
+
+
 def compile_inventory(scope, capabilities, selected=None, provenance=None, problems=None):
     required = list(scope["required_phones"])
-    selected = list(required if selected is None else selected)
-    if len(set(required)) != len(required) or len(set(selected)) != len(selected) or not set(selected) <= set(required):
-        raise ValueError("Required/selected aliases must be unique; selected phones must belong to scope")
+    # Extension phones (scope `extension_phones`, for example a registered phone that is not on the bench today) are
+    # compiled like required ones, so their exact case IDs persist, but a run never needs them: `required_phones`
+    # names only the fixed phones. Without the key the compiled set is the required set, as before.
+    extension = list(scope.get("extension_phones", []))
+    universe = required + extension
+    selected = list(universe if selected is None else selected)
+    if (len(set(universe)) != len(universe) or len(set(selected)) != len(selected) or
+            not set(selected) <= set(universe)):
+        raise ValueError("Required/extension/selected aliases must be unique; selected phones must belong to scope")
     acceptance.families_for(scope.get("acceptance_profile"))  # Unknown profile versions raise.
     transports = scope.get("transports", ["classic", "ble", "gatt"])
     if not transports or len(set(transports)) != len(transports) or set(transports) - {"classic", "ble", "gatt"}:
         raise ValueError("Transports must be unique supported runner names")
-    retired = scope.get("retired_requirements", [])
+    carriers = scope.get("carriers", [])
+    if not isinstance(carriers, list) or len(set(carriers)) != len(carriers) or set(carriers) - set(CARRIERS):
+        raise ValueError("Carriers must be unique names from " + ", ".join(CARRIERS))
+    carrier_eligibility = scope.get("carrier_eligibility", {})
+    if (not isinstance(carrier_eligibility, dict) or set(carrier_eligibility) - set(CARRIERS) or
+            any(not isinstance(v, list) or not set(v) <= set(universe) for v in carrier_eligibility.values())):
+        raise ValueError("Carrier eligibility must list required or extension phone aliases per carrier")
+    retired = retired_requirements(scope)
     if any(not isinstance(r.get("id"), str) or not r["id"].strip() or
            not isinstance(r.get("reason"), str) or not r["reason"].strip() for r in retired):
         raise ValueError("Every retired requirement needs its prior identity and an explicit reason")
@@ -266,8 +301,8 @@ def compile_inventory(scope, capabilities, selected=None, provenance=None, probl
                 not math.isfinite(duration) or duration <= 0 or duration >= scope.get("duration_s", 90)):
             raise ValueError("Settings sweep duration must be positive and shorter than the acceptance request")
         if (not isinstance(sweep_pairs, list) or any(not isinstance(p, list) or len(p) != 2 or p[0] == p[1] or
-                not set(p) <= set(required) for p in sweep_pairs) or len({tuple(p) for p in sweep_pairs}) != len(sweep_pairs)):
-            raise ValueError("Settings sweep pairs must be explicit unique directed pairs from required phones")
+                not set(p) <= set(universe) for p in sweep_pairs) or len({tuple(p) for p in sweep_pairs}) != len(sweep_pairs)):
+            raise ValueError("Settings sweep pairs must be explicit unique directed pairs from required or extension phones")
     lifecycle_duration = scope.get("lifecycle_duration_s", 120)
     if isinstance(lifecycle_duration, bool) or not isinstance(lifecycle_duration, (int, float)) or not math.isfinite(lifecycle_duration) or lifecycle_duration < 120:
         raise ValueError("Lifecycle duration must be at least 120 seconds for the declared control/recovery schedules")
@@ -276,7 +311,7 @@ def compile_inventory(scope, capabilities, selected=None, provenance=None, probl
     rows = []
     blocked_requests = set()
     # Synthetic registry only validates structure; real identity/live checks remain runner-owned.
-    registry = {p: {"serial": "offline-" + p, "node_prefix": f"{i + 1:012x}"} for i, p in enumerate(required)}
+    registry = {p: {"serial": "offline-" + p, "node_prefix": f"{i + 1:012x}"} for i, p in enumerate(universe)}
 
     def add(kind, request, row):
         case_id = request_id(request, kind)
@@ -308,13 +343,19 @@ def compile_inventory(scope, capabilities, selected=None, provenance=None, probl
                 row["lifecycle_case_ids"][template] = case_id
 
     for kind, length in (("broadcast", 2), ("call", 2), ("chain", 3)):
-        for phones in itertools.permutations(required, length):
-            for transport in transports:
-                assignment = {"kind": kind, "phones": list(phones), "transport": transport}
+        for phones in itertools.permutations(universe, length):
+            for transport, carrier in itertools.product(transports, (None, *carriers)):
+                if carrier == "wifi_aware_native" and transport != NATIVE_PROFILE_TRANSPORT:
+                    continue
+                extra = {"carrier": carrier} if carrier else {}
+                assignment = {"kind": kind, "phones": list(phones), "transport": transport, **extra}
                 row = {"id": request_id(assignment, "obligation"), **assignment, "state": "NOT RUN",
                        "eligibility": "UNMEASURED", "case_ids": [], "blocked_profiles": [],
                        "lifecycle_case_ids": {}, "retired_case_ids": []}
                 rows.append(row)
+                if carrier == "wifi_aware_native":
+                    row.update(eligibility="BLOCKED", reason="wifi_aware_native needs Bluetooth turned off on both phones, which the runner cannot do; run it by hand (package A8 phone steps)")
+                    continue
                 missing = [p for p in phones if p not in capabilities or p in problems]
                 if missing:
                     row.update(eligibility="BLOCKED", reason="; ".join(
@@ -323,6 +364,11 @@ def compile_inventory(scope, capabilities, selected=None, provenance=None, probl
                 if not set(phones) <= set(selected):
                     row["reason"] = "Participants not all selected; physical availability is unmeasured"
                     continue
+                if carrier:
+                    unlisted = [p for p in phones if p not in carrier_eligibility.get(carrier, [])]
+                    if unlisted:
+                        row.update(eligibility="BLOCKED", reason=f"{carrier} is not declared for {', '.join(unlisted)} in the scope; census pending or not supported")
+                        continue
                 source = phones[0]
                 caps = capabilities[source]
                 choices = offered(caps, [capabilities[p] for p in phones[1:]], transport,
@@ -340,14 +386,14 @@ def compile_inventory(scope, capabilities, selected=None, provenance=None, probl
                                         for p, (e, a, b), tier in zip(phones, (first, second), tiers)}
                             request = {"caller": source, "callee": peer, "transport": transport,
                                        "profiles": profiles, "setup_action": "accept",
-                                       "duration_s": scope.get("duration_s", 90), "media_trace": True}
+                                       "duration_s": scope.get("duration_s", 90), "media_trace": True, **extra}
                             add(kind, request, row)
                     selected_profiles = {
                         source: lifecycle_profile(caps, choices, transport, caps.get("playback", [])),
                         peer: lifecycle_profile(capabilities[peer], other, transport, capabilities[peer].get("playback", []))}
                     if all(selected_profiles.values()):
                         add_lifecycle(kind, {"caller": source, "callee": peer, "transport": transport,
-                            "profiles": selected_profiles, "setup_action": "accept", "media_trace": True},
+                            "profiles": selected_profiles, "setup_action": "accept", "media_trace": True, **extra},
                             row, phones, ("call_controls", "call_decline", "call_cancel"))
                 else:
                     buffers = sorted(set(caps.get("playback", [])).intersection(
@@ -366,12 +412,12 @@ def compile_inventory(scope, capabilities, selected=None, provenance=None, probl
                                        "profile": profile(caps, encoder, allocation, transport, tier, playback),
                                        "receivers": [{"phone": child, "parent": parent}
                                                      for parent, child in zip(phones, phones[1:])],
-                                       "duration_s": scope.get("duration_s", 90), "media_trace": True}
+                                       "duration_s": scope.get("duration_s", 90), "media_trace": True, **extra}
                             add(kind, request, row)
                     if selected_profile:
                         add_lifecycle(kind, {"source": source, "transport": transport,
                             "profile": selected_profile, "receivers": [{"phone": child, "parent": parent}
-                                for parent, child in zip(phones, phones[1:])], "media_trace": True}, row, phones,
+                                for parent, child in zip(phones, phones[1:])], "media_trace": True, **extra}, row, phones,
                             ("chain_controls", "chain_leaf_rejoin", "chain_middle_rejoin") if kind == "chain" else
                             ("broadcast_controls", "receiver_rejoin"))
                 row["case_ids"] = sorted(set(row["case_ids"]))
@@ -386,7 +432,7 @@ def compile_inventory(scope, capabilities, selected=None, provenance=None, probl
                  "state": "NOT RUN", "required_families": list(acceptance.sweep_families_for(scope.get("acceptance_profile"))), "case_ids": [], "coverage": [],
                  "purpose": "Short diagnostic of individual settings and feasible boundary interactions; not full acceptance or endurance",
                  "selection": "Fixed directed pairs. Cover least frequent uncovered native-mode values, preferring tuples that cover other missing values, plus low-FPS/high-rate, large-geometry/low-rate and maximum-pixel-rate boundaries. Allocation and shared buffer choices vary linearly at the maximum-pixel-rate anchor; no full product claim."}
-        assignments = {(tuple(r["phones"]), r["transport"]): r for r in rows if r["kind"] == "broadcast"}
+        assignments = {(tuple(r["phones"]), r["transport"]): r for r in rows if r["kind"] == "broadcast" and "carrier" not in r}
         for source, receiver in sorted(sweep_pairs):
             for transport in sorted(transports):
                 row = assignments[((source, receiver), transport)]
@@ -433,10 +479,12 @@ def compile_inventory(scope, capabilities, selected=None, provenance=None, probl
                 row["retired_case_ids"] = sorted(set(row["retired_case_ids"]))
         sweep["case_ids"] = sorted(set(sweep["case_ids"]))
     inventory = {"schema": "benchmark-inventory-v1", "state": "NOT RUN", "required_phones": required,
+        **({"extension_phones": extension} if extension else {}),
         "selected_phones": selected, "availability": {p: {"selected": p in selected, "status": "UNMEASURED",
-            "reason": "Offline selection is not live connectivity or ownership proof"} for p in required},
+            "reason": "Offline selection is not live connectivity or ownership proof"} for p in universe},
         "capability_provenance": provenance, "assignments": rows,
         "retired_requirements": retired,
+        **({"carriers": carriers, "carrier_eligibility": carrier_eligibility} if carriers else {}),
         **({"acceptance_profile": scope["acceptance_profile"]} if scope.get("acceptance_profile", acceptance.V3) != acceptance.V3 else {}),
         "lifecycle_templates": {name: {"state": "NOT RUN", "source_kind": "live_camera_bidirectional" if name.startswith("call_") else "live_camera",
             "duration_s": lifecycle_duration, "schedule": [{"fraction": fraction, "role": role, "action": action}
@@ -445,7 +493,7 @@ def compile_inventory(scope, capabilities, selected=None, provenance=None, probl
             "prerequisites": ["Current live identity/capability/permission checks; generated actions are not acknowledgements"] +
                 (["Front-camera capability and flip preservation remain unmeasured from back-camera exports"] if name == "call_controls" else [])}
             for name, events in LIFECYCLE_TEMPLATES.items()},
-        "required_topology_space": topology_space(required, transports),
+        "required_topology_space": topology_space(universe, transports),
         "selected_topology_space": topology_space(selected, transports),
         "full_setting_space": setting_space(capabilities, transports),
         "combination_rules": {
@@ -461,7 +509,8 @@ def compile_inventory(scope, capabilities, selected=None, provenance=None, probl
                       "Longer/branch/mixed/relayed-call obligations symbolic only; no execution or acceptance claim",
                       "Camera/acoustic/optical/endurance/network-impairment adapters remain separate"]}
     cases = {kind: sorted(values.values(), key=lambda c: c["id"]) for kind, values in suites.items()}
-    summary = {"state": "NOT RUN", "required_phones": required, "selected_phones": selected,
+    summary = {"state": "NOT RUN", "required_phones": required, **({"extension_phones": extension} if extension else {}),
+               "selected_phones": selected,
                "cases": {k: len(v) for k, v in cases.items()},
                "lifecycle_cases": {kind: sum(len(r["lifecycle_case_ids"]) for r in rows if r["kind"] == kind)
                                    for kind in cases},
@@ -484,7 +533,7 @@ def main(argv=None):
     scope = read(scope_path)
     caps, provenance, problems = {}, {}, {}
     registry = read(resolve(scope["registry"]))["devices"]
-    for phone in scope["required_phones"]:
+    for phone in [*scope["required_phones"], *scope.get("extension_phones", [])]:
         try:
             path = resolve(scope["capabilities"][phone])
             raw = path.read_bytes()

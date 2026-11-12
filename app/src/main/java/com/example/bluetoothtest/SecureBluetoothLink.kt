@@ -5,6 +5,7 @@ import java.io.ByteArrayOutputStream
 import java.io.Closeable
 import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.security.GeneralSecurityException
@@ -38,16 +39,38 @@ enum class SecureRecordType(val wireValue: Int) {
      * unless [SecureRecordReader.acceptRelaySetup], so every existing reader is unchanged.
      */
     RELAY_SETUP(12),
+
+    /**
+     * Wi-Fi upgrade records `BWF1` (PROTOCOL "Wi-Fi transport"): `CAPS`, `HOST`, `DECLINE`, `PICK`, `ARMED`, `BIND`,
+     * `READY`, `SWITCH`, `RESUME`, `CLOSE`, `CREDS`. A reader rejects this type as unknown unless its owner opted in with
+     * [SecureRecordReader.acceptWifi], so every existing reader is unchanged. Numbers 14 and 15 stay reserved by other drafts.
+     */
+    BWF1(16),
 }
 
 data class SecureRecord(val type: SecureRecordType, val payload: ByteArray)
 
+/** Where sealed hop payloads go: one link writer, or (Wi-Fi upgrade) a carrier router that chooses a carrier per record. */
+interface RecordSink {
+    /** Writes one hop record; returns the wire bytes the record occupies (header + ciphertext), counted when it is handed over or queued; 0 only when it was dropped. [API] */
+    fun write(type: SecureRecordType, payload: ByteArray): Int
+}
+
+/** Wire bytes one BMS1 record adds to its payload: header plus AEAD tag. */
+internal const val SECURE_RECORD_OVERHEAD_BYTES = SecureRecordProtocol.HEADER_BYTES + MeshAead.TAG_BYTES
+
 class SecureRecordWriter internal constructor(
     private val output: OutputStream,
     key: ByteArray,
-) : Closeable {
+) : HopRecordSink, Closeable {
     private val key = key.copyOf()
     private var nextSequence = 0L
+    /**
+     * Guards [key] and [aead] between sealing and [close]. Held only while a record is sealed (no I/O), so [close] never
+     * waits on a blocked socket write. A7 review P1-1: no record is ever sealed with a wiped key.
+     */
+    private val keyLock = Any()
+    @Volatile private var closed = false
 
     /** Records written so far, which is also the sequence of the next one (diagnostics: relay counters at close). */
     val recordsWritten: Long
@@ -56,18 +79,24 @@ class SecureRecordWriter internal constructor(
     private val aead = if (DebugTunables.aeadCipherReuse) MeshAead.Context() else null
 
     @Synchronized
-    fun write(type: SecureRecordType, payload: ByteArray): Int {
+    override fun write(type: SecureRecordType, payload: ByteArray): Int {
         require(payload.size <= MAX_PLAINTEXT_BYTES) { "Secure record is too large" }
         val ciphertextBytes = payload.size + MeshAead.TAG_BYTES
         val header = SecureRecordProtocol.encodeHeader(type, nextSequence, ciphertextBytes)
         if (aead != null) {
             // One array and one write: the same bytes as the header and ciphertext written one after the other.
-            val record = aead.sealAfter(key, nextSequence, header, payload)
+            val record = synchronized(keyLock) {
+                if (closed) throw IOException(CLOSED_MESSAGE)
+                aead.sealAfter(key, nextSequence, header, payload)
+            }
             output.write(record)
             nextSequence++
             return record.size
         }
-        val ciphertext = MeshAead.encrypt(key, nextSequence, payload, header)
+        val ciphertext = synchronized(keyLock) {
+            if (closed) throw IOException(CLOSED_MESSAGE)
+            MeshAead.encrypt(key, nextSequence, payload, header)
+        }
         output.write(header)
         output.write(ciphertext)
         nextSequence++
@@ -75,28 +104,38 @@ class SecureRecordWriter internal constructor(
     }
 
     @Synchronized
-    fun flush() = output.flush()
+    override fun flush() = output.flush()
 
+    /** Wipes the key; every later [write] throws instead of sealing (a write that is sealing finishes first). */
     override fun close() {
-        key.fill(0)
-        aead?.release()
+        synchronized(keyLock) {
+            closed = true
+            key.fill(0)
+            aead?.release()
+        }
     }
 
     companion object {
         const val MAX_PLAINTEXT_BYTES = StreamProtocol.MAX_PAYLOAD_BYTES + 128
+
+        /** The message of the [IOException] a closed writer or reader throws. */
+        internal const val CLOSED_MESSAGE = "Secure link closed"
     }
 }
 
 class SecureRecordReader internal constructor(
     input: InputStream,
     key: ByteArray,
-) : Closeable {
+) : HopRecordSource, Closeable {
     private val arrival = ArrivalTrainMeter()
     private val input = DataInputStream(ArrivalTimedInputStream(input, arrival))
     private val key = key.copyOf()
     private var nextSequence = 0L
     /** Experimental AEAD reuse (MeshAead.Context), null when off. */
     private val aead = if (DebugTunables.aeadCipherReuse) MeshAead.Context() else null
+    /** Guards [key] and [aead] between opening a record and [close] (never held across I/O). */
+    private val keyLock = Any()
+    @Volatile private var closed = false
 
     /**
      * Set only by the experimental store-and-forward path on a link it owns. False (default):
@@ -111,11 +150,18 @@ class SecureRecordReader internal constructor(
     @Volatile var acceptRelaySetup = false
 
     /**
+     * Wi-Fi upgrade (default off): set by the call or hop owner on a link where the BMH3 `WIFI` marker was exchanged
+     * (initiator sent it, responder saw it) or both BMH2 build tags allow it ([SecureBluetoothSession.wifiReadOptIn]).
+     * False (default): type 16 is an unknown record type, exactly as in a build before the type existed.
+     */
+    @Volatile var acceptWifi = false
+
+    /**
      * Largest ciphertext this reader allocates for one record; checked after the 17-byte header and before the
      * body is read. Unlimited (default) except on an audio-only live stream, where the end-to-end reader sets it
      * (PROTOCOL "Ingress budgets").
      */
-    @Volatile var maxCiphertextBytes = Int.MAX_VALUE
+    @Volatile override var maxCiphertextBytes: Int = Int.MAX_VALUE
 
     /** This link's recently delivered capacity, measured from large incoming records (kbps). */
     fun arrivalCapacityKbps(): Int? = arrival.estimateKbps()
@@ -138,11 +184,11 @@ class SecureRecordReader internal constructor(
         @Synchronized get() = nextSequence
 
     @Synchronized
-    fun read(): SecureRecord {
+    override fun read(): SecureRecord {
         arrival.beginRecord()
         val header = ByteArray(SecureRecordProtocol.HEADER_BYTES).also(input::readFully)
         val decoded = try {
-            SecureRecordProtocol.decodeHeader(header, acceptStoreForward, acceptDiscoveryOpening, acceptRelaySetup)
+            SecureRecordProtocol.decodeHeader(header, acceptStoreForward, acceptDiscoveryOpening, acceptRelaySetup, acceptWifi)
         } catch (error: RuntimeException) {
             HopIntegrityLog.headerFailure(header, error.message.orEmpty(), nextSequence, peekNextHeader(nextSequence + 1))
             throw error
@@ -158,10 +204,16 @@ class SecureRecordReader internal constructor(
         val ciphertext = ByteArray(decoded.ciphertextBytes).also(input::readFully)
         arrival.endRecord()
         val plaintext = try {
-            aead?.decrypt(key, decoded.sequence, ciphertext, header)
-                ?: MeshAead.decrypt(key, decoded.sequence, ciphertext, header)
+            synchronized(keyLock) {
+                if (closed) throw IOException(SecureRecordWriter.CLOSED_MESSAGE)
+                aead?.decrypt(key, decoded.sequence, ciphertext, header)
+                    ?: MeshAead.decrypt(key, decoded.sequence, ciphertext, header)
+            }
         } catch (error: GeneralSecurityException) {
             HopIntegrityLog.tagFailure(decoded.type, decoded.sequence, decoded.ciphertextBytes, peekNextHeader(decoded.sequence + 1))
+            // Experimental diagnostic (DEBUG, default off): ask a GR1 GATT peer for the record's chunks again and log
+            // which bytes differ. Nothing is opened or delivered from the resent copy; the link ends below as always.
+            if (DebugTunables.hopIntegrityResendDiff) HopIntegrityResendDiff.examine(header + ciphertext)
             // Type, sequence and size are in the hop_integrity line; this message reaches the user's screen.
             throw GeneralSecurityException("Secure link decrypt failed", error)
         }
@@ -182,7 +234,7 @@ class SecureRecordReader internal constructor(
         } else {
             val next = ByteArray(SecureRecordProtocol.HEADER_BYTES).also(input::readFully)
             val sequence = runCatching {
-                SecureRecordProtocol.decodeHeader(next, acceptStoreForward = true, acceptDiscoveryOpening = true, acceptRelaySetup = true).sequence
+                SecureRecordProtocol.decodeHeader(next, acceptStoreForward = true, acceptDiscoveryOpening = true, acceptRelaySetup = true, acceptWifi = true).sequence
             }.getOrNull()
             when (sequence) {
                 null -> HopNextHeader("invalid", available = available)
@@ -194,9 +246,13 @@ class SecureRecordReader internal constructor(
         HopNextHeader("unavailable")
     }
 
+    /** Wipes the key; a record that arrives later is refused, never opened. */
     override fun close() {
-        key.fill(0)
-        aead?.release()
+        synchronized(keyLock) {
+            closed = true
+            key.fill(0)
+            aead?.release()
+        }
     }
 }
 
@@ -270,18 +326,20 @@ private object SecureRecordProtocol {
         acceptStoreForward: Boolean = false,
         acceptDiscoveryOpening: Boolean = false,
         acceptRelaySetup: Boolean = false,
+        acceptWifi: Boolean = false,
     ): SecureRecordHeader {
         require(bytes.size == HEADER_BYTES) { "Invalid secure record header" }
         val input = DataInputStream(ByteArrayInputStream(bytes))
         val receivedMagic = ByteArray(magic.size).also(input::readFully)
         require(receivedMagic.contentEquals(magic)) { "Invalid secure record magic" }
         val typeValue = input.readUnsignedByte()
-        // The type byte stays in the message below: opt-in readers (types 11, 12, 13) are tested on it, and it names the
+        // The type byte stays in the message below: opt-in readers (types 11, 12, 13, 16) are tested on it, and it names the
         // protocol value refused, not a record's sequence or size.
         val type = SecureRecordType.entries.firstOrNull {
             it.wireValue == typeValue && (it != SecureRecordType.STORE_FORWARD || acceptStoreForward) &&
                 (it != SecureRecordType.DISCOVERY_OPENING || acceptDiscoveryOpening) &&
-                (it != SecureRecordType.RELAY_SETUP || acceptRelaySetup)
+                (it != SecureRecordType.RELAY_SETUP || acceptRelaySetup) &&
+                (it != SecureRecordType.BWF1 || acceptWifi)
         } ?: error("Unknown secure record type $typeValue")
         val sequence = input.readLong()
         require(sequence >= 0) { "Invalid secure record sequence" }
@@ -305,14 +363,44 @@ data class SecureBluetoothSession(
     val peerPseudonymous: Boolean = false,
     /** BMH3 pseudonyms: this phone presented a throwaway key in this handshake. */
     val ownPseudonymous: Boolean = false,
+    /**
+     * BMH3 pseudonyms: the node ID of the throwaway this phone presented ([ownPseudonymous]), derived from its key exactly as the
+     * link peer derives this phone's [peerNodeId]; null when no throwaway was presented. Read only by [PseudonymOwnLog].
+     */
+    val ownPseudonymNodeId: NodeId? = null,
     /** BVMID2 (responder): msg1's tag was the displayed verification code's, so this link is verify-only ([QrSessionScope]). */
     val qrTagMatched: Boolean = false,
     /** Design OR (DEBUG prototype): the `RELAY_SEEK` bits the peer signed in its BMH3 responder block; 0 = none or BMH2. */
     val peerRelaySeek: Int = 0,
+    /** Wi-Fi upgrade: this phone sent the BMH3 `WIFI` marker in its initiator block of this link handshake. */
+    val ownWifiMarker: Boolean = false,
+    /** Wi-Fi upgrade: the peer's verified initiator block carried the BMH3 `WIFI` marker (responder side only). */
+    val peerWifiMarker: Boolean = false,
+    /**
+     * Wi-Fi upgrade, BMH2 hops: both link hellos carried a signed build tag with a release number of at least
+     * [WifiWire.WIFI_FIRST_RELEASE] (step 5). False for every BMH3 hop.
+     */
+    val wifiBuildTagGate: Boolean = false,
+    /**
+     * Wi-Fi upgrade, hops (step 5): `UW_hop`, derived from this hop's two directional keys while they existed. Null only
+     * for a renewed GATT link and for sessions built outside the two hop handshakes. Zeroed by [close] and by
+     * [dropWifiKey]. Never compare a session with `==` for this field (it is a data class holding arrays: identity only);
+     * `copy()` is allowed only with `hopWifiKey = null` (package A5's carrier link), so a copy never shares the array. [R M-5]
+     */
+    val hopWifiKey: ByteArray? = null,
 ) : Closeable {
+    /** May this hop's reader accept `BWF1` records? (the owner sets `reader.acceptWifi = wifiReadOptIn` once, after the handshake). */
+    val wifiReadOptIn: Boolean get() = ownWifiMarker || peerWifiMarker || wifiBuildTagGate
+
+    /** Idempotent; called from any thread (hop ended, emergency wipe; never on a switch change). [R M-5] */
+    fun dropWifiKey() {
+        hopWifiKey?.fill(0)
+    }
+
     override fun close() {
         reader.close()
         writer.close()
+        dropWifiKey()
     }
 }
 
@@ -330,13 +418,15 @@ object SecureBluetoothHandshake {
         capabilities: NodeCapabilities,
         buildTag: BuildTag? = LinkBuildTags.local,
         bmh3: Bmh3InitiatorOptions? = null,
+        raiseTag: Boolean = false,
     ): SecureBluetoothSession {
         if (bmh3 != null) return Bmh3LinkHandshake.initiate(input, output, identity, capabilities, bmh3, buildTag)
-        val pending = MeshHandshake.start(identity, HandshakeRole.INITIATOR, capabilities, buildTag = buildTag)
+        val ownTag = WifiHopGate.ownTagFor(buildTag, raiseTag)
+        val pending = MeshHandshake.start(identity, HandshakeRole.INITIATOR, capabilities, buildTag = ownTag)
         writeHello(output, pending.hello)
         val remote = readHello(input)
         val keys = MeshHandshake.finish(pending, remote)
-        return session(input, output, remote, keys, initiator = true)
+        return session(input, output, remote, keys, initiator = true, ownBuildTag = ownTag)
     }
 
     /**
@@ -352,6 +442,7 @@ object SecureBluetoothHandshake {
         capabilities: NodeCapabilities,
         buildTag: BuildTag? = LinkBuildTags.local,
         bmh3: Bmh3ResponderOptions? = null,
+        raiseTag: Boolean = false,
         beforeHello: (NodeId) -> Unit = {},
     ): SecureBluetoothSession {
         val remote = if (bmh3 == null) {
@@ -368,11 +459,12 @@ object SecureBluetoothHandshake {
             HandshakeHelloCodec.decode(frame)
         }
         require(remote.role == HandshakeRole.INITIATOR) { "Expected an initiator handshake" }
-        val pending = MeshHandshake.start(identity, HandshakeRole.RESPONDER, capabilities, buildTag = buildTag)
+        val ownTag = WifiHopGate.ownTagFor(buildTag, raiseTag)
+        val pending = MeshHandshake.start(identity, HandshakeRole.RESPONDER, capabilities, buildTag = ownTag)
         val keys = MeshHandshake.finish(pending, remote)
         beforeHello(keys.peerNodeId)
         writeHello(output, pending.hello)
-        return session(input, output, remote, keys, initiator = false)
+        return session(input, output, remote, keys, initiator = false, ownBuildTag = ownTag)
     }
 
     private fun session(
@@ -381,6 +473,7 @@ object SecureBluetoothHandshake {
         remote: SignedHandshakeHello,
         keys: MeshSessionKeys,
         initiator: Boolean,
+        ownBuildTag: BuildTag?,
     ): SecureBluetoothSession {
         // Only a verified hello reaches here (MeshHandshake.finish checked its signature). Bit 7 belongs to
         // this layer: no other code ever sees the bit in peerCapabilities. The tag reaches the notice only from a
@@ -397,6 +490,8 @@ object SecureBluetoothHandshake {
             reader = SecureRecordReader(input, keys.receiveKey),
             writer = SecureRecordWriter(output, keys.sendKey),
             peerBuildTag = tag,
+            wifiBuildTagGate = WifiHopGate.bmh2TagsAllow(ownBuildTag, tag),
+            hopWifiKey = WifiHopPlumbing.hopUwOrNull(keys.sendKey, keys.receiveKey),
         ).also {
             keys.sendKey.fill(0)
             keys.receiveKey.fill(0)
@@ -427,7 +522,7 @@ object SecureLinkControlProtocol {
      * 3 reports" (see [CallDeliveryReports]): call endpoints before version 3 only ever sent version 2
      * reports on a direct link and accept a version-1 heartbeat as plain liveness.
      */
-    fun writeHeartbeat(writer: SecureRecordWriter): Int =
+    fun writeHeartbeat(writer: HopRecordSink): Int =
         writer.write(SecureRecordType.LINK_HEARTBEAT, byteArrayOf(VERSION.toByte()))
 
     /**
@@ -437,7 +532,7 @@ object SecureLinkControlProtocol {
      * forwarded (each phone handles its parent and direct children only). It stays inside the
      * authenticated, ordered link encryption.
      */
-    fun writeCapacityReport(writer: SecureRecordWriter, report: LinkCapacityReport): Int =
+    fun writeCapacityReport(writer: HopRecordSink, report: LinkCapacityReport): Int =
         writer.write(SecureRecordType.LINK_HEARTBEAT, encodeCapacityReport(report))
 
     /**

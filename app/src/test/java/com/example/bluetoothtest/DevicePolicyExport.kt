@@ -19,6 +19,9 @@ internal object DevicePolicyExport {
         // Set only where used, so other entries export exactly as before (tools/device_policy_report.py reads both).
         if (entry.supersededBy != null) fields["superseded_by"] = entry.supersededBy
         if (entry.arm != null) fields["arm"] = entry.arm.switch
+        // A promoted arm (its switch defaults on, e.g. test_gatt_native_wedge_guard since 2026-11-10) is in effect unless
+        // its control arm turns it off; the report must not list it as waiting for its arm.
+        if (entry.arm != null && entry.arm.on()) fields["arm_on_by_default"] = true
     }
 
     private fun entryFields(entry: DevicePolicyEntry): MutableMap<String, Any?> = linkedMapOf(

@@ -175,11 +175,9 @@ class HomeLayoutTest {
 
     @Test
     fun settingsNeverNestTwoLevels() {
-        // Every page opens from the top page, except Advanced privacy, which opens from Privacy (2026-10-17 redesign).
+        // Every page opens from the top page (Advanced privacy, the one second level, is gone since 2026-11-04).
         SettingsPage.entries.forEach { page ->
-            val allowed = page.parent == null || page.parent == SettingsPage.MAIN ||
-                (page == SettingsPage.PRIVACY_ADVANCED && page.parent == SettingsPage.PRIVACY)
-            assertTrue("${page.name} nests", allowed)
+            assertTrue("${page.name} nests", page.parent == null || page.parent == SettingsPage.MAIN)
         }
         // Every "Advanced" row opens one page of that group's options: it names a real page whose parent is the top page.
         val root = layout()
@@ -216,7 +214,6 @@ class HomeLayoutTest {
                 SettingsPage.MAIN -> "Main"
                 SettingsPage.VIDEO -> "Video"
                 SettingsPage.PRIVACY -> "Privacy"
-                SettingsPage.PRIVACY_ADVANCED -> "PrivacyAdvanced"
                 SettingsPage.CALLS -> "Calls"
                 SettingsPage.SHARE -> "Share"
                 SettingsPage.CONNECTION -> "Connection"

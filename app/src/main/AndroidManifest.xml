@@ -37,6 +37,14 @@
         android:name="android.permission.NEARBY_WIFI_DEVICES"
         android:usesPermissionFlags="neverForLocation"
         tools:targetApi="tiramisu" />
+    <!--
+        Wi-Fi Aware carrier (default off, Settings "Use Wi-Fi for faster connections"): ConnectivityManager.requestNetwork
+        for a Wi-Fi Aware data path needs this normal (install-time) permission; without it requestNetwork throws
+        SecurityException. Not used by anything else; ACCESS_NETWORK_STATE is the companion permission ConnectivityManager
+        callbacks expect (PlatformBehaviourGuardTest).
+    -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission
         android:name="android.permission.BLUETOOTH_SCAN"
@@ -69,6 +77,7 @@
     <uses-feature android:name="android.hardware.bluetooth" android:required="true" />
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
     <uses-feature android:name="android.hardware.wifi.direct" android:required="false" />
+    <uses-feature android:name="android.hardware.wifi.aware" android:required="false" />
     <!--
         Background reliability (BackgroundPolicy, diagnostics only): see whether a phone maker's
         documented background killer is installed (Don't Kill My App). Package visibility (API 30+)

@@ -19,6 +19,7 @@ import math
 from pathlib import Path
 
 import acceptance_profiles as acceptance
+import app_crash_events
 from benchmark_layout import original, output_path, resolve
 from evidence_relocation import logical
 import re
@@ -42,7 +43,16 @@ DEFAULT_THRESHOLDS = {
     "offered_load_fraction": 0.90,
 }
 ROLLING_CADENCE_GAPS = 256  # RollingLatencyStats capacity behind "surface cadence ... max"
+# A rendered interval is a whole number of display refreshes, so at 15 fps on a 60 Hz screen (4 or 5 refreshes per
+# frame) a healthy p95 is 83.33 ms plus timer noise: exactly the 1.25-period limit (83.4-85.2 ms read FAIL on calls
+# with zero freezes, q26-20261109e 24 of 24). The p95/p99 limits keep their meaning; the comparison allows this
+# fraction of one refresh of the receiving screen, the rounding of that grid. A late frame costs a whole refresh.
+# `surface_refresh_tolerance_periods` in a thresholds override changes it (0 = the comparison before 2026-11-10).
+DISPLAY_REFRESH_TOLERANCE_PERIODS = 0.5
+DEFAULT_DISPLAY_REFRESH_HZ = 60.0
 NUMBER = r"[0-9]+(?:\.[0-9]+)?"
+# The receiving phone's refresh rate when its log states one. No app build logs it yet (2026-11-10).
+DISPLAY_REFRESH = re.compile(rf"BENCHMARK display\b.*?\brefresh(?:Hz|RateHz|_hz)=({NUMBER})")
 LOG_LINE = re.compile(
     r"^(\d\d-\d\d \d\d:\d\d:\d\d\.\d+)\s+(\d+)\s+\d+\s+([VDIWEF])\s+([^:]+):\s?(.*)$"
 )
@@ -75,6 +85,8 @@ DECODER_LINE = re.compile(r"BENCHMARK decoder requested=(\S+) effective=(\S+) re
 LINK_PHY_LINE = re.compile(r"BENCHMARK link_phy requested=(\S+) effective=(\S+) reason=(\S+) source=(\S+)")
 ENDED_EVIDENCE = re.escape(ENDED_CALLBACK) + "|" + re.escape(ENDED_UI)
 NORMAL_END = r"(?:Call ended|Peer ended the call)"
+# DEBUG builds since B3 append the call's ID to the call-thread record: "Private call ended: <message> | callId=<uuid>".
+ENDED_CALL_ID = r"(?: \| callId=[0-9a-fA-F-]+)?"
 ENDED_UI_PAIRING_S = 10.0
 
 
@@ -95,9 +107,30 @@ UNEXPECTED = re.compile(
     r"Incoming GATT stream stopped:|immediate parent withdrew|BAD_DECRYPT|"
     # Android withheld requested foreground-service types (e.g. camera/microphone in the background) or refused
     # the session service: the session ran without what it requested (BackgroundReliability.kt).
-    r"BENCHMARK foreground_service: .*refused=(?!none\b)",
+    r"BENCHMARK foreground_service: .*refused=(?!none\b)|"
+    # A Wi-Fi carrier that died (`carrier_death`): an unexpected event unless it is the close of the planned hang-up.
+    r"BENCHMARK carrier_death:",
     re.IGNORECASE,
 )
+# The phone that did not hang up logs the carrier's read failing 0.1-0.3 s before its own `call phase ENDED` (the peer closed
+# the Wi-Fi socket first; w2v1h-20261110k and w2hi-20261110k: 19 EOFException, 1 SocketException, ageMs 77-199). That
+# close belongs to the planned End. A death inside the confirmed planned-end interval, or up to CARRIER_END_LEAD_S before
+# it, with this reason is planned; a "write stalled" or "silence" death, or any death elsewhere, stays unexpected.
+CARRIER_END_REASON = re.compile(r"BENCHMARK carrier_death: .*\| reason=read failed: (?:EOFException|SocketException)\b")
+CARRIER_END_LEAD_S = 1.0
+# A planned wifi_off (runner control event, phone clock) takes the Wi-Fi carrier away on purpose. The death it causes is
+# planned: the app's own reason names the toggle (`aware_down_wifi_off`, `wifi_off`), or the carrier's socket read fails
+# within WIFI_OFF_READ_FAILURE_S of the action (the peer sees the close, not the radio going down; the lead covers
+# the two phones' clocks). Any other reason, or a death elsewhere, stays unexpected.
+WIFI_OFF_REASON = re.compile(r"BENCHMARK carrier_death: .*\| reason=(?:aware_down_)?wifi_off\b")
+WIFI_OFF_READ_FAILURE = re.compile(r"BENCHMARK carrier_death: .*\| reason=read failed: ")
+WIFI_OFF_READ_FAILURE_S = 2.0
+WIFI_OFF_CLOCK_LEAD_S = 1.0
+BACK_ON_BLUETOOTH = re.compile(r"BENCHMARK carrier_switch: to=BLUETOOTH\b")
+# The central logs its own clean close of the GATT link as the call ends (`event=link_lost | status=0 | class=clean`, a few
+# hundred ms after `call phase ENDED`: un2g-20261110n ASUS > S22, w2hi-20261110k m31). Inside the same planned-end windows
+# that is the hang-up, not a lost link; any other status or class, or the same line mid-call, stays unexpected.
+LINK_CLOSE_AT_END = re.compile(r"BENCHMARK ll_gate: .*\| event=link_lost \| status=0 \| class=clean\b")
 
 
 def timestamp(value):
@@ -135,20 +168,109 @@ def scope_records(rows, spec):
                       "start": spec.get("start"), "end": spec.get("end"), "records": len(selected)}
 
 
+def planned_wifi_offs(manifest):
+    """Each acknowledged wifi_off with the instant it was issued (phone clock) and when Wi-Fi was planned back on."""
+    controls = [item for item in manifest.get("control_events", []) if item.get("time")]
+    result = []
+    for item in controls:
+        if item.get("action") != "wifi_off" or item.get("acknowledged") is False:
+            continue
+        at = timestamp(item["time"])
+        back = min((timestamp(other["time"]) for other in controls if other.get("action") == "wifi_on"
+                    and other.get("device") == item.get("device") and timestamp(other["time"]) > at),
+                   default=float("inf"))
+        result.append({"device": item.get("device"), "at": at, "time": item["time"], "until": back,
+                       "host_before": item.get("host_before"), "host_after": item.get("host_after")})
+    return result
+
+
+def planned_wifi_off_death(message, at, wifi_offs):
+    """True when this `carrier_death` line is the planned wifi_off's doing (see WIFI_OFF_REASON)."""
+    for item in wifi_offs:
+        if at < item["at"] - WIFI_OFF_CLOCK_LEAD_S:
+            continue
+        if WIFI_OFF_REASON.search(message) and at <= item["until"] + WIFI_OFF_CLOCK_LEAD_S:
+            return True
+        if WIFI_OFF_READ_FAILURE.search(message) and at <= item["at"] + WIFI_OFF_READ_FAILURE_S:
+            return True
+    return False
+
+
+def wifi_off_report(device, wifi_offs, rows, surface):
+    """Per planned wifi_off, from this phone's own log: the carrier death it saw, the time until its carrier was back on
+    Bluetooth, and the freeze counters across that stretch. Reported, never a gate: the freeze gates keep counting a freeze
+    here as they do anywhere else, and a call that was not on a Wi-Fi carrier has no death or switch to report."""
+    reports = []
+    for item in wifi_offs:
+        lead = item["at"] - WIFI_OFF_CLOCK_LEAD_S
+        death = next((row for row in rows if row["at"] >= lead and "BENCHMARK carrier_death:" in row["message"]), None)
+        back = next((row for row in rows if row["at"] >= lead and BACK_ON_BLUETOOTH.search(row["message"])), None)
+        report = {"toggled_device": item["device"], "role": "toggled" if item["device"] == device else "peer",
+                  "action_time": item["time"], "host_before": item["host_before"], "host_after": item["host_after"],
+                  "carrier_death": None if death is None else {
+                      "time": death["time"], "message": death["message"],
+                      "after_action_ms": (death["at"] - item["at"]) * 1000,
+                      "planned": planned_wifi_off_death(death["message"], death["at"], [item])},
+                  "back_on_bluetooth": None if back is None else {
+                      "time": back["time"], "ms": (back["at"] - item["at"]) * 1000}}
+        # Freeze counters are cumulative per report segment: take the last report at or before the action and the first
+        # report at or after the return to Bluetooth (the end of the capture when it never came), in the same segment.
+        before = next((sample for sample in reversed(surface) if sample["at"] <= item["at"]), None)
+        horizon = back["at"] if back else item["at"]
+        after = next((sample for sample in surface if sample["at"] >= horizon and (
+            before is None or sample["at"] > before["at"])), None)
+        if before and after and before["label"] == after["label"] and not after["final"] and all(
+                after[key] >= before[key] for key in ("frames", "freeze_events", "freeze_duration_ms")):
+            report["freeze"] = {"from": before["time"], "to": after["time"],
+                                "freeze_events": after["freeze_events"] - before["freeze_events"],
+                                "freeze_duration_ms": after["freeze_duration_ms"] - before["freeze_duration_ms"],
+                                "resolution": "periodic visible-continuity reports; never gated here"}
+        else:
+            report["freeze"] = {"status": "UNMEASURED",
+                                "reason": "no pair of visible-continuity reports in one segment around the toggle"}
+        reports.append(report)
+    return reports
+
+
 def overlaps(intervals, start, end):
     return any(item["from"] <= end and item["to"] >= start for item in intervals)
 
 
-def gate(value, limit, comparison="max", reason=None):
+def gate(value, limit, comparison="max", reason=None, tolerance=None):
+    """`tolerance` (a measurement resolution, in the value's unit) widens the comparison, never the recorded limit."""
     if value is None or limit is None:
         return {"status": "UNMEASURED", "value": None, "limit": limit,
                 "reason": reason or "Required measurement absent"}
     if any(type(item) not in (int, float) or not math.isfinite(item) for item in (value, limit)):
         return {"status": "UNMEASURED", "value": None, "limit": None,
                 "reason": "Measurement and target must be finite numbers"}
-    passed = value <= limit if comparison == "max" else value >= limit
+    slack = tolerance or 0
+    passed = value <= limit + slack if comparison == "max" else value >= limit - slack
     return {"status": "PASS" if passed else "FAIL", "value": value,
-            "limit": limit, "comparison": comparison}
+            "limit": limit, "comparison": comparison, **({"tolerance": tolerance} if tolerance is not None else {})}
+
+
+def display_refresh(rows, spec, manifest):
+    """(refresh rate in Hz, source) of the phone whose screen showed the frames: declared for the log or the device,
+    else the app's own line, else 60 Hz."""
+    declared = spec.get("display_refresh_hz") or (
+        (manifest.get("devices") or {}).get(spec.get("device")) or {}).get("display_refresh_hz")
+    if type(declared) in (int, float) and declared > 0:
+        return float(declared), "declared"
+    logged = next((float(match[1]) for row in rows if (match := DISPLAY_REFRESH.search(row["message"]))), None)
+    if logged:
+        return logged, "app_log"
+    return DEFAULT_DISPLAY_REFRESH_HZ, "default"
+
+
+def frame_interval_gate(value, period, periods, refresh):
+    """A rolling frame-interval percentile against `periods` source frame periods, compared on the display's grid."""
+    if not period:
+        return gate(None, None, reason="Expected FPS not specified")
+    hz, source, share = refresh
+    result = gate(value, period * periods, tolerance=1000 / hz * share)
+    return {**result, "display_refresh_hz": hz, "display_refresh_source": source,
+            "tolerance_basis": f"{share:g} of one {hz:g} Hz display refresh: rendered intervals are whole refreshes"}
 
 
 def limits_for(thresholds=None):
@@ -177,20 +299,22 @@ def value_range(values):
             "max": max(values) if values else None}
 
 
-def counter_summary(samples, intervals):
-    """Cumulative counters reset into segments; overlapping deltas stay ambiguous."""
+def counter_summary(samples, intervals, planned_at=()):
+    """Cumulative counters reset into segments; overlapping deltas stay ambiguous. A delta that ends at a time in
+    `planned_at` is the planned hang-up's own (see planned_end_freeze_samples): counted as `planned_end`."""
     if not samples:
-        return {"observed": None, "segments": [], "lifecycle_overlap": 0, "unexpected": None}
+        return {"observed": None, "segments": [], "lifecycle_overlap": 0, "unexpected": None, "planned_end": 0}
     if len(samples[0]) == 3:
         groups = {}
         for at, value, key in samples:
             groups.setdefault(key, []).append((at, value))
-        summaries = {key: counter_summary(values, intervals) for key, values in groups.items()}
+        summaries = {key: counter_summary(values, intervals, planned_at) for key, values in groups.items()}
         return {"observed": sum(item["observed"] for item in summaries.values()),
                 "segments": [value for item in summaries.values() for value in item["segments"]],
                 "lifecycle_overlap": sum(item["lifecycle_overlap"] for item in summaries.values()),
+                "planned_end": sum(item["planned_end"] for item in summaries.values()),
                 "unexpected": sum(item["unexpected"] for item in summaries.values()), "by_route_or_segment": summaries}
-    totals, total, unexpected, ambiguous = [], 0, 0, 0
+    totals, total, unexpected, ambiguous, planned_end = [], 0, 0, 0, 0
     previous = None
     for at, value in samples:
         if previous is None or value < previous[1]:
@@ -203,14 +327,75 @@ def counter_summary(samples, intervals):
             delta = value - previous[1]
             total = value
             begin = previous[0]
-        if overlaps(intervals, begin, at):
+        if previous is not None and at in planned_at and begin == previous[0]:
+            planned_end += delta
+        elif overlaps(intervals, begin, at):
             ambiguous += delta
         else:
             unexpected += delta
         previous = (at, value)
     totals.append(total)
-    return {"observed": sum(totals), "segments": totals,
+    return {"observed": sum(totals), "segments": totals, "planned_end": planned_end,
             "lifecycle_overlap": ambiguous, "unexpected": unexpected}
+
+
+PLANNED_END_FREEZE_EVENTS = 1
+# The hang-up gap is the peer's last frame to our snapshot: about one freeze threshold (218-287 ms against a 250 ms
+# threshold in w2rm2-20261110a). A report beyond 1.5 thresholds is a freeze in the call, not the hang-up.
+PLANNED_END_FREEZE_THRESHOLDS = 1.5
+END_PROOF_LOST_REASON = "log lines dropped by logd"  # the wording run_device_benchmark.LOG_DROP_REASON records
+
+
+def planned_end_freeze_samples(segments, end_intervals):
+    """The FINAL continuity report is taken when the call ends, so it counts the gap since the peer's last frame
+    as one short freeze. That gap belongs to the planned hang-up (w2rm2-20261110a: 7 of 10 calls, 218-287 ms), not
+    to the call. Only a FINAL report logged inside the phone's confirmed planned-end interval qualifies, and only
+    for one freeze event no longer than 1.5 freeze thresholds; anything longer, any periodic report before the
+    End, and any call with no confirmed planned End stay unexpected. The report interval straddles the End and
+    cannot be split, so a shorter, earlier freeze in the same interval is not distinguishable: it is listed here,
+    never silently dropped."""
+    result = []
+    for segment in segments:
+        for previous, sample in zip(segment, segment[1:]):
+            events = sample["freeze_events"] - previous["freeze_events"]
+            duration = sample["freeze_duration_ms"] - previous["freeze_duration_ms"]
+            if (sample["final"] and events > 0 and any(item["from"] <= sample["at"] <= item["to"] for item in end_intervals)
+                    and events <= PLANNED_END_FREEZE_EVENTS
+                    and duration <= PLANNED_END_FREEZE_THRESHOLDS * sample["freeze_threshold_ms"]):
+                result.append({"time": sample["time"], "at": sample["at"], "freeze_events": events,
+                               "freeze_duration_ms": duration, "reason": "FINAL report after the confirmed planned End"})
+    return result
+
+
+def app_crash_gate(manifest, device, base_path=Path(".")):
+    """FAIL when the phone's dumped crash/system buffers hold a crash or ANR of the app inside the case window;
+    UNMEASURED when the dump is absent, unreadable or changed since it was taken; None for a manifest recorded
+    before this capture existed (it has no `crash_logs`, so no gate is invented for it)."""
+    entries = [item for item in manifest.get("crash_logs", []) if item.get("device") == device]
+    if not entries:
+        return None
+    events, problems = [], []
+    for entry in entries:
+        if entry.get("status") != "MEASURED":
+            problems.append(entry.get("reason") or "the crash and system buffers were not read")
+            continue
+        try:
+            data = resolve(entry["path"], base_path).read_bytes()
+        except OSError as error:
+            problems.append(f"crash dump unreadable: {error}"[:200])
+            continue
+        if entry.get("sha256") and app_crash_events.sha256(data) != entry["sha256"]:
+            problems.append("crash dump differs from its recorded hash")
+            continue
+        events += app_crash_events.parse_crash_events(data.decode("utf-8", errors="replace"), entry.get("package") or
+                                                     app_crash_events.PACKAGE, entry.get("start"), entry.get("end"))
+    if events:
+        result = gate(len(events), 0)
+        result["events"] = events
+        return result
+    if problems:
+        return gate(None, 0, reason="; ".join(problems))
+    return gate(0, 0)
 
 
 def planned_overlap_seconds(planned, begin, end):
@@ -393,7 +578,7 @@ def score_log(text, spec, manifest=None, thresholds=None):
             continue
         proof = terminal[device]
         ended = next((row for row in selected if row["time"] == proof["ended"] and
-                      re.fullmatch(rf"(?:{re.escape(ENDED_CALLBACK)} |{re.escape(ENDED_UI)}){NORMAL_END}",
+                      re.fullmatch(rf"(?:{re.escape(ENDED_CALLBACK)} |{re.escape(ENDED_UI)}){NORMAL_END}{ENDED_CALL_ID}",
                                    row["message"])), None)
         available = next((row for row in selected if row["time"] == proof["available"] and
                           row["message"].startswith("BENCHMARK call available:")), None)
@@ -443,6 +628,20 @@ def score_log(text, spec, manifest=None, thresholds=None):
     # A confirmed private hang-up bounds sampled FPS; it cannot locate cumulative
     # losses or remove measured rolling cadence, encoder output or fatal events.
     lifecycle_planned = [item for item in planned if item.get("action") != "received_deliberate_private_end"]
+    carrier_end_windows = [(item["from"] - CARRIER_END_LEAD_S, item["to"]) for item in planned
+                           if item.get("action") == "received_deliberate_private_end"]
+    # The proof above needs both phones' terminal records; a log that lost one still shows this phone's own end: the runner's
+    # End control was acknowledged and the log's last phase is ENDED (no ACTIVE after it). The hang-up phone's ENDED must also
+    # sit next to its own control acknowledgement (same clock); the peer has no same-clock reference, only the structure.
+    ended = [row for row in selected if row["message"] == "BENCHMARK call phase ENDED"]
+    end_controls = [item for item in manifest.get("control_events", []) if item.get("action") == "end"
+                    and item.get("acknowledged") is True and item.get("state") != "FAIL"]
+    if ended and end_controls and not any(row["at"] > ended[-1]["at"] and row["message"] == "BENCHMARK call phase ACTIVE"
+                                          for row in selected):
+        own = next((item for item in end_controls if item.get("device") == device and item.get("ack_time")), None)
+        if own is None or abs(ended[-1]["at"] - timestamp(own["ack_time"])) <= 2.0:
+            carrier_end_windows.append((ended[-1]["at"] - CARRIER_END_LEAD_S, ended[-1]["at"] + CARRIER_END_LEAD_S))
+    wifi_offs = planned_wifi_offs(manifest)
     surface, encoder, startup, queues, events, thermal, profiles = [], [], [], [], [], [], []
     route_connections, authenticated_streams, encoder_configurations = [], [], []
     route_cutoff = min((timestamp(item["time"]) for item in manifest.get("topology_changes", [])
@@ -577,8 +776,12 @@ def score_log(text, spec, manifest=None, thresholds=None):
         if UNEXPECTED.search(message):
             # A normal hang-up is not proof of an unexpected failure.
             normal_end = re.search(r"Private call ended: (?:Call ended|Peer ended)", message, re.IGNORECASE)
+            carrier_end = bool(CARRIER_END_REASON.search(message) or LINK_CLOSE_AT_END.search(message)) and any(
+                low <= row["at"] <= high for low, high in carrier_end_windows)
+            wifi_off_death = "BENCHMARK carrier_death:" in message and planned_wifi_off_death(message, row["at"], wifi_offs)
             events.append({"time": row["time"], "message": message,
-                           "planned": bool(normal_end) or overlaps(lifecycle_planned, row["at"], row["at"])})
+                           "planned": bool(normal_end) or carrier_end or wifi_off_death or
+                                      overlaps(lifecycle_planned, row["at"], row["at"])})
 
     segments = []
     for sample in surface:
@@ -606,14 +809,28 @@ def score_log(text, spec, manifest=None, thresholds=None):
             if sample["frames"] > 1 and cadence and cadence["p50"] > 0 and not sample["cadence_lifecycle_overlap"]:
                 clean_cadence.append(cadence)
             previous = sample
-    freezes = counter_summary(freeze_rows, lifecycle_planned)
-    durations = counter_summary(duration_rows, lifecycle_planned)
+    confirmed_end = [item for item in planned if item.get("action") == "received_deliberate_private_end"]
+    planned_end_freezes = planned_end_freeze_samples(segments, confirmed_end)
+    # When logd dropped an endpoint's end line, no planned-end interval can be confirmed for either phone. A FINAL report
+    # the rule would have judged if the proof existed (one short freeze) is then neither excused nor blamed: it is set
+    # aside here and the gate is UNMEASURED. Freezes in earlier periodic reports are still counted.
+    end_loss = [item["terminal_log_loss"] for item in manifest.get("control_events", [])
+                if item.get("action") == "end" and item.get("terminal_log_loss")]
+    unjudged_end_freezes = [] if confirmed_end or not end_loss else planned_end_freeze_samples(
+        segments, [{"from": float("-inf"), "to": float("inf")}])
+    planned_at = {item["at"] for item in planned_end_freezes + unjudged_end_freezes}
+    freezes = counter_summary(freeze_rows, lifecycle_planned, planned_at)
+    durations = counter_summary(duration_rows, lifecycle_planned, planned_at)
     clean_fps = [item["visible_fps"] for item in intervals if not item["planned_overlap"]]
     clean_encoder = [item for item in encoder if not item["planned"]]
     drop_totals = {key: counter_summary(values, lifecycle_planned) for key, values in counters.items()}
+    refresh = (*display_refresh(selected, spec, manifest),
+               limits.get("surface_refresh_tolerance_periods", DISPLAY_REFRESH_TOLERANCE_PERIODS))
     gates = {
-        "surface_p95_ms": gate(max((item["p95"] for item in clean_cadence), default=None), period * limits["surface_p95_periods"] if period else None),
-        "surface_p99_ms": gate(max((item["p99"] for item in clean_cadence), default=None), period * limits["surface_p99_periods"] if period else None),
+        "surface_p95_ms": frame_interval_gate(max((item["p95"] for item in clean_cadence), default=None), period,
+                                              limits["surface_p95_periods"], refresh),
+        "surface_p99_ms": frame_interval_gate(max((item["p99"] for item in clean_cadence), default=None), period,
+                                              limits["surface_p99_periods"], refresh),
         "visible_fps": gate(min(clean_fps, default=None), fps * limits["visible_fps_fraction"] if fps else None, "min"),
         "unexpected_freeze_events": gate(freezes["unexpected"], limits["max_freeze_events"]),
         "unexpected_events": gate(sum(not item["planned"] for item in events) if selected else None, limits["max_unexpected_events"]),
@@ -621,6 +838,11 @@ def score_log(text, spec, manifest=None, thresholds=None):
     if not fps:
         for key in ("surface_p95_ms", "surface_p99_ms", "visible_fps"):
             gates[key] = gate(None, None, reason="Expected FPS not specified")
+    if unjudged_end_freezes and gates["unexpected_freeze_events"]["status"] == "PASS":
+        gates["unexpected_freeze_events"] = {**gate(None, limits["max_freeze_events"], reason=END_PROOF_LOST_REASON),
+                                             "detail": "The freeze in the FINAL report cannot be placed against a planned End: "
+                                                       "logd dropped the end line of at least one endpoint",
+                                             "log_loss": end_loss, "unjudged": unjudged_end_freezes}
     if freezes["lifecycle_overlap"] and gates["unexpected_freeze_events"]["status"] == "PASS":
         gates["unexpected_freeze_events"] = gate(None, limits["max_freeze_events"], reason="Freeze delta overlaps a planned action; cannot allocate individual gaps")
     if any(segment[0]["frames"] != 1 for segment in segments) and gates["unexpected_freeze_events"]["status"] == "PASS":
@@ -754,6 +976,11 @@ def score_log(text, spec, manifest=None, thresholds=None):
         first = next((sample for sample in surface if at <= sample["at"] < following and sample["frames"] == 1), None)
         elapsed = (first["at"] - at) * 1000 if first else None
         action_gate = gate(elapsed, limits["max_startup_ms"])
+        if action["action"] == "launch" and limits.get("join_gate_basis") == "selection":
+            # Design decision 2026-11-06 (Q-STARTUP-GATE): launch (cold start plus browsing) is reported, not gated;
+            # the 3 s join gate is selection_to_first_surface_ms.
+            action_gate = {**as_diagnostic(action_gate), "metric": "launch_to_first_surface_ms",
+                           "reason": "Launch-to-first-surface is reported separately; the join gate is selection_to_first_surface_ms"}
         if action["action"] == "connection_timeout":
             action_gate = {"status": "FAIL", "value": elapsed, "limit": limits["max_startup_ms"],
                            "reason": "Runner recorded a connection timeout; later frames do not erase the failure"}
@@ -762,6 +989,10 @@ def score_log(text, spec, manifest=None, thresholds=None):
     action_results.extend(parent_recoveries)
     action_gates = [item["first_surface_ms"] for item in action_results]
     lifecycle_status = aggregate_status(action_gates)
+    if action_gates and all(item["status"] == "DIAGNOSTIC" for item in action_gates):
+        # Only the reported-not-gated launch row exists: no lifecycle action decides, and the join itself is judged
+        # by the selection_to_first_surface_ms gate (absent that, it stays UNMEASURED there, never a pass).
+        lifecycle_status = "PASS"
     return {"device": device, "role": role, "scope": scope, "expected_fps": fps,
             "thresholds_version": limits["version"], "acceptance": acceptance_report,
             "expected_width": width, "expected_height": height, "expected_bitrate_kbps": expected_bitrate,
@@ -772,7 +1003,9 @@ def score_log(text, spec, manifest=None, thresholds=None):
             "link_phy": link_phy,
             "surface_segments": segments, "visible_fps_intervals": intervals,
             "surface_percentile_summary": "Worst observed rolling p95/p99; never averaged or represented as pooled percentiles",
-            "freezes": freezes, "freeze_duration_ms": durations, "drops": drop_totals,
+            "freezes": freezes, "freeze_duration_ms": durations, "planned_end_freezes": planned_end_freezes,
+            "unjudged_end_freezes": unjudged_end_freezes,
+            "drops": drop_totals,
             "input_loss_attribution": {"camera_input_drops": "Reported native camera input-pool cumulative loss; not every possible Camera2 miss",
                                        "raw_input_drops": "Cumulative raw scheduled slots missed or input buffers unavailable",
                                        "sender_drops": "Independent transport admission/recovery loss; never a substitute for source input loss"},
@@ -783,6 +1016,7 @@ def score_log(text, spec, manifest=None, thresholds=None):
             "encoder_configurations": encoder_configurations,
             "capacity_status": aggregate_status([*gates.values(), offered_load]),
             "queues": queues, "thermal": thermal, "startup": startup, "events": events, "profiles": profiles,
+            **({"wifi_off_events": wifi_off_report(device, wifi_offs, selected, surface)} if wifi_offs else {}),
             "coverage": {"actions_exercised": [item["action"] for item in action_results],
                          "optical_latency": "UNMEASURED", "aligned_fixture_fidelity": aggregate_status(optical_gates.values()),
                          "motion_blur": "UNMEASURED", "blockiness": "UNMEASURED"},
@@ -800,6 +1034,13 @@ def score_manifest(manifest, base_path=Path("."), thresholds=None):
         path = resolve(spec["path"], base_path)
         text = path.read_text(encoding="utf-8-sig", errors="replace")
         devices.append({"path": str(path), **score_log(text, spec, manifest, thresholds)})
+        crash = app_crash_gate(manifest, spec.get("device"), base_path)
+        if crash is not None:
+            devices[-1]["gates"]["app_crash_or_anr"] = crash
+            devices[-1]["log_status"] = aggregate_status(devices[-1]["gates"].values())
+            devices[-1]["overall_status"] = aggregate_status([
+                *devices[-1]["gates"].values(), *devices[-1]["optical_gates"].values(),
+                {"status": devices[-1]["lifecycle_status"]}])
     execution = {"runner_error": {"status": "FAIL" if manifest.get("runner_error") else "PASS",
                                   "value": manifest.get("runner_error")},
                  "connection_timeouts": gate(sum(item.get("action") == "connection_timeout"

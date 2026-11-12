@@ -115,11 +115,11 @@ class SavedContactCallsTest {
         val throwaway = "0a0b0c0d0e0f"
         val real = fingerprint.take(12)
         SessionPeerLabels.clearAll()
-        SessionPeerLabels.update(throwaway) { it.copy(selfName = "Rahul", callSubject = "Dinner") }
-        SessionPeerLabels.update(real) { it.copy(callSubject = "Later subject") }
+        SessionPeerLabels.update(throwaway) { it.copy(selfName = "Rahul", streamTitle = "Dinner") }
+        SessionPeerLabels.update(real) { it.copy(streamTitle = "Later title") }
         SessionPeerLabels.move(throwaway, real)
         assertNull(SessionPeerLabels.forPrefix(throwaway))
-        assertEquals(SessionPeerLabels.Entry(selfName = "Rahul", callSubject = "Later subject"), SessionPeerLabels.forPrefix(real))
+        assertEquals(SessionPeerLabels.Entry(selfName = "Rahul", streamTitle = "Later title"), SessionPeerLabels.forPrefix(real))
         SessionPeerLabels.move(real, real) // no reveal: nothing changes
         assertEquals("Rahul", SessionPeerLabels.forPrefix(real)?.selfName)
         SessionPeerLabels.clearAll()

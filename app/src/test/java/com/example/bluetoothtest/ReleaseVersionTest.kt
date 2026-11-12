@@ -76,5 +76,8 @@ class ReleaseVersionTest {
         // A split release of this base has release number = base.
         assertEquals(code, ReleaseNumber.fromVersionCode(code * 10L + 2))
         assertFalse(code <= 0)
+        // A release built from here must be able to use Wi-Fi with a phone on the same release (WifiWire.buildTagAllowsBwf1).
+        assertTrue("WIFI_FIRST_RELEASE ${WifiWire.WIFI_FIRST_RELEASE} is after this release $code", WifiWire.WIFI_FIRST_RELEASE <= code)
+        assertTrue(WifiWire.buildTagAllowsBwf1(BuildTag(code, false)))
     }
 }

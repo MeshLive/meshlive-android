@@ -83,7 +83,11 @@ class GattLinkPolicyTest {
     fun theOffSwitchTurnsEachActiveEntryOff() {
         for (entry in GattLinkPolicy.entries.filterNot { it.proposed }) {
             // A phone on which the entry applies (some entries match only the Android 10/11 stack or one SoC family).
-            val phone = listOf(traits(33), traits(30), traits(29), traits(33, "Xiaomi", "Mediatek")).firstOrNull {
+            val phone = listOf(
+                traits(33), traits(30), traits(29), traits(33, "Xiaomi", "Mediatek"),
+                // A MediaTek Realme UI phone on Android 16 (mediatek-coloros-native-gatt-client-wedge, API 36+ only).
+                traits(36, "realme", "Mediatek"),
+            ).firstOrNull {
                 DeviceFamilyPolicy.resolve(it, emptySet()).isActive(entry.id)
             }
             assertNotNull("${entry.id} applies to no test phone", phone)
@@ -268,6 +272,11 @@ class GattLinkPolicyTest {
         assertFalse(GattClientTeardown.registrationWaitFor(null))
         assertFalse(GattClientTeardown.registrationWaitFor(seen))
         GattSwitches.applyExtras({ key, d -> if (key == "test_gatt_close_deferral") false else d }, { _, d -> d }, { null })
+        if (!BuildConfig.DEBUG) {
+            // =false is a DEBUG control arm: a release build keeps close deferral on.
+            assertTrue(GattSwitches.closeDeferral)
+            return
+        }
         assertFalse(GattClientTeardown.registrationWaitFor(fresh))
     }
 

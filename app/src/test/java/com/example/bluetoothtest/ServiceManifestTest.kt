@@ -26,6 +26,13 @@ class ServiceManifestTest {
     }
 
     @Test
+    fun theWifiAwareDataPathPermissionsAreDeclared() {
+        // Without CHANGE_NETWORK_STATE ConnectivityManager.requestNetwork for an Aware data path throws SecurityException. [Am 8]
+        assertTrue(declaresPermission("CHANGE_NETWORK_STATE"))
+        assertTrue(declaresPermission("ACCESS_NETWORK_STATE"))
+    }
+
+    @Test
     fun theSessionServiceDeclaresTheLocationTypeAndItsPermission() {
         val service = Regex("<service\\s+android:name=\"\\.ActiveVideoSessionService\"[^>]*>", RegexOption.DOT_MATCHES_ALL)
             .find(manifest)!!.value

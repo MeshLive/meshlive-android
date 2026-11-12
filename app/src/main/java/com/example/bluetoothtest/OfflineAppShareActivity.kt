@@ -112,7 +112,7 @@ class OfflineAppShareActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        stopSharing("destroyed", null)
+        stopSharing("destroyed", null) // clears foreignDirectGroup once the group is gone (cleanGroup) [A4 review P3-2]
         worker.shutdownNow()
         super.onDestroy()
     }
@@ -189,10 +189,48 @@ class OfflineAppShareActivity : AppCompatActivity() {
     // --- Wi-Fi Direct group ------------------------------------------------------------------------
 
     private var apkInfo: AppApkInfo? = null
+    private var shareLease: DiscoveryPauseLease? = null
+    private var shareReserved = false
 
     @SuppressLint("MissingPermission")
     private fun startGroup(info: AppApkInfo, supports5Ghz: Boolean) {
         apkInfo = info
+        val lease = WifiRadio.pauseDiscoveryLease("share") // Wider reach's discovery holds the Aware attach: pause it first [M-10]
+        shareLease = lease
+        WifiRadio.scheduler.post { // FIFO behind the pause; never awaitPaused on the main thread
+            val reserved = WifiRadio.ledger.reserveDirect("share") == DirectReserve.OK
+            runOnUiThread {
+                when {
+                    stopped || isDestroyed -> {
+                        if (reserved) WifiRadio.ledger.releaseDirect("share")
+                        lease.resume()
+                    }
+                    !reserved -> {
+                        lease.resume()
+                        shareLease = null
+                        showStopped(OfflineAppSharePolicy.BUSY_MESSAGE)
+                    }
+                    else -> {
+                        shareReserved = true
+                        beginGroup(info, supports5Ghz)
+                    }
+                }
+            }
+        }
+    }
+
+    /** Release THEN resume; both idempotent. The group (if any) stays claimed by [foreignDirectGroup] until it is gone. */
+    private fun releaseShareClaim() {
+        if (shareReserved) {
+            shareReserved = false
+            WifiRadio.ledger.releaseDirect("share")
+        }
+        shareLease?.resume()
+        shareLease = null
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun beginGroup(info: AppApkInfo, supports5Ghz: Boolean) {
         val p2p = getSystemService(WifiP2pManager::class.java)
         if (p2p == null) {
             showStopped(getString(R.string.share_nearby_unsupported))
@@ -240,6 +278,7 @@ class OfflineAppShareActivity : AppCompatActivity() {
             override fun onSuccess() {
                 cleanGroup(groupLifecycle.created(), p2p, ch)
                 if (stopped) return
+                WifiRadio.ledger.foreignDirectGroup = true
                 log("group_created | attempt=${attempt.name.lowercase()}")
                 groupInfoTries = 0
                 handler.postDelayed({ readGroupInfo() }, 300L)
@@ -461,7 +500,13 @@ class OfflineAppShareActivity : AppCompatActivity() {
         val p2p = manager
         val ch = channel
         val cleanup = groupLifecycle.stop()
+        // The group (if any) stays claimed until removeGroup confirms it is gone, so an Aware attach never starts
+        // against a group that still exists (its failure would count as a local fault). [A4 review P3-2]
+        if (cleanup != NearbyGroupLifecycle.Cleanup.REMOVE_GROUP || p2p == null || ch == null) {
+            WifiRadio.ledger.foreignDirectGroup = false
+        }
         if (p2p != null && ch != null) cleanGroup(cleanup, p2p, ch)
+        releaseShareClaim()
         manager = null
         channel = null
         log("stopped | reason=$reason | apk_requests=$downloads")
@@ -475,7 +520,10 @@ class OfflineAppShareActivity : AppCompatActivity() {
             NearbyGroupLifecycle.Cleanup.CLOSE_CHANNEL -> runCatching { ch.close() }
             NearbyGroupLifecycle.Cleanup.REMOVE_GROUP -> runCatching {
                 p2p.removeGroup(ch, object : WifiP2pManager.ActionListener {
-                    override fun onSuccess() { runCatching { ch.close() } }
+                    override fun onSuccess() {
+                        WifiRadio.ledger.foreignDirectGroup = false // the group is gone [A4 review P3-2]
+                        runCatching { ch.close() }
+                    }
                     override fun onFailure(reason: Int) {
                         log("group_remove_failed | reason=$reason")
                         runCatching { ch.close() }
@@ -496,6 +544,7 @@ class OfflineAppShareActivity : AppCompatActivity() {
 
     private fun showStopped(message: String) {
         stopped = true
+        releaseShareClaim()
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         statusText.text = message
         listOf(wifiQr, urlQr, wifiCaption, urlCaption, countdownText, detailText).forEach { it.visibility = View.GONE }

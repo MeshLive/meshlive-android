@@ -233,6 +233,42 @@ class BenchmarkInventoryTest(unittest.TestCase):
         self.assertEqual(72, next(t["assignment_count"] for t in catalog["required_topology_space"]
                                  if t["kind"] == "homogeneous_chain" and t["role_slots"] == 3))
 
+    def test_a_phone_that_moves_from_required_to_extension_keeps_every_request_id(self):
+        # The owner's fixed phones changed (Xiaomi and A55 now extend the inventory): nothing they take part in is dropped.
+        wide = PHONES + ["a15s"]
+        caps = {p: capability(p) if p in PHONES else {**capability("a55"), "node_prefix": f"{7:012x}"} for p in wide}
+        scope = {"required_phones": PHONES[:4] + ["a15s"], "extension_phones": PHONES[4:], "transports": TRANS,
+                 "duration_s": 90}
+        old, _, _ = inventory.compile_inventory({**scope, "required_phones": PHONES, "extension_phones": []},
+                                                {p: caps[p] for p in PHONES})
+        new, inventory_doc, summary = inventory.compile_inventory(scope, caps)
+        for kind in old:
+            self.assertTrue({c["id"] for c in old[kind]} <= {c["id"] for c in new[kind]}, kind)
+        self.assertEqual(PHONES[:4] + ["a15s"], inventory_doc["required_phones"])
+        self.assertEqual(PHONES[4:], inventory_doc["extension_phones"])
+        self.assertEqual(PHONES[4:], summary["extension_phones"])
+        self.assertEqual(set(wide), set(inventory_doc["selected_phones"]))  # compiled: offline selection is not availability
+        self.assertTrue(any("a15s" in c["caller"] + c["callee"] for c in new["call"]))
+
+    def test_without_extension_phones_the_inventory_is_what_it_was(self):
+        _, doc, summary = compile_for(PHONES[:3])
+        self.assertNotIn("extension_phones", doc)
+        self.assertNotIn("extension_phones", summary)
+
+    def test_an_extension_phone_cannot_also_be_required(self):
+        with self.assertRaises(ValueError):
+            inventory.compile_inventory({"required_phones": PHONES[:3], "extension_phones": PHONES[2:4],
+                                         "transports": TRANS, "duration_s": 90}, {p: capability(p) for p in PHONES[:4]})
+
+    def test_carrier_eligibility_and_sweep_pairs_may_name_extension_phones(self):
+        scope = {"required_phones": PHONES[:3], "extension_phones": PHONES[3:4], "transports": TRANS, "duration_s": 90,
+                 "carriers": ["wifi_direct"], "carrier_eligibility": {"wifi_direct": PHONES[:4]},
+                 "settings_sweep": {"duration_s": 45, "pairs": [[PHONES[2], PHONES[3]]]}}
+        inventory.compile_inventory(scope, {p: capability(p) for p in PHONES[:4]})
+        scope["carrier_eligibility"] = {"wifi_direct": PHONES[:5]}
+        with self.assertRaises(ValueError):
+            inventory.compile_inventory(scope, {p: capability(p) for p in PHONES[:4]})
+
     def test_retiring_an_exact_requirement_removes_only_its_request(self):
         old, _, _ = compile_for(PHONES[:2])
         retired_id = old["broadcast"][0]["id"]
@@ -243,6 +279,28 @@ class BenchmarkInventoryTest(unittest.TestCase):
         self.assertEqual({c["id"] for v in old.values() for c in v} - {retired_id},
                          {c["id"] for v in new.values() for c in v})
         self.assertIn(retired_id, {i for r in catalog["assignments"] for i in r["retired_case_ids"]})
+
+    def test_retirement_file_retires_many_vanished_requests_with_one_reason(self):
+        caps = {p: capability(p) for p in PHONES[:2]}
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "retired.json"
+            path.write_text(json.dumps({"reason": "Capability refresh changed the sampled profiles",
+                                        "ids": ["gone-one", "gone-two"]}))
+            scope = {"required_phones": PHONES[:2], "transports": TRANS, "duration_s": 90,
+                     "retired_requirements": [{"id": "inline", "reason": "Removed by the owner"}],
+                     "retired_requirement_files": [str(path)]}
+            _, catalog, _ = inventory.compile_inventory(scope, caps)
+            self.assertEqual([("inline", "Removed by the owner"),
+                              ("gone-one", "Capability refresh changed the sampled profiles"),
+                              ("gone-two", "Capability refresh changed the sampled profiles")],
+                             [(row["id"], row["reason"]) for row in catalog["retired_requirements"]])
+            for bad in ({"reason": " ", "ids": ["x"]}, {"reason": "ok", "ids": [""]}, {"reason": "ok"}):
+                path.write_text(json.dumps(bad))
+                with self.assertRaisesRegex(ValueError, "explicit reason"):
+                    inventory.compile_inventory(scope, caps)
+            path.write_text(json.dumps({"reason": "ok", "ids": ["inline"]}))
+            with self.assertRaisesRegex(ValueError, "unique"):
+                inventory.compile_inventory(scope, caps)
 
     def test_retirement_records_require_reason_and_do_not_rewrite_requests(self):
         scope = {"required_phones": PHONES[:2], "retired_requirements": [{"id": "old-request", "reason": "User removed obsolete setting"}]}
@@ -407,6 +465,44 @@ class BenchmarkInventoryTest(unittest.TestCase):
                 inventory.main(["--scope", str(folder / "scope.json"), "--phones=", "--output", str(folder / "paused")])
             self.assertEqual([], json.loads((folder / "paused/settings-sweep-bundle.json").read_text())["suites"])
             self.assertEqual(0, json.loads((folder / "paused/summary.json").read_text())["settings_sweep_cases"])
+
+
+    def test_carrier_dimension_adds_new_ids_and_never_changes_existing_ones(self):
+        base, base_catalog, _ = compile_for(PHONES[:3])
+        scope = {"required_phones": PHONES[:3], "transports": TRANS, "duration_s": 90,
+                 "carriers": ["wifi_aware", "wifi_direct", "wifi_aware_native"],
+                 "carrier_eligibility": {"wifi_aware": ["s24", "s22"], "wifi_direct": PHONES[:3],
+                                         "wifi_aware_native": ["s24", "s22"]}}
+        cases, catalog, _ = inventory.compile_inventory(scope, {p: capability(p) for p in PHONES[:3]})
+        for kind in base:
+            self.assertEqual({c["id"] for c in base[kind]}, {c["id"] for c in cases[kind] if "carrier" not in c})
+            self.assertEqual([c for c in base[kind]], [c for c in cases[kind] if "carrier" not in c])
+        added = [c for kind in cases.values() for c in kind if "carrier" in c]
+        self.assertTrue(added)
+        self.assertFalse({c["id"] for c in added} & {c["id"] for v in base.values() for c in v})
+        self.assertEqual({"wifi_aware", "wifi_direct"}, {c["carrier"] for c in added})  # native is blocked, never a case
+        self.assertTrue(all(set(c["phones"] if "phones" in c else []) <= set(PHONES[:3]) for c in added))
+        wifi_aware = [c for c in added if c["carrier"] == "wifi_aware"]
+        self.assertTrue(all(c.get("source", c.get("caller")) in {"s24", "s22"} for c in wifi_aware))
+        native = [r for r in catalog["assignments"] if r.get("carrier") == "wifi_aware_native" and r["case_ids"] == []]
+        self.assertTrue(native and all(r["eligibility"] == "BLOCKED" for r in native))
+        self.assertTrue(any("m31" in r["phones"] and r.get("carrier") == "wifi_aware" and r["eligibility"] == "BLOCKED"
+                            for r in catalog["assignments"]))
+        self.assertEqual(0, len([r for r in base_catalog["assignments"] if "carrier" in r]))
+
+    def test_same_scope_without_carriers_is_byte_identical(self):
+        a = compile_for(PHONES[:3])
+        scope = {"required_phones": PHONES[:3], "transports": TRANS, "duration_s": 90, "carriers": []}
+        b = inventory.compile_inventory(scope, {p: capability(p) for p in PHONES[:3]})
+        self.assertEqual(json.dumps(a, sort_keys=True), json.dumps(b, sort_keys=True))
+
+    def test_unknown_carrier_and_unknown_eligible_phone_are_refused(self):
+        caps = {p: capability(p) for p in PHONES[:2]}
+        with self.assertRaises(ValueError):
+            inventory.compile_inventory({"required_phones": PHONES[:2], "transports": TRANS, "carriers": ["lte"]}, caps)
+        with self.assertRaises(ValueError):
+            inventory.compile_inventory({"required_phones": PHONES[:2], "transports": TRANS, "carriers": ["wifi_aware"],
+                                         "carrier_eligibility": {"wifi_aware": ["nobody"]}}, caps)
 
 
 if __name__ == "__main__":

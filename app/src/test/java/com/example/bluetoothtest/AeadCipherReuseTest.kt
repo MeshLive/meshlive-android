@@ -70,8 +70,9 @@ class AeadCipherReuseTest {
         assertArrayEquals(before.bytes.toByteArray(), after.bytes.toByteArray())
         val records = payloads.size + 1
         assertEquals(2 * records, before.writes)
-        // One write per hop record: a buffered link no longer flushes a large record's header on its own.
-        assertEquals(records, after.writes)
+        // One write per hop record: a buffered link no longer flushes a large record's header on its own. The reuse is an
+        // Experimental arm (value && BuildConfig.DEBUG): a release build keeps the shipped two writes per record.
+        assertEquals(if (BuildConfig.DEBUG) records else 2 * records, after.writes)
     }
 
     @Test

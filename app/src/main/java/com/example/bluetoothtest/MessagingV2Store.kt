@@ -131,11 +131,14 @@ class ThreadStore(private val dir: File, private val cipher: AtRestCipher, priva
     /** Stores or replaces [message]. Throws (and stores nothing) when a new message would exceed the row or byte cap. */
     @Synchronized
     fun save(message: ThreadMessage) {
-        val sealed = cipher.seal(encode(message))
-        val existing = messages.containsKey(message.id)
-        require(existing || messages.size < maxRows) { "Conversation storage is full (rows)" }
-        require(bytes() - (sizes[message.id] ?: 0) + sealed.size <= maxBytes) { "Conversation storage is full" }
-        atomicWrite(File(dir, "${message.id}.rec"), sealed)
+        val sealed = WipeGuard.guardedWrite("thread message") {
+            val record = cipher.seal(encode(message))
+            val existing = messages.containsKey(message.id)
+            require(existing || messages.size < maxRows) { "Conversation storage is full (rows)" }
+            require(bytes() - (sizes[message.id] ?: 0) + record.size <= maxBytes) { "Conversation storage is full" }
+            atomicWrite(File(dir, "${message.id}.rec"), record)
+            record
+        }
         messages[message.id] = message
         sizes[message.id] = sealed.size
     }

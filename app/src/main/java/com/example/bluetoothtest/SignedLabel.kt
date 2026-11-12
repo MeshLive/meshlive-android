@@ -9,7 +9,7 @@ import java.security.MessageDigest
 import java.util.UUID
 
 /**
- * Peer labels: optional names, call subjects and stream titles. Promoted 2026-10-11; since 2026-10-17 a
+ * Peer labels: optional names and stream titles (the kind 3 call subject is retired, 2026-11-05). Promoted 2026-10-11; since 2026-10-17 a
  * constant with no Settings switch, [CallFeatureDefaults.NAMES_AND_TITLES]. A
  * DEBUG benchmark launch uses only `test_peer_labels`. Naming design phase 1 with review fixes R1-R10
  * (PROTOCOL "Peer labels").
@@ -29,7 +29,7 @@ object PeerLabelFeature {
     @Volatile var enabled = false
 
     /**
-     * Naming v2 (Design G, G1): the PUBLIC stream title pages are a separate switch from the in-session names and subjects
+     * Naming v2 (Design G, G1): the PUBLIC stream title pages are a separate switch from the in-session names and titles
      * ([enabled]). A title is a title, not a person, and the Go-live dialog says it is public. The in-session stream title
      * (the signed label a joining viewer receives) still needs [enabled]; the advert pages and reading others' pages need
      * this. A constant like [enabled] ([NamingFeatures.TITLE_PAGES]); a DEBUG benchmark launch with `test_peer_labels`
@@ -41,16 +41,14 @@ object PeerLabelFeature {
     @Volatile internal var audience: NamesAudience = NamesAudience.EVERYONE
 
     /**
-     * "Show my name before they answer": the caller's name is queued before `INVITE` in a stranger (pseudonym) session.
-     * False is the Design F control arm, and what a DEBUG benchmark launch uses unless it gives `test_names_before_answer`.
+     * Experimental "Show my name before they answer" (`names_before_answer`, off since 2026-11-06): true queues the
+     * caller's name before `INVITE` in a stranger (pseudonym) session. False, the default of every launch, holds it until
+     * the callee's verified REVEAL passes the block check ([CallerNameRelease]).
      */
     @Volatile var nameBeforeAnswer = false
 
     /** Your optional display name (already normalized), or null for anonymous (handle only). */
     @Volatile var localName: String? = null
-
-    /** Subject typed for the next outgoing call; consumed when the call starts. */
-    @Volatile var pendingCallSubject: String? = null
 
     /** Title of the stream this phone is broadcasting (fixed for the stream's lifetime). */
     @Volatile var localStreamTitle: String? = null
@@ -107,6 +105,7 @@ internal object SignedLabelCodec {
     private val CONTAINER_MAGIC = "BLB1".toByteArray(Charsets.US_ASCII)
     const val VERSION = 1
     const val MAX_SPKI_BYTES = 512
+    /** Still 64: a retired kind 3 call subject from an older build (up to 64 bytes) must decode so it can be skipped. */
     const val MAX_TEXT_BYTES = 64
     const val MAX_SIGNATURE_BYTES = 256
     const val MAX_LABELS = 3
@@ -291,7 +290,8 @@ internal class LabelInbox(private val nowMs: () -> Long = System::currentTimeMil
                     logRejected(context, null, "malformed")
                     return@forEach
                 }
-                if (label.kind == null) return@forEach // Unknown kinds are skipped for later versions.
+                // Unknown kinds are skipped for later versions, and so is the retired kind 3 call subject from older ones.
+                if (label.kind == null) return@forEach
                 val kind = try {
                     SignedLabelCodec.verify(label, expectedSigner, expectedBinding)
                 } catch (error: LabelRejected) {
@@ -344,7 +344,7 @@ internal object LocalLabels {
 
 /** Writing and reading the single `LABELS` record at its fixed position on a stream hop. */
 internal object LabelRecords {
-    fun write(writer: SecureRecordWriter, sealer: EndToEndContentSealer, labels: List<ByteArray>) {
+    fun write(writer: HopRecordSink, sealer: EndToEndContentSealer, labels: List<ByteArray>) {
         writer.write(
             SecureRecordType.END_TO_END_CONTENT,
             sealer.seal(EndToEndContentType.LABELS, 0, SignedLabelCodec.encodeContainer(labels.take(SignedLabelCodec.MAX_LABELS))),
@@ -352,7 +352,7 @@ internal object LabelRecords {
     }
 
     /** Reads the promised `LABELS` record; any other record here is a framing error (fails closed). */
-    fun read(reader: SecureRecordReader, opener: EndToEndContentOpener): ByteArray {
+    fun read(reader: HopRecordSource, opener: EndToEndContentOpener): ByteArray {
         val record = reader.read()
         require(record.type == SecureRecordType.END_TO_END_CONTENT) { "Expected a LABELS record" }
         val opened = opener.open(record.payload)

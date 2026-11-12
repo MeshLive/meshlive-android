@@ -108,9 +108,10 @@ class PhyLinkPolicyTest {
         assertFalse(PhySwitches.priorityReassert)
         try {
             PhySwitches.applyFlags { it == "test_ll_gate" || it == "test_priority_reassert" }
-            assertTrue(PhySwitches.llGate)
+            // A release build ignores the launch flags: every experiment stays off.
+            assertEquals(BuildConfig.DEBUG, PhySwitches.llGate)
             assertFalse(PhySwitches.linkChangeRollback)
-            assertTrue(PhySwitches.priorityReassert)
+            assertEquals(BuildConfig.DEBUG, PhySwitches.priorityReassert)
         } finally {
             PhySwitches.applyFlags { false }
         }

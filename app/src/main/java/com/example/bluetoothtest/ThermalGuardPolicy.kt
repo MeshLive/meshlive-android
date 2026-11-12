@@ -6,6 +6,16 @@ object ThermalGuardPolicy {
     fun shouldBlockStreaming(status: Int): Boolean =
         status >= PowerManager.THERMAL_STATUS_CRITICAL
 
+    /**
+     * Calls at critical heat (DECISIONS 2026-11-06): heat never refuses a call, only its video. At [status] a
+     * phone places and answers voice calls, and its call camera stays off.
+     */
+    fun callVideoAllowed(status: Int): Boolean = !shouldBlockStreaming(status)
+
+    /** What a call [requested] by the user becomes at [status]: a video call goes on as voice at critical heat. */
+    fun callTypeAtHeat(requested: CallType, status: Int): CallType =
+        if (callVideoAllowed(status)) requested else CallType.VOICE
+
     fun shouldReduceWorkload(status: Int, reductionEnabled: Boolean): Boolean =
         reductionEnabled && status >= PowerManager.THERMAL_STATUS_MODERATE &&
             !shouldBlockStreaming(status)

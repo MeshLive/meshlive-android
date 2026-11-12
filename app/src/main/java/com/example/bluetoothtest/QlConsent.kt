@@ -21,4 +21,25 @@ internal object QlConsent {
         val stored = runCatching { write(recognise) }.isSuccess
         return stored && recognise
     }
+
+    /**
+     * The user confirmed a scan of [peer] and the shield was stored: records the recognition answer ([recognise]; null when
+     * no choice was shown) and lets this visit's sessions with [peer] offer and lease. Returns whether the scanning session
+     * may go on to the lease exchange.
+     */
+    fun confirmScan(
+        visit: MeetVisit,
+        peer: IdentityFingerprint,
+        recognise: Boolean?,
+        vaultUsable: Boolean,
+        /** The visit the confirmation was given in ([MeetVisit.begin]); null: the current one. */
+        visitToken: Long? = null,
+        write: (Boolean) -> Unit,
+    ): Boolean {
+        // The answer is stored first: until then this visit does not let [peer] be answered (a displayer session with
+        // [peer] running at the same moment must not offer or lease before a "No" is in place).
+        val mayOffer = if (recognise != null) applyAnswer(recognise, vaultUsable, write) else true
+        visit.confirm(peer, mayOffer, visitToken)
+        return mayOffer
+    }
 }

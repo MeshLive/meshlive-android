@@ -9,6 +9,7 @@ import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.CameraMetadata
+import android.hardware.camera2.CaptureFailure
 import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
@@ -77,7 +78,24 @@ class CameraVideoEncoder(
     private val gpuScale: GpuScaleRequest? = null,
     /** DEBUG encoder bench (EncoderBenchSpec): per-run overrides; null in every product path. */
     private val bench: EncoderBenchOverrides? = null,
+    /**
+     * AP5 `test_sw_shortfall_avc` (SoftwareEncoderShortfall; null in release builds): told once per session, with this
+     * encoder's name, size and requested FPS, when the native (software) encoder stayed short of the frame rate in force
+     * for SoftwareEncoderShortfall.SHORT_WINDOWS windows while its input kept up.
+     */
+    private val onSoftwareShortfall: ((SoftwareShortfallMark, SoftwareShortfallVerdict) -> Unit)? = null,
+    /** DEBUG call join stages ([CallJoinStages]; null for streams): encoder started and the camera's first frame, once each. */
+    private val onJoinStage: ((CallJoinStage, String) -> Unit)? = null,
+    /**
+     * JT2 `test_call_camera_first` (promoted 2026-11-12, default on): the camera opens while its preview surface is requested, and the first
+     * capture session is configured when both are ready ([CameraOpenJoin]); false: the surface first, then the open (as before).
+     */
+    parallelOpen: Boolean = false,
 ) : Closeable {
+    private val openJoin = if (parallelOpen) CameraOpenJoin() else null
+    private var openRequestedNs = 0L
+    private var sessionCreateNs = 0L
+    private var sessionQueryMs = -1L
     /** The coded size this encoder produces; a restart that changes it marks its first keyframe (RestartDiscontinuityMarker). */
     val outputResolution: VideoResolution
         get() = settings.resolution
@@ -110,6 +128,9 @@ class CameraVideoEncoder(
     private var nativeSpeedLearner: NativeEncoderSpeedLearner? = null
     private var nativeSpeedStore: NativeEncoderSpeedStore? = null
     private var nativeOverloadReported = false
+    /** AP5 SoftwareEncoderShortfall windows of this session: native (software) encoders with a listener only. */
+    private val softwareShortfall = if (usesNativeEncoder && onSoftwareShortfall != null) SoftwareShortfallWindows() else null
+    private var softwareShortfallDropsAtWindowStart = 0L
     /** libvpx presets use their own scale, so they are remembered under their own key. */
     private val nativeSpeedKey = (if (usesNativeVpx) "libvpx:" else "") +
         nativeEncoderSpeedKey(settings.resolution.width, settings.resolution.height, settings.fps)
@@ -150,6 +171,18 @@ class CameraVideoEncoder(
     private val gpuActive = gpuScale != null && videoCodec.usesSurfaceInput && debugRawInputFile == null &&
         referenceFrameLimit == 0
     private var gpuCapture: GpuScaleCapture? = null
+    /**
+     * DEBUG: camera-side losses for a hardware encoder's own input surface ([SurfaceCaptureLoss] says what it counts
+     * and cannot see), logged as the native path's `capture drops N`. Null on the native, raw-input and GPU paths.
+     */
+    private val surfaceCaptureLoss = if (BuildConfig.DEBUG && videoCodec.usesSurfaceInput && !usesNativeEncoder &&
+        debugRawInputFile == null && !gpuActive) SurfaceCaptureLoss() else null
+    /**
+     * DEBUG: camera-side losses on the YUV copy path (a MediaCodec encoder fed copied camera images, for example
+     * c2.android.vp9.encoder), matched by sensor timestamp ([CopyPathCaptureLoss] says what it counts and cannot see).
+     */
+    private val copyCaptureLoss = if (BuildConfig.DEBUG && !videoCodec.usesSurfaceInput && !usesNativeEncoder &&
+        debugRawInputFile == null) CopyPathCaptureLoss() else null
     private var gpuStartedNs = 0L
     private var gpuResetMs = -1.0
     @Volatile private var retainGpuCaptureOnClose = false
@@ -421,7 +454,27 @@ class CameraVideoEncoder(
         if (BuildConfig.DEBUG && rawStartedUs > 0L) RawReferenceClock(rawStartedUs, rawStartedNs) else null
 
     @SuppressLint("MissingPermission")
+    /** Experimental call pre-warm ([CallEncoderPrewarm]): [prepareEncoder] ran ahead of [start]. */
+    @Volatile private var encoderPrepared = false
+    private var preparedCameraId: String? = null
+    private var preparedCameraCharacteristics: CameraCharacteristics? = null
+
+    /**
+     * Experimental call pre-warm (`test_call_prewarm`): only the encoder part of [start] (camera metadata, encoder
+     * create, configure, input surface or buffers, start). Opens no camera device and starts no capture or raw input;
+     * a later [start] does only that. Runs on the thread [start] runs on.
+     */
+    fun prepare() {
+        if (closed.get() || encoderPrepared) return
+        prepareEncoder()
+    }
+
     fun start() {
+        if (!encoderPrepared) prepareEncoder()
+        startCapture()
+    }
+
+    private fun prepareEncoder() {
         check(debugRawInputFile == null || BuildConfig.DEBUG) { "Raw fixture input is debug-only" }
         gpuStartedNs = System.nanoTime()
         val selectedCameraId = if (RawInputGuard.cameraMayStart(debugRawInputFile != null)) {
@@ -537,7 +590,19 @@ class CameraVideoEncoder(
             "Encoder statistics ${if (encodingStatisticsEnabled) "enabled" else "unavailable"} " +
                 "for ${activeEncoderName}",
         )
+        onJoinStage?.invoke(
+            CallJoinStage.ENCODER_STARTED,
+            "encoder=$activeEncoderName | path=${inputPathLabel()} | initMs=${(System.nanoTime() - gpuStartedNs) / 1_000_000L}",
+        )
+        preparedCameraId = selectedCameraId
+        preparedCameraCharacteristics = cameraCharacteristics
+        encoderPrepared = true
+    }
 
+    /** The camera part of [start]: the only place this class opens the camera (or starts the GPU or raw input). */
+    private fun startCapture() {
+        val selectedCameraId = preparedCameraId
+        val cameraCharacteristics = preparedCameraCharacteristics
         if (gpuActive) {
             startGpuCapture()
             return
@@ -567,6 +632,7 @@ class CameraVideoEncoder(
                         val image = availableReader.acquireLatestImage() ?: return@setOnImageAvailableListener
                         injectBlankIfRequested(image)
                         if (dropLeadingBlank(image)) {
+                            copyCaptureLoss?.onDeliberatelyDropped(image.timestamp)
                             image.close()
                             return@setOnImageAvailableListener
                         }
@@ -597,7 +663,36 @@ class CameraVideoEncoder(
             }
         }
 
+        val join = openJoin
         if (previewSurface != null) {
+            markCameraOpenRequested("surface=ready")
+            cameraManager.openCamera(checkNotNull(selectedCameraId), cameraCallback, worker)
+        } else if (join != null) {
+            // JT2 camera-first: the viewfinder surface is requested (it hops to the main thread) and the camera opens at once;
+            // the session is configured when both are ready ([CameraOpenJoin]).
+            viewfinderSurface = CameraViewfinderSurface(
+                context,
+                viewfinder,
+                checkNotNull(cameraCharacteristics),
+                settings.resolution.width,
+                settings.resolution.height,
+                scaleMode,
+                { surface ->
+                    worker.post {
+                        if (!closed.get()) {
+                            previewSurface = surface
+                            onJoinStage?.invoke(CallJoinStage.PREVIEW_SURFACE_READY, "sinceOpenRequestedMs=${sinceOpenRequestedMs()} | order=parallel")
+                            if (join.onSurfaceReady() == CameraOpenJoin.Action.CONFIGURE) configureCaptureSession()
+                        }
+                    }
+                },
+                { error ->
+                    if (join.onSurfaceFailed() == CameraOpenJoin.Action.FAIL) {
+                        notifyFailure("Camera preview surface failed: ${error.message ?: error.javaClass.simpleName}", error)
+                    }
+                },
+            ).also(CameraViewfinderSurface::request)
+            markCameraOpenRequested("surface=requested")
             cameraManager.openCamera(checkNotNull(selectedCameraId), cameraCallback, worker)
         } else {
             viewfinderSurface = CameraViewfinderSurface(
@@ -611,7 +706,9 @@ class CameraVideoEncoder(
                     worker.post {
                         if (!closed.get()) {
                             previewSurface = surface
+                            onJoinStage?.invoke(CallJoinStage.PREVIEW_SURFACE_READY, "sinceOpenRequestedMs=n/a | order=surface_first")
                             runCatching {
+                                markCameraOpenRequested("surface=ready")
                                 cameraManager.openCamera(checkNotNull(selectedCameraId), cameraCallback, worker)
                             }.onFailure { error ->
                                 notifyFailure("Camera could not open: ${error.message}", error)
@@ -623,6 +720,27 @@ class CameraVideoEncoder(
             ).also(CameraViewfinderSurface::request)
         }
     }
+
+    /** DEBUG join stage: the camera open is about to be asked for (the first time only; a retry or rebuild reopens silently). */
+    private fun markCameraOpenRequested(detail: String) {
+        if (openRequestedNs == 0L) openRequestedNs = System.nanoTime()
+        onJoinStage?.invoke(CallJoinStage.CAMERA_OPEN_REQUESTED, "$detail | camera=$openedCameraId")
+    }
+
+    private fun sinceOpenRequestedMs(): Long =
+        if (openRequestedNs == 0L) -1L else (System.nanoTime() - openRequestedNs) / 1_000_000L
+
+    /** The camera-to-encoder path, for the DEBUG join-stage lines. */
+    private fun inputPathLabel(): String = when {
+        debugRawInputFile != null -> "raw"
+        gpuActive -> "gpu"
+        usesNativeEncoder -> "native"
+        videoCodec.usesSurfaceInput -> "surface"
+        else -> "copy"
+    }
+
+    /** The camera's first completed capture of this encoder's own session (the GPU path's shared session reports none). */
+    @Volatile private var cameraFirstFrameTold = false
 
     // ---- MediaCodec encoder initialisation (V-09, V-11, V-12, V-14, V-16) ----------------------------
 
@@ -1037,6 +1155,7 @@ class CameraVideoEncoder(
                 }
                 rawStartedNs = System.nanoTime()
                 rawStartedUs = SystemClock.elapsedRealtimeNanos() / 1_000L
+                onJoinStage?.invoke(CallJoinStage.CAMERA_FIRST_FRAME, "path=raw")
                 rawNextFrameNs = rawStartedNs
                 val file = checkNotNull(debugRawInputFile)
                 val width = settings.resolution.width
@@ -1151,19 +1270,25 @@ class CameraVideoEncoder(
             openRetry.reset()
             // A reopen for a session rebuild creates its session through the rebuilder (V-01).
             if (rebuilder.onDeviceOpened()) return
+            onJoinStage?.invoke(CallJoinStage.CAMERA_OPENED, "openMs=${sinceOpenRequestedMs()} | joined=${openJoin != null}")
+            // Camera-first: the session waits here for the preview surface when it is not ready yet (CameraOpenJoin).
+            if (openJoin != null && openJoin.onCameraOpened() != CameraOpenJoin.Action.CONFIGURE) return
             configureCaptureSession()
         }
 
         override fun onClosed(closedCamera: CameraDevice) {
+            openJoin?.onCameraGone()
             rebuilder.onDeviceClosed()
         }
 
         override fun onDisconnected(disconnectedCamera: CameraDevice) {
+            openJoin?.onCameraGone()
             disconnectedCamera.close()
             notifyFailure("Camera disconnected.")
         }
 
         override fun onError(failedCamera: CameraDevice, error: Int) {
+            openJoin?.onCameraGone()
             failedCamera.close()
             if (closed.get()) return
             // Transient errors are retried, policy errors explained, anything else reported as before (V-05).
@@ -1276,7 +1401,10 @@ class CameraVideoEncoder(
         val videoInputSurface = encoderSurface ?: imageReader?.surface ?: return
         val generation = ++captureSessionGeneration
         val requested = CameraStreamPlan("full", previewSurface != null, referenceImageReader != null)
+        val queryStartNs = System.nanoTime()
         val requestedSupported = sessionConfigurationSupported(openedCamera, surfacesFor(requested, videoInputSurface))
+        sessionQueryMs = (System.nanoTime() - queryStartNs) / 1_000_000L
+        if (BuildConfig.DEBUG && onJoinStage != null && CallJoinStages.current.claimOnce("camera_caps")) logCameraCaps(openedCamera)
         var plan = requested
         val viaSessionConfiguration = CameraSwitches.sessionConfiguration
         if (viaSessionConfiguration) {
@@ -1298,6 +1426,7 @@ class CameraVideoEncoder(
         captureTargets = targets
         logCameraSession(requested, plan, requestedSupported, viaSessionConfiguration)
         val callback = captureSessionCallback(generation)
+        sessionCreateNs = System.nanoTime()
         runCatching {
             if (viaSessionConfiguration) {
                 val configuration = SessionConfiguration(
@@ -1325,6 +1454,11 @@ class CameraVideoEncoder(
                 return
             }
             session = configuredSession
+            onJoinStage?.invoke(
+                CallJoinStage.CAMERA_SESSION_CONFIGURED,
+                "createToConfiguredMs=${(System.nanoTime() - sessionCreateNs) / 1_000_000L} | targets=${captureTargets.size} | " +
+                    "sinceOpenRequestedMs=${sinceOpenRequestedMs()}",
+            )
             applyRepeatingRequest()
             val cameraFps = targetFpsRange?.let { "camera ${it.lower}–${it.upper} FPS" }
                 ?: "camera default FPS"
@@ -1344,6 +1478,78 @@ class CameraVideoEncoder(
                 closingSession = null
                 rebuilder.onSessionClosed()
             }
+        }
+    }
+
+    /**
+     * DEBUG (JT2): what the camera's first completed capture says about the start: how long after the exposure began the result
+     * arrived (sensor timestamp on the real-time clock only), the auto-exposure state and the exposure and gain it chose.
+     */
+    private fun firstCaptureDetail(result: TotalCaptureResult): String {
+        val sensorNs = result.get(CaptureResult.SENSOR_TIMESTAMP)
+        val lagMs = if (cameraTimestampSource == CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME && sensorNs != null) {
+            (SystemClock.elapsedRealtimeNanos() - sensorNs) / 1_000_000L
+        } else {
+            null
+        }
+        val exposureNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+        return "sensorLagMs=${lagMs ?: "unknown"} | aeState=${aeStateName(result.get(CaptureResult.CONTROL_AE_STATE))} | " +
+            "exposureUs=${exposureNs?.let { it / 1_000L } ?: "unknown"} | iso=${result.get(CaptureResult.SENSOR_SENSITIVITY) ?: "unknown"}"
+    }
+
+    private fun aeStateName(state: Int?): String = when (state) {
+        null -> "unknown"
+        CaptureResult.CONTROL_AE_STATE_INACTIVE -> "inactive"
+        CaptureResult.CONTROL_AE_STATE_SEARCHING -> "searching"
+        CaptureResult.CONTROL_AE_STATE_CONVERGED -> "converged"
+        CaptureResult.CONTROL_AE_STATE_LOCKED -> "locked"
+        CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED -> "flash_required"
+        CaptureResult.CONTROL_AE_STATE_PRECAPTURE -> "precapture"
+        else -> "other($state)"
+    }
+
+    /**
+     * DEBUG, once per call (JT2): what the camera HAL offers for a faster, steadier start. `sessionKeys` are the request keys the
+     * HAL wants at session creation (the AE fps range among them avoids a reconfiguration at the first request), the stabilization
+     * lists are the modes the phone offers, `recordDefault*` what the RECORD template sets by itself, and `postOpenQueryMs` how
+     * long the post-open `isSessionConfigurationSupported` query took (it runs before the session is created).
+     */
+    private fun logCameraCaps(openedCamera: CameraDevice) {
+        val id = openedCameraId ?: return
+        runCatching {
+            val characteristics = cameraManager.getCameraCharacteristics(id)
+            val sessionKeys = safeCameraRead("AVAILABLE_SESSION_KEYS") { characteristics.availableSessionKeys }.orEmpty()
+            val sessionKeyNames = sessionKeys.map { it.name }
+            fun sessionKey(key: CaptureRequest.Key<*>) = key.name in sessionKeyNames
+            val videoStabilization = safeCameraRead("CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES") {
+                characteristics.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)
+            }
+            val opticalStabilization = safeCameraRead("LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION") {
+                characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
+            }
+            val pipelineMaxDepth = safeCameraRead("REQUEST_PIPELINE_MAX_DEPTH") {
+                characteristics.get(CameraCharacteristics.REQUEST_PIPELINE_MAX_DEPTH)
+            }
+            val record = runCatching { openedCamera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD) }.getOrNull()
+            val deviceSetup = if (Build.VERSION.SDK_INT >= 35) {
+                runCatching { cameraManager.isCameraDeviceSetupSupported(id) }.getOrNull()
+            } else {
+                null
+            }
+            Log.i(
+                "BluetoothVideo",
+                "BENCHMARK camera_caps: id=$id | hardwareLevel=${CameraLevelCodes.name(hardwareLevel)} | " +
+                    "sessionKeys=${sessionKeys.size} | sessionKeyAeTargetFpsRange=${sessionKey(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE)} | " +
+                    "sessionKeyVideoStabilization=${sessionKey(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE)} | " +
+                    "sessionKeyOpticalStabilization=${sessionKey(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE)} | " +
+                    "videoStabilizationModes=${videoStabilization?.joinToString("+") ?: "unknown"} | " +
+                    "opticalStabilizationModes=${opticalStabilization?.joinToString("+") ?: "unknown"} | " +
+                    "recordDefaultVideoStabilization=${record?.get(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE) ?: "unset"} | " +
+                    "recordDefaultOpticalStabilization=${record?.get(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE) ?: "unset"} | " +
+                    "recordDefaultAeRange=${record?.get(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE) ?: "unset"} | " +
+                    "pipelineMaxDepth=${pipelineMaxDepth ?: "unknown"} | cameraDeviceSetupSupported=${deviceSetup ?: "n/a"} | " +
+                    "postOpenQueryMs=$sessionQueryMs | sinceOpenRequestedMs=${sinceOpenRequestedMs()}",
+            )
         }
     }
 
@@ -1766,7 +1972,7 @@ class CameraVideoEncoder(
                 nativeInputDrops,
             )
         } else {
-            ""
+            (surfaceCaptureLoss?.periodicField() ?: copyCaptureLoss?.periodicField()).orEmpty()
         } + layeringSummary() + quantizerSummary()
         Log.i(
             "BluetoothVideo",
@@ -1804,6 +2010,26 @@ class CameraVideoEncoder(
                     ),
                 )
                 applyEncoderTarget(target)
+            }
+        }
+        softwareShortfall?.let { tracker ->
+            val drops = nativeInputDrops + rawInputDrops
+            val windowDrops = drops - softwareShortfallDropsAtWindowStart
+            softwareShortfallDropsAtWindowStart = drops
+            val encode = nativeEncodeLatency.snapshot()
+            tracker.onWindow(
+                outputFps = cadenceReportFrames / elapsedSeconds,
+                // The rate in force: the request, lowered by the link/thermal limit and the low-light follower.
+                targetFps = minOf(settings.fps, lastMaximumFps, fpsFollow?.effectiveFps ?: Int.MAX_VALUE).coerceAtLeast(1),
+                // A raw fixture paces its own input; the camera's sensor frame applies to live input only.
+                sourceFrameMs = if (debugRawInputFile != null) null else sensorFrameDurationNs?.div(1_000_000.0),
+                encodeP95Ms = encode.p95Ms.takeIf { encode.samples > 0 },
+                inputDrops = windowDrops,
+            )?.let { verdict ->
+                onSoftwareShortfall?.invoke(
+                    SoftwareShortfallMark(activeEncoderName, settings.resolution.width, settings.resolution.height, settings.fps),
+                    verdict,
+                )
             }
         }
         cadenceReportStartedNs = nowNs
@@ -2501,6 +2727,7 @@ class CameraVideoEncoder(
                 source.timestamp / 1_000,
                 0,
             )
+            copyCaptureLoss?.onHanded(source.timestamp)
         } catch (error: Exception) {
             queuedInputTimesNs.remove(sourcePresentationTimeUs)
             if (!closed.get()) {
@@ -2945,6 +3172,14 @@ class CameraVideoEncoder(
             result: TotalCaptureResult,
         ) {
             if (closed.get()) return
+            if (!cameraFirstFrameTold && onJoinStage != null) {
+                cameraFirstFrameTold = true
+                onJoinStage.invoke(
+                    CallJoinStage.CAMERA_FIRST_FRAME,
+                    "path=${inputPathLabel()} | " + firstCaptureDetail(result),
+                )
+            }
+            copyCaptureLoss?.let { loss -> result.get(CaptureResult.SENSOR_TIMESTAMP)?.let(loss::onDelivered) }
             if (BuildConfig.DEBUG) {
                 exposureTimeNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
                 sensorFrameDurationNs = result.get(CaptureResult.SENSOR_FRAME_DURATION)
@@ -2963,6 +3198,20 @@ class CameraVideoEncoder(
                         "effective=${result.get(CaptureResult.SCALER_ROTATE_AND_CROP) ?: "unreported"}",
                 )
             }
+        }
+
+        override fun onCaptureBufferLost(session: CameraCaptureSession, request: CaptureRequest, target: Surface, frameNumber: Long) {
+            if (closed.get()) return
+            surfaceCaptureLoss?.onBufferLost(encoderTarget = target === encoderSurface)
+        }
+
+        override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
+            if (closed.get()) return
+            copyCaptureLoss?.onCaptureFailed()
+            surfaceCaptureLoss?.onCaptureFailed(
+                flushed = failure.reason == CaptureFailure.REASON_FLUSHED,
+                imageCaptured = failure.wasImageCaptured(),
+            )
         }
     }
 
@@ -3042,6 +3291,7 @@ class CameraVideoEncoder(
 
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
+        openJoin?.onEncoderClosed()
         hcVectors?.finish("closed")
         if (debugRawInputFile != null && rawStartedUs > 0L) {
             val frameBytes = settings.resolution.width.toLong() * settings.resolution.height * 3 / 2
@@ -3082,6 +3332,8 @@ class CameraVideoEncoder(
             "Encoder input FINAL: capture drops $nativeInputDrops" +
                 if (debugRawInputFile != null) ", raw input drops $rawInputDrops" else "",
         )
+        if (firstVideoFrameSeen) surfaceCaptureLoss?.let { Log.i("BluetoothVideo", it.finalLine()) }
+        if (firstVideoFrameSeen) copyCaptureLoss?.let { Log.i("BluetoothVideo", it.finalLine()) }
         recordBurstProfile()
         debugMediaTrace?.close()
         debugStageTrace?.close()

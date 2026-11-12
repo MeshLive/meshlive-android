@@ -391,10 +391,10 @@ class DeviceRunScoreTest(unittest.TestCase):
 
     def test_private_planned_end_uses_each_phones_confirmed_phase_clock_and_keeps_prior_failure(self):
         text = (line(0, surface(1).replace("Receiver", "Private call")) +
-                line(5, surface(76, p95=84).replace("Receiver", "Private call")) +
+                line(5, surface(76, p95=100).replace("Receiver", "Private call")) +
                 line(5.7, "BENCHMARK call phase ENDED") +
                 line(5.8, "Private call ended: Peer ended the call") +
-                line(5.801, surface(86, p95=84, final=True).replace("Receiver", "Private call")) +
+                line(5.801, surface(86, p95=100, final=True).replace("Receiver", "Private call")) +
                 line(5.9, "BENCHMARK call available: node=aaaaaaaaaaaa"))
         # The actor's acknowledgment is on another clock; it cannot bound this receiver.
         event = {"device": "peer", "action": "end", "acknowledged": True, "ack_time": "10-02 19:12:00.100",
@@ -421,6 +421,13 @@ class DeviceRunScoreTest(unittest.TestCase):
         self.assertEqual(scorer.score_log(reopened, spec, {"control_events": [event]})["gates"]["visible_fps"]["status"], "FAIL")
         fatal = text + line(5.95, "FATAL EXCEPTION: main")
         self.assertEqual(scorer.score_log(fatal, spec, {"control_events": [event]})["gates"]["unexpected_events"]["status"], "FAIL")
+        # A build that names the call on the record is the same planned end; an abnormal end with an ID stays abnormal.
+        with_id = text.replace("Peer ended the call", "Peer ended the call | callId=123e4567-e89b-12d3-a456-426614174000")
+        named = scorer.score_log(with_id, spec, {"control_events": [event]})
+        self.assertEqual(named["gates"]["visible_fps"]["status"], "PASS")
+        self.assertEqual(named["evaluation_intervals"][0]["start"], "10-02 19:12:05.700")
+        lost_with_id = lost.replace("Call link lost", "Call link lost | callId=123e4567-e89b-12d3-a456-426614174000")
+        self.assertEqual(scorer.score_log(lost_with_id, spec, {"control_events": [event]})["gates"]["visible_fps"]["status"], "FAIL")
 
     def test_private_end_logged_only_by_the_ui_teardown_record_is_the_same_evidence_when_the_call_thread_record_was_lost(self):
         # calls-noloss-m31asus-51cc8028/0007: ASUS logd dropped the call-thread record; the UI record survived.

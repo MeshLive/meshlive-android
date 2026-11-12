@@ -28,6 +28,18 @@ class BenchmarkLayoutTest(unittest.TestCase):
             "paths": self.paths if paths is None else paths,
             "directories": directories or {}}}), encoding="utf-8")
 
+    def test_output_on_an_unplugged_evidence_drive_says_to_plug_it_in(self):
+        target = self.root / "ssd/runs"
+        target.mkdir(parents=True)
+        import subprocess
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(self.root / "benchmarks/runs"), str(target)], check=True,
+                       capture_output=True)
+        target.rmdir()  # the drive is gone; the junction dangles
+        with self.assertRaisesRegex(ValueError, "plug it in"):
+            layout.output_path("benchmarks/runs/new-run", "runs", root=self.root)
+        self.assertEqual(layout.output_path("benchmarks/catalog/plan", "catalog", root=self.root),
+                         self.root / "benchmarks/catalog/plan")
+
     def test_absolute_relative_and_windows_separator_aliases(self):
         expected = self.root / "benchmarks/runs/run-id/manifest.json"
         for path in ("artifacts/old/run/manifest.json", self.root / "artifacts/old/run/manifest.json"):

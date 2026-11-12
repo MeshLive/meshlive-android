@@ -282,15 +282,16 @@ object CocListeners {
                 roles.getOrPut(role) {
                     SharedCocListener(
                         role,
-                        open = { PlatformCocServer(role, adapter.listenUsingInsecureL2capChannel()) },
+                        open = { PlatformCocServer(role, platformListen(adapter, role)) },
                         log = { Log.i("BluetoothVideo", it) },
                     )
                 }
             }
             shared.acquire(owner)?.let { return echoGuarded(it, owner) }
         }
-        val server = adapter.listenUsingInsecureL2capChannel()
+        val server = platformListen(adapter, role)
         CocRegistrations.note("listen", "$owner-dedicated")
+        CocBudget.onListen(runCatching { server.psm }.getOrDefault(-1), CocRegistrations.ledger)
         CocListenerLedger.opened(owner, server)
         return echoGuarded(
             object : CocListenLease<BluetoothSocket> by DedicatedCocListener(server) {
@@ -310,6 +311,51 @@ object CocListeners {
     private fun echoGuarded(lease: CocListenLease<BluetoothSocket>, owner: String): CocListenLease<BluetoothSocket> =
         if (CocEchoVerify.enabled()) EchoRespondingLease.forSockets(lease, owner) { Log.i("BluetoothVideo", it) } else lease
 
+    /**
+     * The platform listen. Experimental watchdog (`test_call_listen_watchdog_ms`, off): a listen the stack has not
+     * completed by the deadline throws [ListenStalledException] (the wedged S22 stack blocked it forever inside
+     * createSocketChannel), and a server socket that arrives later is closed. Off: a plain blocking call, as before.
+     */
+    @SuppressLint("MissingPermission")
+    private fun platformListen(adapter: BluetoothAdapter, role: String): BluetoothServerSocket {
+        val deadlineMs = CocAvailabilitySwitches.listenWatchdogMs
+        val open = {
+            if (CallListenInject.hangRequested(role)) CallListenInject.hangForever()
+            adapter.listenUsingInsecureL2capChannel()
+        }
+        try {
+            return if (deadlineMs <= 0) open() else watchdogListen(role, deadlineMs, open)
+        } catch (error: IOException) {
+            if (error !is ListenStalledException) lastListenFailure = error
+            throw error
+        }
+    }
+
+    /** The last exception the platform listen itself threw (identity only; the status tells a used-up stack by it). */
+    @Volatile var lastListenFailure: Throwable? = null
+        private set
+
+    private fun watchdogListen(role: String, deadlineMs: Long, open: () -> BluetoothServerSocket): BluetoothServerSocket {
+        val watchdog = ListenWatchdog<BluetoothServerSocket>(
+            deadlineMs,
+            closeLate = { late -> late.close() },
+            onLate = { lateMs ->
+                Log.i("BluetoothVideo", "BENCHMARK call_availability: state=late_socket_closed | stage=coc_listen | role=$role | lateMs=$lateMs")
+            },
+        )
+        return try {
+            watchdog.run(role, open)
+        } catch (stalled: ListenStalledException) {
+            Log.w(
+                "BluetoothVideo",
+                (if (BuildConfig.DEBUG) "BENCHMARK " else "") + "call_availability: state=failed | stage=coc_listen | " +
+                    "reason=stalled | role=$role | waitedMs=${stalled.waitedMs} | deadlineMs=$deadlineMs",
+            )
+            CallsAvailabilityTracker.noteListenStalled(role)
+            throw stalled
+        }
+    }
+
     /** Adapter off/on: every stack listener is gone (and on Android 10 its leaked slots are freed). */
     fun resetAll(reason: String) {
         val all = synchronized(roles) { roles.values.toList() }
@@ -322,6 +368,7 @@ object CocListeners {
     ) : CocServerHandle<BluetoothSocket> {
         init {
             CocRegistrations.note("listen", "$role-shared")
+            CocBudget.onListen(runCatching { server.psm }.getOrDefault(-1), CocRegistrations.ledger)
             CocListenerLedger.opened("$role-shared", server)
         }
 

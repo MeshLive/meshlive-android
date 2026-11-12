@@ -1,0 +1,5 @@
+New: calls and live streams can move to Wi-Fi when both phones support it (Settings > Use Wi-Fi when it helps; off by default). Phones with Wi-Fi Aware use it, others use Wi-Fi Direct; Bluetooth stays connected and takes over if Wi-Fi stops.
+A frozen call picture now recovers by itself.
+Security and privacy fixes for relayed streams and calls.
+The Calls screen uses less battery while it waits for people nearby.
+Many call connection fixes.

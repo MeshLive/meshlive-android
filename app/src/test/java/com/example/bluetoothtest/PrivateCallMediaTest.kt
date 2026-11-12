@@ -27,6 +27,23 @@ class PrivateCallMediaTest {
     }
 
     @Test
+    fun aFamilyRateCapIsIgnoredOnlyWhenAsked() {
+        val selected = VideoSettings.DEFAULT.copy(fps = 30, bitRate = 800_000)
+        val legacyQti = BluetoothStackFingerprint("qcom", "atoll", 30)
+        val capped = privateCallVideoSettings(
+            selected, BluetoothTransportOption.BLE_GATT, legacyQti,
+        )
+        assertEquals(150_000, capped.bitRate)
+        assertEquals(15, capped.fps)
+        val uncapped = privateCallVideoSettings(
+            selected, BluetoothTransportOption.BLE_GATT, legacyQti, ignoreFamilyRateCap = true,
+        )
+        assertEquals(180_000, uncapped.bitRate) // the transport budget still applies
+        assertEquals(15, uncapped.fps) // family geometry and FPS caps still apply
+        assertEquals(VideoResolution(426, 240, "240p"), uncapped.resolution)
+    }
+
+    @Test
     fun privateCallCapsEachDirectionWithoutChangingPictureOrCadence() {
         val selected = VideoSettings(
             VideoResolution(640, 360, "360p"),
@@ -301,6 +318,17 @@ class PrivateCallMediaTest {
         assertEquals("BENCHMARK call ended_ui: message=Peer ended the call", line)
         // The runner's unexpected-termination check and the scorer's failure scan key on this prefix.
         assertFalse(line.contains("Private call ended:"))
+    }
+
+    @Test
+    fun theEndLineNamesItsCallAfterTheMessageSoTheNormalEndIsStillRecognised() {
+        val callId = "123e4567-e89b-12d3-a456-426614174000"
+        val line = privateCallEndedLine("Call ended", callId)
+        // The scorer's normal-end check reads the message right after the prefix; the call ID is a trailing field.
+        assertTrue(Regex("Private call ended: (?:Call ended|Peer ended)").containsMatchIn(line))
+        assertEquals(callId, Regex("""\| callId=(\S+)$""").find(line)!!.groupValues[1])
+        // A release build (no call ID) keeps the bare line.
+        assertFalse(privateCallEndedLine("Call ended", null).contains("callId"))
     }
 
     @Test

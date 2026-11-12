@@ -5,7 +5,9 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothSocket
 import android.content.Context
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
+import kotlin.concurrent.thread
 
 /**
  * Root cause (stack bug, Android 12 and 13): when we are LE central, the stack starts EATT on every
@@ -74,7 +76,15 @@ internal object BleCocClient {
             owner = owner,
             mayBlock = Looper.myLooper() != Looper.getMainLooper(),
         )
-        val socket = connectChannel(device, psm, owner, onSocket, deadline = deadline)
+        val socket = if (CocSwitches.psmReuseRetry) {
+            connectReusingPsm(context, device, psm, owner, onSocket, deadline)
+        } else {
+            connectChannel(device, psm, owner, onSocket, deadline = deadline)
+        }
+        if (CocSwitches.primeAsync && Looper.myLooper() != Looper.getMainLooper()) {
+            primeAndAttachInBackground(context, device, socket, psm, onLinkStatus, phyPreference, connectionPriority, owner, deadline, onControl)
+            return markLinkReached({ true }) { verifyEcho(socket, owner) }
+        }
         // Default on here since Q49 (test_coc_mtu_prime=false is the DEBUG control arm): this fresh ACL has had no MTU exchange, so no data length update.
         if (CocMtuPrime.enabled()) CocMtuPrime.runOnAcl(context, device, owner)
         val attached = runCatching { BleL2capPsmReader.attach(context, device, psm, onLinkStatus, phyPreference, connectionPriority, deadline) }
@@ -84,6 +94,91 @@ internal object BleCocClient {
             .getOrNull()
         onControl(attached)
         return markLinkReached({ true }) { verifyEcho(socket, owner) }
+    }
+
+    /**
+     * Experimental test_coc_psm_reuse_retry (join-latency P4b): the fresh-ACL CoC connect, retried once with the PSM
+     * already read when it fails fast. The retry keeps the break-before-make rule of the stranded-EATT class: it waits
+     * (bounded, [BleCocFreshAcl.ACL_DOWN_WAIT_MS]) for the failed attempt's ACL to drop, on a watch armed before the
+     * first connect so a drop during it is not missed. A second failure goes to the caller as before (its full redo).
+     */
+    private fun connectReusingPsm(
+        context: Context,
+        device: BluetoothDevice,
+        psm: Int,
+        owner: String,
+        onSocket: (BluetoothSocket) -> Unit,
+        deadline: SetupDeadline?,
+    ): BluetoothSocket {
+        val watch = AclDownWatch.forDevice(context, device)
+        val startedMs = SystemClock.elapsedRealtime()
+        try {
+            return connectChannel(device, psm, owner, onSocket, deadline = deadline).also { watch.release() }
+        } catch (error: Throwable) {
+            val nowMs = SystemClock.elapsedRealtime()
+            val mayBlock = Looper.myLooper() != Looper.getMainLooper()
+            if (!mayBlock || !CocPsmReuseRetry.shouldRetry(error, nowMs - startedMs, deadline?.remainingMs(nowMs))) {
+                watch.release()
+                throw error
+            }
+            val log: (String) -> Unit = { Log.i("BluetoothVideo", it) }
+            val aclDown = GattLinkLifetime.awaitAclDown(watch, BleCocFreshAcl.ACL_DOWN_WAIT_MS, log = log, reason = "coc-psm-reuse")
+            log(CocPsmReuseRetry.line(owner, nowMs - startedMs, error, aclDown, SystemClock.elapsedRealtime() - nowMs))
+            return connectChannel(device, psm, owner, onSocket, deadline = deadline)
+        }
+    }
+
+    /**
+     * Experimental test_coc_prime_async (join-latency P1): the same MTU prime and GATT control reattach as the synchronous
+     * path, in the same order, on a daemon thread, while the caller authenticates. [CocPrimeGate] holds the first bulk
+     * write until they are done (bounded). A reattach that ends after the caller closed the socket is closed here, not
+     * handed over (the caller's teardown has already run).
+     */
+    @SuppressLint("MissingPermission")
+    private fun primeAndAttachInBackground(
+        context: Context,
+        device: BluetoothDevice,
+        socket: BluetoothSocket,
+        psm: Int,
+        onLinkStatus: (String) -> Unit,
+        phyPreference: BlePhyPreference,
+        connectionPriority: BleConnectionPriority,
+        owner: String,
+        deadline: SetupDeadline?,
+        onControl: (BleL2capControlConnection?) -> Unit,
+    ) {
+        val log: (String) -> Unit = { Log.i("BluetoothVideo", it) }
+        val gate = CocPrimeGate(owner, nowMs = SystemClock::elapsedRealtime, log = log)
+        CocPrimeGates.register(socket, gate)
+        thread(name = "CocPrimeAsync", isDaemon = true) {
+            val startedMs = SystemClock.elapsedRealtime()
+            var primeOutcome = "not_applicable"
+            var primeEndMs = startedMs
+            var attached: BleL2capControlConnection? = null
+            try {
+                if (CocMtuPrime.enabled()) {
+                    primeOutcome = CocMtuPrime.runOnAcl(context, device, owner)?.outcome?.label ?: "skipped"
+                }
+                primeEndMs = SystemClock.elapsedRealtime()
+                attached = runCatching {
+                    BleL2capPsmReader.attach(context, device, psm, onLinkStatus, phyPreference, connectionPriority, deadline)
+                }
+                    .onFailure { error -> onLinkStatus("BLE CoC connected; GATT control reattach failed: ${error.message}") }
+                    .getOrNull()
+                if (attached != null && !socket.isConnected) {
+                    log("BENCHMARK coc_prime_async: owner=$owner | phase=late_attach_closed | reason=socket_closed")
+                    runCatching { attached.close() }
+                } else {
+                    onControl(attached)
+                }
+            } catch (error: Throwable) {
+                log("BENCHMARK coc_prime_async: owner=$owner | phase=error | error=${error.javaClass.simpleName}")
+            } finally {
+                val nowMs = SystemClock.elapsedRealtime()
+                gate.release(primeOutcome, primeEndMs - startedMs, nowMs - primeEndMs, attached != null)
+                CocPrimeGates.remove(socket)
+            }
+        }
     }
 
     /**
@@ -172,4 +267,28 @@ internal object BleCocFreshAcl {
             runCatching { watch.release() }
         }
     }
+}
+
+/**
+ * Experimental `test_coc_psm_reuse_retry` (default off; join-latency P4b). In rem-u, 3 of 14 M31-client joins lost their
+ * first fresh-ACL CoC connect 0.43-0.53 s in ("read failed, socket might closed or timeout"), and the caller then
+ * repeated GATT connect, PSM read, ACL-down wait and CoC connect (+2.9 s). The PSM does not change between the two
+ * connects, so one retry reuses it; only a fast failure qualifies (not the app-side connect bound), and only when the
+ * caller's deadline leaves room for the ACL wait and a connect.
+ */
+internal object CocPsmReuseRetry {
+    /** A failure later than this is not the fast refusal seen in the evidence. */
+    const val FAST_FAIL_MS = 3_000L
+
+    /** Room a retry needs inside the caller's deadline: the ACL-down wait bound plus a connect. */
+    const val ROOM_MS = GattLinkLifetime.ACL_DOWN_WAIT_MS + 1_000L
+
+    fun shouldRetry(error: Throwable, attemptElapsedMs: Long, deadlineRemainingMs: Long?): Boolean =
+        error is java.io.IOException && error !is CocConnectTimeoutException &&
+            attemptElapsedMs in 0..FAST_FAIL_MS &&
+            (deadlineRemainingMs == null || deadlineRemainingMs >= ROOM_MS)
+
+    fun line(owner: String, failedAfterMs: Long, error: Throwable, aclDown: Boolean, waitedMs: Long): String =
+        "BENCHMARK coc_psm_reuse_retry: owner=$owner | failedAfterMs=$failedAfterMs | error=${error.javaClass.simpleName} | " +
+            "aclDown=$aclDown | aclWaitMs=$waitedMs"
 }

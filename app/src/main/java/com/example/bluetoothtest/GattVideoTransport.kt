@@ -47,6 +47,8 @@ class GattVideoConnection(
     val disconnectStatus: () -> Int = { -1 },
     /** Asks the link for [BlePhyPreference] now (used when the setup deferred the PHY request, `test_phy_after_auth`). */
     val requestPhy: (BlePhyPreference) -> Boolean = { false },
+    /** Reads the link's PHY (starts no LL procedure; the result updates [phySummary]); false when it could not be asked. */
+    val readPhy: () -> Boolean = { false },
     private val closeAction: () -> Unit,
 ) : Closeable {
     private val closed = AtomicBoolean(false)
@@ -73,6 +75,8 @@ internal class GattBytePipe(
     val recovery: GattChunkRecovery? = null,
     /** DEBUG `test_gatt_drop_received_every=N`: each received data chunk whose sequence is N-1 mod N is dropped once. */
     private val dropEvery: Int = DebugTunables.gattDropReceivedEvery,
+    /** Experimental diagnostic `test_hop_integrity_resend_diff` ([HopIntegrityResendDiff]); default off. */
+    resendDiff: Boolean = DebugTunables.hopIntegrityResendDiff,
     private val debugLog: (String) -> Unit = { line -> Log.i("BluetoothVideo", line) },
     private val onFailure: (String) -> Unit,
 ) : InputStream() {
@@ -98,6 +102,13 @@ internal class GattBytePipe(
         GattRecoveryReader(link)
     }
     private val droppedOnce = LinkedHashSet<Int>()
+    /** [HopIntegrityResendDiff] for this link: null with the switch off or without GR1 (then nothing below runs). */
+    private val diffTap: ResendDiffTap? = if (resendDiff && recovery != null) {
+        ResendDiffTap(recovery.link, recoveryActive = { recoveryReader?.active == true }, sendNack = recovery::sendNack)
+            .also(HopIntegrityResendDiff::register)
+    } else {
+        null
+    }
 
     @Volatile private var lastInboundNs = 0L
 
@@ -108,6 +119,12 @@ internal class GattBytePipe(
     fun heardWithin(windowMs: Long): Boolean {
         val last = lastInboundNs
         return last != 0L && System.nanoTime() - last <= windowMs * 1_000_000L
+    }
+
+    /** Milliseconds since the peer's last data chunk, or -1 before any (Experimental `test_phy_direction_split`). */
+    fun quietMs(): Long {
+        val last = lastInboundNs
+        return if (last == 0L) -1L else (System.nanoTime() - last) / 1_000_000L
     }
 
     fun offer(bytes: ByteArray): Boolean = offer(bytes, 0, bytes.size)
@@ -144,7 +161,11 @@ internal class GattBytePipe(
             return true
         }
         lastInboundNs = System.nanoTime()
-        if (sequence in recentPacketSequences || sequence in pendingPackets) return true
+        if (sequence in recentPacketSequences || sequence in pendingPackets) {
+            // A duplicate is dropped as always; the diagnostic only compares it (never delivers it).
+            if (diffTap != null && sequence in recentPacketSequences) diffTap.onDuplicate(sequence, packet)
+            return true
+        }
         if (seqAfter(sequence, nextPacketSequence) > 0) {
             if (
                 seqAfter(sequence, nextPacketSequence) > MAX_REORDERED_PACKET_DISTANCE ||
@@ -222,6 +243,7 @@ internal class GattBytePipe(
     fun onRecoveryGone(range: Gr1.SeqRange) {
         val reader = recoveryReader ?: return
         if (closed.get()) return
+        diffTap?.onGone(range)
         val lost = reader.goneHit(range)
         if (lost == null) {
             recovery?.note("event=ignored | reason=gone_not_missing | seq=${range.first}")
@@ -243,6 +265,7 @@ internal class GattBytePipe(
             recentPacketSequences.remove(recentPacketSequences.first())
         }
         recentPacketSequences += nextPacketSequence
+        diffTap?.onAccepted(nextPacketSequence, packet)
         nextPacketSequence++
         return offer(packet, GATT_CHUNK_HEADER_BYTES, packet.size - GATT_CHUNK_HEADER_BYTES)
     }
@@ -282,6 +305,10 @@ internal class GattBytePipe(
 
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
+        diffTap?.let { tap ->
+            tap.close()
+            HopIntegrityResendDiff.unregister(tap)
+        }
         recovery?.close()
         synchronized(this) {
             pendingPackets.clear()
@@ -718,6 +745,8 @@ object GattVideoClient {
         /** The caller's setup deadline (a call's or message's dial), null when unbounded. */
         deadline: SetupDeadline? = null,
         config: ConnectRetryConfig = ConnectRetryConfig.current(),
+        /** Experimental `test_phy_direction_split`: the split remembered for this peer, asked for at setup instead of 2M/2M. */
+        phySplit: GattPhySplit? = null,
     ): GattVideoConnection {
         var linkReached = false
         val startedMs = SystemClock.elapsedRealtime()
@@ -758,6 +787,7 @@ object GattVideoClient {
                     onPhyMove,
                     attemptTimeoutMs = attempts.attemptTimeoutMs(attemptStartedMs),
                     connectPhaseMs = attempts.connectPhaseMs(),
+                    phySplit = phySplit,
                 )
                 attempts.successLines(attemptStartedMs, SystemClock.elapsedRealtime()).forEach { Log.i("BluetoothVideo", it) }
                 PoolExhaustionPolicy.shared.onConnectSuccess()
@@ -776,6 +806,7 @@ object GattVideoClient {
                 }
                 // A refused registration opens one backoff step (one log line); automatic callers consult the hold.
                 GattPoolBackoff.noteConnectFailure(error.message, "gatt-video-client")
+                GattNativeClientWedge.onCentralConnectFailure(error.message, attemptElapsedMs, "gatt-video-client")
                 if (poolFailureRetry(device, error.message, attempt, onStatus)) {
                     attempts.countPoolRetry()
                     Thread.sleep(ConnectAttempts.Link.GATT_VIDEO.retryDelayMs)
@@ -883,6 +914,8 @@ object GattVideoClient {
         attemptTimeoutMs: Long = ConnectAttempts.Link.GATT_VIDEO.attemptTimeoutMs,
         /** Experimental unified policy only: the attempt ends if not connected after this long. */
         connectPhaseMs: Long? = null,
+        /** Experimental `test_phy_direction_split` ([GattVideoClient.open]). */
+        phySplit: GattPhySplit? = null,
     ): GattVideoConnection {
         val result = AtomicReference<GattVideoConnection?>()
         val error = AtomicReference<String?>()
@@ -916,6 +949,10 @@ object GattVideoClient {
         var gatt: BluetoothGatt? = null
         var output: GattClientOutputStream? = null
         val adaptivePhyRef = AtomicReference<AdaptivePhyLink?>()
+        // Experimental test_phy_direction_split: a remembered split, only where the setup request carries it (the 2M default).
+        val startSplit = phySplit?.takeIf { split ->
+            !deferPhy && phyRequestMasks(phyPreference, split).let { it.txMask != it.rxMask }
+        }
         // Experimental test_ll_gate (P-01): one MTU, discovery, PHY or connection-update request in flight on this link.
         // A pass-through (requests start at once, as before) unless the switch is on.
         val gate = newLinkGate("gatt-video", LeLinkRole.CENTRAL, device.address)
@@ -928,6 +965,8 @@ object GattVideoClient {
                     peerHeard = { input.heardWithin(AdaptivePhyLink.PEER_HEARD_MS) },
                     onMovedTo1M = onPhyMove,
                     gate = gate,
+                    peerQuietMs = { input.quietMs() },
+                    startSplit = startSplit,
                 ),
             )
             LeChildInterval.register(gatt.device?.address, gatt)
@@ -1220,9 +1259,11 @@ object GattVideoClient {
                         logSetup("phy_update_deferred", "mask=${phyPreference.mask} placement=after_auth")
                     } else {
                         logSetup("phy_update_request", "mask=${phyPreference.mask} option=${phyPreference.option} placement=subscribed")
-                        val phyMasks = phyRequestMasks(phyPreference, DebugTunables.experimentalPhySplit)
+                        val requestedSplit = startSplit ?: DebugTunables.experimentalPhySplit
+                        val phyMasks = phyRequestMasks(phyPreference, requestedSplit)
                         if (phyMasks.txMask != phyMasks.rxMask) {
-                            Log.i("BluetoothVideo", "BENCHMARK gatt_phy_split: link=gatt-video | requested=${DebugTunables.experimentalPhySplit?.debugValue} | txMask=${phyMasks.txMask} | rxMask=${phyMasks.rxMask}")
+                            val source = if (startSplit != null) " | source=memory" else ""
+                            Log.i("BluetoothVideo", "BENCHMARK gatt_phy_split: link=gatt-video | requested=${requestedSplit?.debugValue} | txMask=${phyMasks.txMask} | rxMask=${phyMasks.rxMask}$source")
                         }
                         phyHold.submit("gatt_video_phy", isActive = { !cancelled.get() && !teardown.disconnected }) {
                             gate.submit(
@@ -1257,6 +1298,7 @@ object GattVideoClient {
                                 }.isSuccess
                             }.accepted
                         },
+                        { !cancelled.get() && runCatching { activeGatt.readPhy() }.isSuccess },
                     ) {
                         cancelled.set(true)
                         GattResourceRegistry.shared.setActive(activeGatt, false)
@@ -1485,6 +1527,9 @@ class GattVideoServer(
     private val onStatus: (String) -> Unit,
     private val onConnection: (GattVideoConnection) -> Unit,
 ) : Closeable {
+    /** True only for a call endpoint's own receiver set (not a relay, stream or renewal): [CallReadyAdvertisingHold]. Set before [start]. */
+    @Volatile internal var callEndpoint: Boolean = false
+
     /**
      * Experimental in-call link renewal (Design SR): the set advertises only this 128-bit service UUID (no announcement,
      * no manufacturer data, an empty scan response) instead of [announcement]. Null: the normal call or stream advert.
@@ -1511,6 +1556,12 @@ class GattVideoServer(
 
     /** Review B3: since when a central has been connected but not yet admitted, or null. */
     fun setupCentralSinceMs(): Long? = if (setupCentral != null && activeDevice == null) setupCentralAtMs else null
+
+    /**
+     * R1 C9 (2026-11-10): a central is connected, in setup or admitted, so closing this server now would orphan its
+     * link (the call endpoint's epoch-boundary restart waits for it, BoundaryRestartPlan).
+     */
+    fun linkInFlight(): Boolean = !closed.get() && (setupCentral != null || activeDevice != null)
 
     private val appContext = context.applicationContext
     private val bluetoothManager = appContext.getSystemService(BluetoothManager::class.java)
@@ -1612,6 +1663,9 @@ class GattVideoServer(
         }
     }
 
+    /** AP7 F1 (`test_gatt_first_write_counts_control`): a decoded control write arrived on the current connection. */
+    @Volatile private var controlWriteDelivered = false
+
     /**
      * Keep-address part of the same entry ([GattServerReregisterKeepsAddress]; control arm
      * `test_gatt_reregister_keep_address=false`): a re-registration keeps the running advertising set.
@@ -1668,10 +1722,14 @@ class GattVideoServer(
         advertiseHandler.postDelayed({ checkFirstWriteWatch(device) }, timeout)
     }
 
+    /** AP7 F1: a delivered data write, or (with the switch on) a delivered decoded control write on this connection. */
+    private fun firstWriteReceived(): Boolean =
+        input?.heardAny() == true || (DebugTunables.gattFirstWriteCountsControl && controlWriteDelivered)
+
     private fun checkFirstWriteWatch(device: BluetoothDevice) {
         val watch = connectionWatch ?: return
         if (closed.get()) return
-        val missing = watch.firstWriteExpired(dataReceived = input?.heardAny() == true)
+        val missing = watch.firstWriteExpired(dataReceived = firstWriteReceived())
         if (
             missing == null || !missing.equals(device.address, ignoreCase = true) ||
             !missing.equals(activeDevice?.address, ignoreCase = true)
@@ -1694,7 +1752,7 @@ class GattVideoServer(
     @SuppressLint("MissingPermission")
     private fun reregisterAfterMissingFirstWrite(device: BluetoothDevice) {
         val (old, action) = synchronized(this) {
-            if (closed.get() || activeDevice?.address != device.address || input?.heardAny() == true) {
+            if (closed.get() || activeDevice?.address != device.address || firstWriteReceived()) {
                 releaseAdmissionHold(device)
                 return
             }
@@ -1885,6 +1943,7 @@ class GattVideoServer(
             input = activeInput
             output = activeOutput
             recovery?.start(activeOutput)
+            controlWriteDelivered = false
             armFirstWriteWatch(device)
             onConnection(
                 GattVideoConnection(
@@ -1914,7 +1973,11 @@ class GattVideoServer(
             val activeInput = input
             val valid = peerMatches && requestSupported && handleIncoming(activeInput, value)
             val heard = valid && activeInput?.heardAny() == true
-            if (heard) connectionWatch?.onDataReceived(device.address)
+            // AP7 F1 (Experimental `test_gatt_first_write_counts_control`): a decoded GR1 hello/high proves the stack
+            // delivers this connection's writes, so the stage-2 first-write watch must not cancel and re-register the server.
+            val controlDelivered = valid && controlCountsAsFirstWrite(DebugTunables.gattFirstWriteCountsControl, value)
+            if (controlDelivered) controlWriteDelivered = true
+            if (heard || controlDelivered) connectionWatch?.onDataReceived(device.address)
             if (responseNeeded) {
                 server?.sendResponse(
                     device,
@@ -2082,16 +2145,29 @@ class GattVideoServer(
     }
 
     private fun switchToBalancedAdvertising() {
-        if (closed.get()) return
-        if (activeDevice != null) {
-            // A set held through an admission ([AdmissionAdvertisingHold]) can outlive the link: try the step again later.
-            if (advertising) scheduleBalancedStep()
-            return
-        }
-        // F11: while a verification code is shown the set stays low-latency / high power; checked again later.
-        if (AdvertisingBoost.holding()) {
-            scheduleBalancedStep()
-            return
+        // A link up (a set held through an admission, [AdmissionAdvertisingHold], can outlive it) or an F11 verification
+        // code (the set stays low-latency / high power): look again later. JT2-P2: an idle call endpoint's receiver set is held.
+        when (
+            CallReadyAdvertisingHold.decide(
+                enabled = DebugTunables.callAdvIdleFast,
+                callEndpoint = callEndpoint,
+                closed = closed.get(),
+                advertising = advertising,
+                linkActive = activeDevice != null,
+                boostHolding = AdvertisingBoost.holding(),
+            )
+        ) {
+            CallReadyAdvertisingHold.Action.IGNORE -> return
+            CallReadyAdvertisingHold.Action.RETRY_LATER -> {
+                scheduleBalancedStep()
+                return
+            }
+            CallReadyAdvertisingHold.Action.HOLD -> {
+                advertisement.noteBalancedHeld()
+                armHoldLog()
+                return
+            }
+            CallReadyAdvertisingHold.Action.STEP -> Unit
         }
         // Same set, same address: a peer that just discovered it can still connect.
         if (DebugTunables.stableAdvertisingAddress && advertisement.switchToBalanced()) return
@@ -2101,6 +2177,25 @@ class GattVideoServer(
                 startAdvertising(lowLatency = false)
             }.onFailure { onStatus("GATT video balanced advertising failed: ${it.message}") }
         }
+    }
+
+    /** DEBUG: when the set was first held (elapsedRealtime), 0 when not held; the 60 s `adv_hold` line repeats while it is. */
+    @Volatile private var heldSinceMs = 0L
+
+    private val holdLog: Runnable = Runnable {
+        if (closed.get() || !advertising || activeDevice != null) {
+            heldSinceMs = 0L
+            return@Runnable
+        }
+        val now = android.os.SystemClock.elapsedRealtime()
+        android.util.Log.i("BluetoothVideo", CallReadyAdvertisingHold.line((now - heldSinceMs) / 1_000L, now))
+        advertiseHandler.postDelayed(holdLog, CallReadyAdvertisingHold.LOG_INTERVAL_MS)
+    }
+
+    private fun armHoldLog() {
+        if (!BuildConfig.DEBUG || heldSinceMs != 0L) return
+        heldSinceMs = android.os.SystemClock.elapsedRealtime()
+        advertiseHandler.postDelayed(holdLog, CallReadyAdvertisingHold.LOG_INTERVAL_MS)
     }
 
     /** Experimental in-call link renewal: the armed phone's window ended or the renewal bound; the server stays. */

@@ -216,20 +216,24 @@ internal object DecoderPolicyEntries {
         title = "Decoder stall recovery A/B arm (rebuild once, then exclude the component)",
         matcher = DeviceMatcher(),
         effects = emptyList(),
-        behaviour = "With DEBUG test_decoder_stall_recovery=true, the first decoder_stall of a decoder makes the " +
+        behaviour = "With test_decoder_stall_recovery (default on; DEBUG false is the control arm), the first decoder_stall of a decoder makes the " +
             "receiver wait for a keyframe (the normal needsKeyFrame request) and rebuild the same decoder; a " +
             "repeat excludes the component for the rest of the session and rebuilds with the next candidate; " +
             "after three stalls without 60 healthy frames in between it only logs.",
         sources = listOf(MEDIA3_MTK_STALL_2711, MOONLIGHT_HUNG),
         sourceStatus = PARTIAL,
-        evidence = listOf("none: Experimental; needs an A15s (MediaTek) smoke and a hidden-surface case"),
+        evidence = listOf(
+            "randomised user-launch A/B on one pair, 12 calls per arm, same build: without recovery 8 of 12 calls " +
+                "survived a software-AV1 stall at the Wi-Fi switch, with it 12 of 12 (one-sided Fisher p = 0.047); " +
+                "promoted to default on 2026-11-10; an A15s (MediaTek) smoke and a hidden-surface case are still open",
+        ),
         confidence = LOW,
         confidenceNote = "the mechanism mirrors Moonlight's recovery ladder; false positives on a legitimately " +
-            "slow decoder are the risk and are why the arm is off by default",
+            "slow decoder are the risk; the DEBUG false arm stays as the control",
         reviewed = REVIEWED,
         origin = "Family backlog D-02",
         proposed = true,
-        fallback = "Off (default): a stall is logged only.",
+        fallback = "DEBUG test_decoder_stall_recovery=false: a stall is logged only (the control arm).",
     )
 
     /** D-03: candidate order and vendor low-latency keys (Experimental). */

@@ -32,14 +32,16 @@ class FeatureResolutionMatrixTest {
     )
 
     private val cases = listOf(
-        Case(RotatingDiscoveryFeature.spec) { l, x, s, _ -> if (l.benchmark) x == true else s ?: true },
+        // No user switch since 2026-11-04: a stored choice is ignored.
+        Case(RotatingDiscoveryFeature.spec, constantKey = true) { l, x, s, _ -> if (l.benchmark) x == true else s ?: true },
         Case(NeutralNameOption.spec) { l, x, s, _ -> if (l.benchmark) x == true else s ?: true }, // default on since 2026-10-27
         // MessagingV2Feature.resolve (inside Messages): `messages && (bench ? extra : stored) ?: default`.
         Case(MessagingV2Feature.spec, constantKey = true) { l, x, s, _ -> (if (l.benchmark) x else s) ?: true },
         // MessagingV2ChatFeature.resolve: bench ? getBooleanExtra(EXTRA, true) : stored ?: true.
         Case(MessagingV2ChatFeature.spec, constantKey = true) { l, x, s, _ -> if (l.benchmark) x ?: true else s ?: true },
-        // RelayedCallsFeature.resolve with getBoolean(PREF, false).
-        Case(RelayedCallsFeature.spec) { l, x, s, adv -> if (l.benchmark) x == true else if (adv) s ?: false else false },
+        // RelayedCallsFeature.resolve with getBoolean(PREF, false); since 2026-11-06 (owner, GAP-AUDIT-2 Q2) the stored
+        // choice counts with or without Manual video settings.
+        Case(RelayedCallsFeature.spec) { l, x, s, _ -> if (l.benchmark) x == true else s ?: false },
         // applyCallReachability with getBoolean(PREF_REACHABLE_FOR_CALLS, true).
         Case(CallReachabilityFeature.spec) { l, x, s, _ -> if (l.benchmark) x == true else s ?: true },
         // hasExtra = BuildConfig.DEBUG && extra present.
@@ -49,8 +51,8 @@ class FeatureResolutionMatrixTest {
         Case(CallResolutionLadderFeature.spec) { l, x, _, _ -> if (l.debug && x != null) x else !l.benchmark },
         Case(AutoQualityFeature.spec) { l, x, _, _ -> l.debug && x == true },
         Case(GpuScaleFeature.spec) { l, x, _, _ -> l.debug && x == true },
-        // NamingSettings.nameBeforeAnswer, which had its own copy of the default.
-        Case(NamingFeatures.NAMES_BEFORE_ANSWER) { l, x, s, _ -> if (l.benchmark) x == true else s ?: true },
+        // NamingSettings.nameBeforeAnswer: Experimental and off for every user launch since 2026-11-06 (design decision).
+        Case(NamingFeatures.NAMES_BEFORE_ANSWER, constantKey = true) { l, x, s, _ -> if (l.benchmark) x == true else s ?: false },
         Case(NamingFeatures.TITLE_PAGES, constantKey = true) { l, x, s, _ -> if (l.benchmark) x == true else s ?: true },
         Case(AudioLiveFeatures.audioLive, constantKey = true) { l, x, s, _ -> if (l.benchmark) x == true else s ?: true },
     ) + CallFeature.entries.map { feature ->
@@ -100,11 +102,11 @@ class FeatureResolutionMatrixTest {
         assertEquals(keys.size, keys.toSet().size)
         assertTrue(RotatingDiscoveryFeature.spec.id in ConnectivityFeatures.findPcs.dependsOn)
         assertTrue(RotatingDiscoveryFeature.spec.id in ConnectivityFeatures.bmh3Pseudonyms.dependsOn)
-        // The snapshot carries the dependency, so the Settings rows grey out with rotating IDs off.
-        val stored = mapOf(RotatingDiscoveryFeature.PREF to false, PcAnnouncementFeature.PREF to true)
+        // Rotating IDs have no user switch: an "off" stored by 0.4.4 or older leaves them, and their children, on.
+        val stored = mapOf("experimental_rotating_ids" to false, PcAnnouncementFeature.PREF to true)
         val snapshot = FeatureCatalog.resolveAll(false, { null }) { stored[it] }
-        assertFalse(snapshot.isOn(ConnectivityFeatures.findPcs))
-        assertFalse(snapshot.isOn(ConnectivityFeatures.bmh3Pseudonyms))
+        assertTrue(snapshot.isOn(RotatingDiscoveryFeature.spec))
+        assertTrue(snapshot.isOn(ConnectivityFeatures.bmh3Pseudonyms))
         assertTrue(snapshot.isOn(ConnectivityFeatures.bmh3))
         // The run-time value of Find PCs keeps its own rule (it needs rotating IDs where it reads announcements).
         assertTrue(FeatureCatalog.resolve(ConnectivityFeatures.findPcs, false, { null }) { stored[it] })
@@ -120,10 +122,10 @@ class FeatureResolutionMatrixTest {
             assertTrue(FeatureCatalog.isEnabled(ConnectivityFeatures.bmh3.id))
             assertTrue(FeatureCatalog.isEnabled(NamingFeatures.BVMID2.id))
             assertTrue(FeatureCatalog.isEnabled(AudioLiveFeatures.audioLive.id))
-            // A stored choice counts there too.
-            phone.preferences(CallFeatureDefaults.APP_SETTINGS_PREFERENCES).edit().putBoolean(Bmh3Feature.PREF, false).apply()
+            // A stored choice of a switch that has a Settings row counts there too.
+            phone.preferences(CallFeatureDefaults.APP_SETTINGS_PREFERENCES).edit().putBoolean(CompactDiscoveryFeature.PREF, false).apply()
             MeshLiveApplication.snapshotFeatures(context)
-            assertFalse(FeatureCatalog.isEnabled(ConnectivityFeatures.bmh3.id))
+            assertFalse(FeatureCatalog.isEnabled(ConnectivityFeatures.iphoneDiscovery.id))
         } finally {
             phone.root.deleteRecursively()
         }

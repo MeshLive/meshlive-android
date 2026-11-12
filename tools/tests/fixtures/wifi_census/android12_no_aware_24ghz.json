@@ -1,0 +1,17 @@
+{
+  "description": "Anonymised real-format Android 12 dump: no Aware feature, old chip numbering, no saved Direct group, 2.4 GHz STA.",
+  "model": "SM-M315F",
+  "sdk": 31,
+  "soc": "Exynos 9611",
+  "features": {
+    "aware": false,
+    "direct": true,
+    "rtt": false
+  },
+  "wifi_initially_enabled": true,
+  "wifi_status_on": "Wifi is enabled\nWifi scanning is always available\n==== Primary ClientModeManager instance ====\nWifi is connected to \"Cafe-Guest\"\nWifiInfo: SSID: \"Cafe-Guest\", BSSID: 44:55:66:77:88:99, MAC: 9a:11:22:33:44:55, Supplicant state: COMPLETED, Wi-Fi standard: 4, RSSI: -61, Link speed: 144Mbps, Tx Link speed: 144Mbps, Frequency: 2437MHz, Net ID: 3, Metered hint: true, score: 45\n",
+  "wifi_status_off": "Wifi is disabled\nWifi scanning is only available when wifi is enabled\n",
+  "wifiaware": "Wi-Fi Aware Service\n  mUsageEnabled: false\n  mClients: [{}]\n  mCapabilities: [Capabilities [maxPublishes=0, maxSubscribes=0, maxNdiInterfaces=0, maxNdpSessions=0, supportedCipherSuites=0, isInstantCommunicationModeSupported=false, isNanPairingSupported=false, isSuspensionSupported=false, is6gSupported=false, isHeSupported=false]]\n",
+  "wifip2p": "WifiP2pService\nWifiP2pStateMachine:\n  currentState=InactiveState\n  mWifiP2pInfo groupFormed=false, isGroupOwner=false, groupOwnerAddress=/0.0.0.0\n  mGroup null\n  mSavedPeerConfig Device: Peer-Two\n    deviceAddress: 22:33:44:55:66:77\n  mGroups \n\nmAutonomousGroup false\nmJoinExistingGroup false\nmDiscoveryStarted false\nmListenStarted false\nmDetailedState disconnected\n",
+  "wifi": "Dump of WifiService\nDump of HalDeviceManager:\nWifiChipInfo {chipId=0, availableModes=[{.id = 3, .availableCombinations = [{.limits = [{.types = [0], .maxIfaces = 1}, {.types = [2], .maxIfaces = 1}]}, {.limits = [{.types = [0], .maxIfaces = 1}, {.types = [3], .maxIfaces = 1}]}]}]}\n"
+}

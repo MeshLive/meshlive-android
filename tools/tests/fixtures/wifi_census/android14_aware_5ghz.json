@@ -1,0 +1,17 @@
+{
+  "description": "Anonymised real-format Android 14 dump: Aware with two clients, new chip numbering, a saved Direct group, 5 GHz STA.",
+  "model": "SM-S901E",
+  "sdk": 34,
+  "soc": "SM8450",
+  "features": {
+    "aware": true,
+    "direct": true,
+    "rtt": true
+  },
+  "wifi_initially_enabled": true,
+  "wifi_status_on": "Wifi is enabled\nWifi scanning is always available\n==== Primary ClientModeManager instance ====\nWifi is connected to \"HomeNet-5G\"\nWifiInfo: SSID: \"HomeNet-5G\", BSSID: 3c:5a:b4:11:22:33, MAC: 9a:11:22:33:44:55, Supplicant state: COMPLETED, Wi-Fi standard: 11, RSSI: -48, Link speed: 866Mbps, Tx Link speed: 780Mbps, Frequency: 5180MHz, Net ID: 12, Metered hint: false, score: 60\nsuccessfulTxPackets: 100\nsuccessfulTxPacketsPerSecond: 5\n",
+  "wifi_status_off": "Wifi is disabled\nWifi scanning is only available when wifi is enabled\n",
+  "wifiaware": "Wi-Fi Aware Service\n  mNextClientId: 2\n  mDeathRecipientsByClientId: {0=android.os.BinderProxy@1a2b3c, 1=android.os.BinderProxy@4d5e6f}\n  mUidByClientId: {0=10123, 1=10124}\nAwareStateManager:\n  mClients: {0=com.android.server.wifi.aware.WifiAwareClientState@aa11, 1=com.android.server.wifi.aware.WifiAwareClientState@bb22}\n  mUsageEnabled: true\n  mCapabilities: [Capabilities [maxConcurrentAwareClusters=1, maxPublishes=6, maxSubscribes=6, maxServiceNameLen=255, maxMatchFilterLen=255, maxTotalMatchFilterLen=510, maxServiceSpecificInfoLen=255, maxExtendedServiceSpecificInfoLen=270, maxNdiInterfaces=1, maxNdpSessions=5, maxAppInfoLen=255, maxQueuedTransmitMessages=6, maxSubscribeInterfaceAddresses=42, supportedCipherSuites=1, isInstantCommunicationModeSupport=false, isNanPairingSupported=false, isSetClusterIdSupported=false, isSuspensionSupported=false, is6gSupported=false, isHeSupported=false, isPeriodicRangingSupported=false, maxSupportedRangingPktBandWidth=0,maxSupportedRxChains=0]]\n  mCurrentAwareConfiguration: ENABLED\n",
+  "wifip2p": "WifiP2pService\nWifiP2pStateMachine:\n  currentState=InactiveState\n  mWifiP2pInfo groupFormed=false, isGroupOwner=false, groupOwnerAddress=/0.0.0.0\n  mGroup network: DIRECT-ab-GroupNet\n   isGO: true\n   GO: Device: Galaxy-S22\n    deviceAddress: 7e:22:33:44:55:66\n    interfaceMacAddress: 7e:22:33:44:55:66\n    ipAddress: /192.168.49.1\n   primary type: 10-0050F204-5\n   secondary type: null\n   wps: 0\n   grpcapab: 0\n   devcapab: 0\n   status: 0\n   wfdInfo: null\n   vendorElements: null\n   vendorData: null\n   Pairing Bootstrapping Methods: 0\n   interface: p2p0\n   networkId: -1\n   securityType: 0\n   frequency: 2437\n   vendorData: null\n  mSavedPeerConfig Device: Peer-One\n    deviceAddress: 12:34:56:78:9a:bc\n  mGroups network: DIRECT-ab-GroupNet\n   isGO: true\n   GO: Device: Galaxy-S22\n    deviceAddress: 7e:22:33:44:55:66\n   Client: Device: Peer-One\n    deviceAddress: 12:34:56:78:9a:bc\n   interface: p2p0\n   networkId: 5\n   securityType: 0\n   frequency: 2437\n   vendorData: null\n\nmAutonomousGroup false\nmJoinExistingGroup false\nmDiscoveryStarted false\nmListenStarted false\nmDetailedState idle\n",
+  "wifi": "Dump of WifiService\nDump of HalDeviceManager:\nWifiChipInfo {chipId=0, availableModes=[{id=3, availableCombinations=[{limits=[{maxIfaces=1, types=[0]}, {maxIfaces=1, types=[3, 4]}]}, {limits=[{maxIfaces=2, types=[0]}]}]}], currentModeIdValid=true, currentModeId=3}\nmDebugChipsInfo: [{chipId=0, availableModes=[{id=3, availableCombinations=[{limits=[{maxIfaces=1, types=[0]}, {maxIfaces=1, types=[3, 4]}]}]}]}]\n"
+}

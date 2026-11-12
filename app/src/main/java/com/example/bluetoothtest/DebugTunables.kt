@@ -285,6 +285,26 @@ object DebugTunables {
         }
 
     /**
+     * A viewer's search for a lost stream ends after 60 s (default on, owner answer 2026-11-10, audit CALL-04; DEBUG control
+     * arm `test_stream_search_bound=false` keeps the unbounded search): "The stream was lost" with Try again, back in the
+     * stream list, which also reopens the phone to calls ([StreamSearchBound]).
+     */
+    @Volatile var streamSearchBound: Boolean = true
+        set(value) {
+            field = value || !BuildConfig.DEBUG
+        }
+
+    /**
+     * A callee behind a throwaway key sends its name to a stranger caller only after that caller's reveal passed the block
+     * check, like its camera and microphone, instead of with Accept ([CalleeNameRelease]); a blocked caller never learns it.
+     * Default on since 2026-11-10 (design decision, audit CALL-06; DEBUG control arm `test_callee_name_after_reveal=false`).
+     */
+    @Volatile var calleeNameAfterReveal: Boolean = true
+        set(value) {
+            field = value || !BuildConfig.DEBUG
+        }
+
+    /**
      * Experimental (default off, `test_skip_redundant_priority`): a connection-priority request for the priority
      * already requested is not sent when the link's last update already put the interval in that priority's window
      * ([LeConnectionPriorityKeeper.isRedundant]; line `prio_request: skipped`). A/B for the A15s-source radio join
@@ -348,6 +368,57 @@ object DebugTunables {
             field = value && BuildConfig.DEBUG
         }
 
+    /** Wi-Fi carrier (Experimental, default off, DEBUG `test_wifi_carrier`): forces the `wifi_carrier` switch on in a debug launch. Read only by DefaultWifiSwitches until A6 installs the FeatureCatalog source; the extra name stays. */
+    @Volatile var wifiCarrier: Boolean = false
+        set(value) { field = value && BuildConfig.DEBUG }
+    /** Wider reach (Experimental, default off, DEBUG `test_wifi_wider_reach`): same pattern as wifiCarrier. [R M-7] */
+    @Volatile var wifiWiderReach: Boolean = false
+        set(value) { field = value && BuildConfig.DEBUG }
+    /** Wi-Fi Direct (Experimental, default off, DEBUG `test_wifi_direct`): same pattern as wifiCarrier. [R M-7] */
+    @Volatile var wifiDirect: Boolean = false
+        set(value) { field = value && BuildConfig.DEBUG }
+    /** Wi-Fi Aware instant communication mode arm (`test_wifi_icm`); read only by WifiDebugArms. */
+    @Volatile var wifiIcm: Boolean = false
+        set(value) { field = value && BuildConfig.DEBUG }
+    /** Measured arm for D9: allow an upgrade while this phone's own Wi-Fi client is on 2.4 GHz (`test_wifi_allow_24ghz`); read only by WifiDebugArms. */
+    @Volatile var wifiAllow24ghz: Boolean = false
+        set(value) { field = value && BuildConfig.DEBUG }
+    /** Measured arm: attach even while another client holds Wi-Fi Aware, Private level (`test_wifi_share_attach`); read only by WifiDebugArms. */
+    @Volatile var wifiShareAttach: Boolean = false
+        set(value) { field = value && BuildConfig.DEBUG }
+    /**
+     * PROTOCOL `port`, promoted 2026-11-10 (W5): the Wi-Fi Aware server port is derived from UW and the ticket and used when the
+     * platform reports none (`test_wifi_aware_derived_port`); read only by WifiDebugArms. Default on: a release build keeps it on;
+     * a DEBUG launch can pass false as the control arm (host random port, guest without a platform port ends `no_port`).
+     */
+    @Volatile var wifiAwareDerivedPort: Boolean = true
+        set(value) { field = value || !BuildConfig.DEBUG }
+    /** Experimental arm: the 5 GHz channel hint of the Aware data-path request is required, not a hint (`test_wifi_aware_require_channel`); read only by WifiDebugArms. */
+    @Volatile var wifiAwareRequireChannel: Boolean = false
+        set(value) { field = value && BuildConfig.DEBUG }
+    /** AP9 DEBUG `test_aware_band_strict`: the old all-channels-5GHz Aware band rule (the new default judges by the 5 GHz data channel); read only by WifiDebugArms. */
+    @Volatile var awareBandStrict: Boolean = false
+        set(value) { field = value && BuildConfig.DEBUG }
+    /** AP10 Experimental, default off, DEBUG `test_aware_24ghz_alone`: a phone with no other Bluetooth media link accepts a 2.4 GHz-only Aware data path (off = AP9's 5 GHz rule exactly); read only by WifiDebugArms. */
+    @Volatile var aware24GhzAlone: Boolean = false
+        set(value) { field = value && BuildConfig.DEBUG }
+    /** AP10 Experimental, default off, DEBUG `test_aware_goodput_guard`: the Aware goodput guard returns a low hop to Bluetooth (off = it measures and logs `quality_fallback_suppressed` only); read only by WifiDebugArms. */
+    @Volatile var awareGoodputGuard: Boolean = false
+        set(value) { field = value && BuildConfig.DEBUG }
+    /** Census only (`test_wifi_probe`): CAPS goes out with every bit clear and no attempt is ever started; facts are logged. */
+    @Volatile var wifiProbe: Boolean = false
+        set(value) { field = value && BuildConfig.DEBUG }
+    /** Benchmark arm (`test_wifi_force_carrier=aware|direct|bluetooth`): try only that carrier. Empty = normal. */
+    @Volatile var wifiForceCarrier: String = ""
+        set(value) { field = if (BuildConfig.DEBUG && value in setOf("aware", "direct", "bluetooth")) value else "" }
+    /** DEBUG `test_wifi_exact_kbps`: exact call rate for the M2 measurement (DEBUG only; ignored without `test_rate_control` or with `auto`). [A5 Am 16] */
+    @Volatile var wifiExactKbps: Int = 0
+        set(value) { field = if (BuildConfig.DEBUG && value > 0) value else 0 }
+
+    /** Experimental (default off), Design WF, RESERVED, no consumer yet (R-4): lower the Bluetooth standby's connection priority while Wi-Fi carries media. `test_wifi_ble_standby_low_power=true`. Parsed and logged; no code reads it; the benchmark runner refuses it. */
+    @Volatile var wifiBleStandbyLowPower: Boolean = false
+        set(value) { field = value && BuildConfig.DEBUG }
+
     /** F16 fix 2, Experimental (default off, DEBUG `test_call_fps_follow=true`): [CallFpsFollow] for Automatic calls. */
     @Volatile var callFpsFollow: Boolean = false
         set(value) {
@@ -400,6 +471,30 @@ object DebugTunables {
         }
 
     /**
+     * Design PP package A (2026-11-10), Experimental: a second, shorter timer on an incoming BLE GATT/CoC connection that ends at the
+     * verified hop plus opening ([IncomingPhaseBounds.HOP_AUTH_MS], 10 s instead of waiting out the 20 s watchdog), so a connector
+     * that never completes the hop handshake releases the call endpoint sooner. The 20 s watchdog stays as it is; a BMH2 first frame,
+     * Classic, Wi-Fi and the relay budgets keep the conservative bound. DEBUG launch extra `test_call_preauth_deadline_short=true`
+     * (benchmark tunable `call_preauth_deadline_short`); off by default, in release builds always off.
+     */
+    @Volatile var callPreauthDeadlineShort: Boolean = false
+        set(value) {
+            field = value && BuildConfig.DEBUG
+        }
+
+    /**
+     * Design PP package A (2026-11-10), Experimental, SEC-06: an authenticated incoming connection of an ordinary call that has not
+     * delivered its first valid INVITE [IncomingPhaseBounds.PRE_INVITE_MS] after its reader started is closed (the conservative
+     * 20 s for a relayed, Classic or Wi-Fi endpoint). Verification-only (BVMID2) sessions, message exchanges, relay duties, outgoing
+     * calls and renewal are never bounded by it. DEBUG launch extra `test_call_pre_invite_deadline=true` (benchmark tunable
+     * `call_pre_invite_deadline`); off by default, in release builds always off.
+     */
+    @Volatile var callPreInviteDeadline: Boolean = false
+        set(value) {
+            field = value && BuildConfig.DEBUG
+        }
+
+    /**
      * Review T5 (2026-10-27): the GATT control client re-attached after a CoC connect makes one attempt bounded at 3 s and
      * returns at once (the PHY request follows 600 ms later, off the connect path). DEBUG `test_coc_attach_single=false`
      * is the control arm: up to 3 attempts of 6 s, and the connect waits the 600 ms. Release builds always have it.
@@ -415,6 +510,36 @@ object DebugTunables {
             field = value && BuildConfig.DEBUG
         }
 
+    /**
+     * Promoted 2026-11-12 on mechanism (default on, release builds keep it on), join-latency P4a: [FastFirstRedial], the first
+     * redial after a fast 133/0x3E (within the 1.5 s fast-establishment class) waits 200 ms instead of 500 (GATT video and BLE
+     * control clients). DEBUG `test_fast_first_redial=false` is the control arm.
+     */
+    @Volatile var fastFirstRedial: Boolean = true
+        set(value) {
+            field = value || !BuildConfig.DEBUG
+        }
+
+    /**
+     * Promoted 2026-11-12 on mechanism (default on, release builds keep it on), join-time JT2-P2: [CallReadyAdvertisingHold], a
+     * call endpoint's idle GATT receiver set keeps its 100 ms / high-power advertising instead of stepping to 250 ms / medium
+     * 10 s after start. DEBUG `test_call_adv_idle_fast=false` is the control arm.
+     */
+    @Volatile var callAdvIdleFast: Boolean = true
+        set(value) {
+            field = value || !BuildConfig.DEBUG
+        }
+
+    /**
+     * Promoted on mechanism 2026-11-12 (default on, release builds keep it on): [CallsQuiet.indicatorVisible], the Calls >
+     * Nearby searching indicator stops after [CallsQuiet.INDICATOR_FOR_MS] instead of spinning (and redrawing the window every
+     * frame) for as long as discovery runs. DEBUG `test_calls_indicator_settles=false` is the control arm.
+     */
+    @Volatile var callsIndicatorSettles: Boolean = true
+        set(value) {
+            field = value || !BuildConfig.DEBUG
+        }
+
     /** Experimental (off), review A10: [StallRetryOwnBudget]. DEBUG `test_stall_retry_own_budget=true`. */
     @Volatile var stallRetryOwnBudget: Boolean = false
         set(value) {
@@ -428,6 +553,17 @@ object DebugTunables {
     @Volatile var setupStallMs: Long = 0L
         set(value) {
             field = if (BuildConfig.DEBUG) value.coerceIn(0L, 10_000L) else 0L
+        }
+
+    /**
+     * Experimental (0 = off; AP7 F2, analysis a15s-asus 2026-11-07): a first-2M call attempt whose hop authentication
+     * finished after this many ms is treated as a setup stall and takes the existing 1M retry, recording the peer bad on
+     * 2M as a stalled setup does. DEBUG `test_stall_slow_auth_ms`. Clamped to [AdaptivePhyMemory.SETUP_STALL_MS]: at or
+     * above it the existing guard claims the attempt first and this arm can never fire.
+     */
+    @Volatile var stallSlowAuthMs: Long = 0L
+        set(value) {
+            field = if (BuildConfig.DEBUG) value.coerceIn(0L, AdaptivePhyMemory.SETUP_STALL_MS) else 0L
         }
 
     /** Experimental (off), review A13: the relayed SETUP budget starts at hop authentication. DEBUG `test_relayed_budget_from_hop_auth=true`. */
@@ -700,6 +836,39 @@ object DebugTunables {
         }
 
     /**
+     * Experimental (off; design decision 2026-11-06, Q-AUDIO-STALL): after the peer's call audio stopped arriving for 2 s or
+     * more, audio still late after the playout clock grew to its maximum (older than the playout budget) is dropped and
+     * logged ([CallStaleAudio]); normal jitter still plays every packet. Off logs the same line in observe mode. DEBUG launch
+     * extra `test_call_stale_audio_drop`.
+     */
+    @Volatile var callStaleAudioDrop: Boolean = false
+        set(value) {
+            field = value && BuildConfig.DEBUG
+        }
+
+    /**
+     * Experimental (off): after one isolated late burst (b12sm 2026-11-11: a 526 ms sender pause grew the S22's call delay
+     * by 303 ms for the rest of the call), the call delay returns to its level before the burst by leaving out quiet
+     * decoded audio inside pauses, never speech; video follows at the same point ([CallFastRecovery]). Sustained lateness
+     * and continuous speech keep today's slow shrink. DEBUG launch extra `test_call_fast_recovery`.
+     */
+    @Volatile var callFastRecovery: Boolean = false
+        set(value) {
+            field = value && BuildConfig.DEBUG
+        }
+
+    /**
+     * Experimental (off; audit MEDIA-06): a call's video decoder that stops taking frames (a decoder watchdog stall, or
+     * no queue room within the 1.5 s playout budget instead of 5 s) is replaced at the next keyframe instead of ending
+     * the call; after three stalls without 60 healthy frames video stops and voice continues ([CallVideoStallRestart]).
+     * DEBUG launch extra `test_call_video_restart`.
+     */
+    @Volatile var callVideoRestart: Boolean = false
+        set(value) {
+            field = value && BuildConfig.DEBUG
+        }
+
+    /**
      * LE CoC client on a fresh ACL (BleCocClient, DeviceFamilyPolicy.LE_COC_EATT_STRANDED_CHANNELS):
      * null = the stack-family default (Android 12/13). DEBUG launch extra
      * `test_coc_fresh_acl=true|false` forces it on or off on any phone.
@@ -820,6 +989,29 @@ object DebugTunables {
         }
 
     /**
+     * Experimental, default off (AP7 F1, analysis a15s-asus 2026-11-07): a well-formed GR1 hello or high accepted on the
+     * server's write characteristic counts as the stage-2 first-write watch's delivered write, so the watch does not cancel
+     * and re-register the server on a link whose writes did reach the app. DEBUG launch extra
+     * `test_gatt_first_write_counts_control`. Off: today's data-only rule.
+     */
+    @Volatile var gattFirstWriteCountsControl: Boolean = true
+        set(value) {
+            // Default on: a release build keeps it on; a DEBUG launch can pass false as the control arm.
+            field = value || !BuildConfig.DEBUG
+        }
+
+    /**
+     * Experimental diagnostic (off; DEBUG only): after a `BMS1` tag failure on a GATT link with GR1, ask the peer for
+     * the failed record's chunks again, compare them byte for byte and log `hop_integrity_diff` lines, then end the link
+     * as before ([HopIntegrityResendDiff]). Launch extra `test_hop_integrity_resend_diff` (benchmark tunable
+     * `hop_integrity_resend_diff`); read when a GATT link starts.
+     */
+    @Volatile var hopIntegrityResendDiff: Boolean = false
+        set(value) {
+            field = value && BuildConfig.DEBUG
+        }
+
+    /**
      * Default on: at a PHY move (`stalled_one_way`, `one_pdu_per_event`) a live stream sender drops queued media older than
      * [PhyMoveSkip.FLOOD_STALE_MS] once (video codec-safely, audio older than the viewer's playout) instead of flooding it into
      * the viewer ([PhyMoveSkip.floodGuard]). Calls and audio-only live never. DEBUG launch extra `test_phy_move_flood_guard=false`
@@ -841,6 +1033,19 @@ object DebugTunables {
     @Volatile var decoderSizeChangeRebuild: Boolean = true
         set(value) {
             field = value || !BuildConfig.DEBUG
+        }
+
+    /**
+     * DEBUG only, default off: the manual stream relay ([BluetoothVideoRelay], `test_role=relay`) passes the
+     * end-to-end handshake through, so a source or viewer behind it sees an end-to-end peer that is not its link peer.
+     * Every other stream hop requires the two to be the same node (StreamHopPeerBinding, SEC-B2); this switch exempts
+     * a version 2 hop whose link peer signed `maxChildren > 0`. Launch extra `test_stream_relay_passthrough`
+     * (set it on the source and on the viewer of a DEBUG relay chain); `test_require_relay` implies it. Release builds
+     * ignore it.
+     */
+    @Volatile var streamRelayPassthrough: Boolean = false
+        set(value) {
+            field = value && BuildConfig.DEBUG
         }
 
     /**
@@ -1258,6 +1463,31 @@ object DebugTunables {
         }
 
     /**
+     * Experimental, default off (design decision 2026-11-06, DECISIONS "Relay admission without a measured ceiling"): with
+     * no fresh relay ceiling the relay budget is at least 2 x the per-link load whatever relay load was proven before
+     * ([LinkCapacityPolicy.relayFloor]); [relayColdStart] keeps naming the proven-0 case, and a fresh relay ceiling keeps
+     * the measured budget. DEBUG launch extra `test_relay_no_ceiling_floor`. Lines: `BENCHMARK relay_floor_policy` (launch),
+     * `BENCHMARK relay_admission` (adds `floor=` only while on).
+     */
+    @Volatile var relayNoCeilingFloor: Boolean = false
+        set(value) {
+            field = value && BuildConfig.DEBUG
+        }
+
+    /**
+     * Relayed calls: the idle call endpoint restart guard (default on, a bug fix; rc-ctl-20261106). On: a stale offer
+     * never rebuilds an endpoint holding an accepted link that has not signalled a call yet (asked again at the next
+     * tick), a new endpoint reads its offer's helper bits from the state at its creation with its own transport, and
+     * the static call relay stops when its authenticated child link closes before the caller joins. DEBUG
+     * `test_relayed_restart_guard=false` is the control arm (the old restart, cached bits and up to 180 s on a dead
+     * child). Lines: `BENCHMARK relayed_helper: offer_restart=deferred|done`, `call_relay_child: event=closed_before_parent`.
+     */
+    @Volatile var relayedRestartGuard: Boolean = true
+        set(value) {
+            field = value || !BuildConfig.DEBUG
+        }
+
+    /**
      * Fan-out growth compares proven load and planned links in one unit ([LinkCapacityPolicy.fanOutProvenScale]):
      * proven wire kbps x 1.2 + one planned link. Default on; DEBUG `test_fanout_proven_links=false`
      * is the control arm (raw proven + planned link, which capped a 300 kbps source at 2 children).
@@ -1354,6 +1584,19 @@ object DebugTunables {
         }
 
     /**
+     * On by default since 2026-11-04 (owner, after release-window-ab2 16/17 vs 9/17 and preservation on three pairs;
+     * [StallRediscover.releaseWindowMs]): the 1M retry after a failed 2M call setup scans for the callee's new advertisement
+     * for as long as the callee can take to release the old link (3 x the LE supervision timeout after our own close, 1 x
+     * after an observed loss, plus the callee's GATT restart pause and 2 s), instead of the fixed 8 s clamp that made A15s ->
+     * ASUS retries dial a stale address. DEBUG `test_rediscover_release_window=false` is the control arm; release builds are
+     * always on.
+     */
+    @Volatile var rediscoverReleaseWindow: Boolean = true
+        set(value) {
+            field = value || !BuildConfig.DEBUG
+        }
+
+    /**
      * Default on: the 1M call-setup retry after a 2M setup stall waits (bounded [SetupRetryAclWait.BOUND_MS]) for the stalled
      * link's ACL to drop before it dials, so it does not dial into the lingering ACL (HCI 0x3E/0x0B, GATT 133). DEBUG launch
      * extra `test_setup_retry_acl_wait=false` is the control arm (dial at once).
@@ -1440,6 +1683,18 @@ object DebugTunables {
         }
 
     /**
+     * Experimental, default off (AP7 F3, analysis a15s-asus 2026-11-07): the DEBUG static private-call relay
+     * (`test_private_call_relay=true`) gives its LE child hop the same 3 s hop-authentication guard and one 1M retry as an
+     * on-demand hop, and records the pair bad on 2M after a stalled 2M attempt. Production relayed calls already use the
+     * on-demand path (`startOnDemand` -> `openNextHop`); this makes the benchmark's static shape match it. DEBUG launch
+     * extra `test_relay_start_hop_guard`.
+     */
+    @Volatile var relayStartHopGuard: Boolean = false
+        set(value) {
+            field = value && BuildConfig.DEBUG
+        }
+
+    /**
      * Relayed calls, DECISIONS Design C "Amendment CP" (default on, review CP-1): every relay edge (caller to helper, helper
      * to helper, helper to target) runs BMH3 with a throwaway that declares PSEUDONYM, fresh per connection, never BMH2 while
      * pseudonym mode is on; a hop is bound when it answers with a real key and not when it declared a throwaway; a helper
@@ -1493,6 +1748,18 @@ object DebugTunables {
     @Volatile var adaptivePhySplit: GattPhySplit? = null
         set(value) {
             field = value.takeIf { BuildConfig.DEBUG }
+        }
+
+    /**
+     * Experimental, default off (Q14, design decision 2026-11-06; A/B on ASUS <-> A15s, S24 <-> Xiaomi, A55 <-> M31): a GATT
+     * central's 2M link moves only the failing direction to 1M ([PhyDirectionSplit]: receive silence moves RX; a backlogged
+     * writer tries RX, then the mirror, then full 1M) and the split that worked is remembered per peer, so the next link to
+     * that peer asks for it at setup ([AdaptivePhyMemory.splitFor]). Takes precedence over [adaptivePhySplit]. Needs
+     * `test_adaptive_phy`. DEBUG launch extra `test_phy_direction_split` ([PhySwitches.radioArms]).
+     */
+    @Volatile var phyDirectionSplit: Boolean = false
+        set(value) {
+            field = value && BuildConfig.DEBUG
         }
 
     /**
@@ -1933,12 +2200,83 @@ object DebugTunables {
         }
 
     /**
+     * Experimental first call frame with a playout ramp (off by default; see FirstFrameRamp): the first decoded frame
+     * is shown at once, then the following frames play slowed (at least 67% speed) until they meet the normal playout
+     * target, about 2 s later, instead of freezing until it (the freezes of callFirstFrameNow, Q16). Takes precedence
+     * over callFirstFrameNow. Launch extra `test_call_first_frame_ramp` (benchmark tunable `call_first_frame_ramp`).
+     */
+    @Volatile var callFirstFrameRamp: Boolean = true
+        set(value) {
+            // Default on: a release build keeps it on; a DEBUG launch can pass false as the control arm.
+            field = value || !BuildConfig.DEBUG
+        }
+
+    /**
+     * Experimental (default off, JT1, [CallPrewarm]): a ringing video call prepares its encoder, and at the peer's call
+     * header its decoder component; camera and microphone still start only after Accept and the media decision. Launch
+     * extra `test_call_prewarm` (benchmark tunable `call_prewarm`).
+     */
+    @Volatile var callPrewarm: Boolean = false
+        set(value) {
+            field = value && BuildConfig.DEBUG
+        }
+
+    /**
+     * Promoted 2026-11-12 on mechanism (default on, release builds keep it on; JT2, [CallMediaStartOrder]): after Accept and the
+     * block check, the call starts its camera before its audio route (the route open is queued on the audio command thread, the
+     * microphone after it), the camera opens while its preview surface is requested ([CameraOpenJoin]) and remote audio plays
+     * only after the route open. Nothing starts earlier than before. DEBUG launch extra `test_call_camera_first=false` (benchmark
+     * tunable `call_camera_first`) is the control arm.
+     */
+    @Volatile var callCameraFirst: Boolean = true
+        set(value) {
+            field = value || !BuildConfig.DEBUG
+        }
+
+    /**
+     * Default-on (owner 2026-11-10; see CallMediaAccess, UI audit 2026-11-10 UI-01): a video call answered or placed
+     * while only camera access is refused goes on as a voice call with a notice (the existing camera-off answer, no
+     * wire change). Control arm: launch extra `test_call_voice_when_camera_refused=false` (benchmark tunable
+     * `call_voice_when_camera_refused`), where the refusal is only said. Release builds always keep it on.
+     */
+    @Volatile var callVoiceWhenCameraRefused: Boolean = true
+        set(value) {
+            field = value || !BuildConfig.DEBUG
+        }
+
+    /**
+     * Experimental quiet end of an incoming link that never rang (off by default until its phone A/B; see
+     * PreRingFailure, call audit 2026-11-10 CALL-02): no screen change and no "The incoming call couldn't connect"; the
+     * endpoint is rebuilt as today and one `call_pre_ring_failure` line records it. Off: the ordinary call-ended path.
+     * Launch extra `test_call_quiet_pre_ring_failure` (benchmark tunable `call_quiet_pre_ring_failure`). The constant is
+     * the release behaviour and the launch default in one place, so promoting it is one edit (a promoted switch that
+     * keeps a `value && BuildConfig.DEBUG` setter stays off in release builds); a DEBUG launch can set either arm.
+     */
+    const val CALL_QUIET_PRE_RING_FAILURE_DEFAULT = false
+    @Volatile var callQuietPreRingFailure: Boolean = CALL_QUIET_PRE_RING_FAILURE_DEFAULT
+        set(value) {
+            field = if (BuildConfig.DEBUG) value else CALL_QUIET_PRE_RING_FAILURE_DEFAULT
+        }
+
+    /**
      * Experimental call encoder fit (off by default; see CallEncoderFit): a call geometry at which
      * this phone's native encoder stayed over budget at its fastest settings is remembered, and later
      * calls start one supported size smaller at the same frame rate. Launch extra
      * `test_call_encoder_fit` (benchmark tunable `call_encoder_fit`); live camera only.
      */
     @Volatile var callEncoderFit: Boolean = false
+        set(value) {
+            field = value && BuildConfig.DEBUG
+        }
+
+    /**
+     * Experimental, default off (AP5, 2026-11-07; see SoftwareEncoderShortfall): when this phone's software encoder stayed
+     * under 80 % of the frame rate in force for 3 windows while its input kept up, that encoder, size and FPS are remembered
+     * for 7 days, and the next call or stream that would start with it prefers this phone's hardware H.264 encoder (when
+     * the peer decodes H.264 and Automatic may use it). Changes the codec choice only, never the requested size, FPS or
+     * bitrate; never a hand-picked encoder. Launch extra `test_sw_shortfall_avc` (benchmark tunable `sw_shortfall_avc`).
+     */
+    @Volatile var swShortfallAvc: Boolean = false
         set(value) {
             field = value && BuildConfig.DEBUG
         }

@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "api": 34,
+  "feature_wifi_aware": true,
+  "feature_wifi_direct": true,
+  "aware": {
+    "permission": "granted",
+    "is_available": true,
+    "is_device_attached": false,
+    "location_enabled": true,
+    "characteristics": {
+      "max_service_name_length": 255,
+      "max_service_specific_info_length": 255,
+      "max_match_filter_length": 255,
+      "supported_cipher_suites": 3,
+      "instant_communication_mode_supported": true,
+      "number_of_supported_data_interfaces": 2,
+      "number_of_supported_data_paths": 8,
+      "number_of_supported_publish_sessions": 8,
+      "number_of_supported_subscribe_sessions": 8,
+      "aware_pairing_supported": false,
+      "suspension_supported": false
+    },
+    "available_aware_resources": {
+      "available_data_paths": 8,
+      "available_publish_sessions": 8,
+      "available_subscribe_sessions": 8
+    },
+    "is_set_channel_on_data_path_supported": true,
+    "attach_status": "ok",
+    "attach_elapsed_ms": 812,
+    "attach_timeout_ms": 10000
+  },
+  "wifi_direct": {
+    "permission": "granted",
+    "device_info_status": "ok",
+    "device_address_sha256": "29117597c719519a",
+    "device_name_sha256": "0d3c65a9e1b2c4f6"
+  }
+}

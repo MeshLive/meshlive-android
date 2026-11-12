@@ -12,9 +12,12 @@ requested versus effective difference (a lower rate, a different encoder, direct
 pass the original request.
 
 The project's reference phones are listed in [../tools/benchmark_scope.json](../../tools/benchmark_scope.json):
-S24 (SM-S921B), S22 (SM-S901E), M31 (SM-M315F), ASUS (ASUS_I01WD), Xiaomi (Redmi 23053RN02I) and A55 (SM-A556E);
-the A15s (OPPO CPH2179) is an additional measured phone. They are examples of the span of Android versions, SoCs and
-Bluetooth stacks the app should handle. Your phones extend the same inventory; they do not replace anything.
+S24 (SM-S921B), S22 (SM-S901E), M31 (SM-M315F), ASUS (ASUS_I01WD), A15s (OPPO CPH2179) and Realme (RMX5256) are the
+fixed required phones (`required_phones`); Xiaomi (Redmi 23053RN02I) and A55 (SM-A556E) extend the inventory
+(`extension_phones`): their request ids are compiled and kept, and a run does not need them. They are examples of the
+span of Android versions, SoCs and Bluetooth stacks the app should handle. Your phones extend the same inventory; they
+do not replace anything. `carrier_eligibility` lists the phones measured for each Wi-Fi carrier, and
+`carrier_eligibility_provenance` cites the calls behind each listing.
 
 ### Roles and topologies
 
@@ -104,7 +107,7 @@ recorded with them).
 
 | Measurement | Target |
 | --- | --- |
-| Actual frame intervals | p95 at most 1.25 frame periods; p99 at most 2 periods |
+| Actual frame intervals | p95 at most 1.25 frame periods; p99 at most 2 periods. A rendered interval is a whole number of display refreshes, so the comparison allows half a refresh period of the receiving phone's screen (8.33 ms at 60 Hz); a frame shown a whole refresh late still fails. The refresh rate is the one declared for the phone (`display_refresh_hz`), else the app's `BENCHMARK display: refreshHz=` line, else 60 Hz; each gate records `tolerance`, `display_refresh_hz` and `display_refresh_source` |
 | Encoder and visible FPS | At least 95% of the selected FPS |
 | Unexpected loss and freezes | Zero; keep input, transport, forwarder, audio, decoder and queue causes separate |
 | Startup and recovery | At most 3000 ms; full fault-to-first-surface time, including the search gap |
@@ -123,6 +126,8 @@ distributions, never lowered to make a failure pass.
 | Longest stall | Every link | Calls at most 500 ms, streams at most 1 s. The largest gap between rendered surface updates from the receiver's rolling 256-gap report window; PASS needs every report interval to add at most 256 gaps, otherwise UNMEASURED. The tail after the last frame is not included |
 | Frozen-time share | Every link | At most 1% of scored rendered time in unexpected freezes (gaps beyond the freeze threshold, less one frame period each); planned actions overlapping a freeze make it UNMEASURED |
 | Effective-profile cadence | Every link | At most 5% of the clean report time below 95% of the FPS in force (from the received stream header, time-weighted across a change; the requested FPS before any header), judged together with the longest-stall gate. The time resolution is the report interval. The earlier rule (the slowest clean report interval at least 95%) stays in the row as `legacy_slowest_window`, a labelled comparison that never decides. Requested-profile shortfall and share of time degraded are diagnostics |
+| Stream join | Every stream receiver | Selection to first rendered surface at most 3000 ms (`selection_to_first_surface_ms`, the app's `Receiver startup: selection-to-first-surface` line) and discovery at most 1500 ms. Without the selection line the gate is UNMEASURED, never a pass. Launch to first surface (cold start plus browsing, about 5 s) is computed and reported as the non-gating `launch_to_first_surface_ms` row (DIAGNOSTIC, its verdict kept as `measured_status`). A runner connection timeout stays a failure. Private-call setup-to-first-surface is unchanged |
+| Private-call join (release gate) | Every user-launch call, decided over the suite | Two app-clock stages from an idle callee: the caller's dial to ringing plus the receiving phone's Accept to the first non-black picture (`release_join_gate`, below). The target stays 3 s; the recorded interim line is 90% of calls within 6 s and none over 15 s. A build without the `call_join_stage` lines leaves it UNMEASURED |
 | Audio continuity | Every link | Zero audio drops. Speech-gap metrics need an accepted-PCM adapter and stay UNMEASURED (`acoustic`) |
 | Media age | Every link | Capture to release or surface acknowledgement of the same source PTS across two phones, only through measured clock anchors (`score_pipeline_trace.py` `media_age` plan; compared as a value plus clock uncertainty). No target is decided yet, so the value is reported and the gate stays UNMEASURED. Local queue ages are proxies, never media age |
 | Unexpected freezes, loss counters, p95/p99 frame intervals | Healthy link only | Zero, and the v3 targets. On an impaired link they are DIAGNOSTIC |
@@ -130,8 +135,8 @@ distributions, never lowered to make a failure pass.
 
 A link is *healthy* unless the request carries `media_impairment(s)` or the manifest declares
 `acceptance.link_class: "impaired"` (for example offered load above the measured link capacity). It is never inferred
-from the result. Startup, discovery, identity, requested-profile faithfulness and unexpected-event gates are
-unchanged. VMAF, SSIM, PSNR, the visible-FPS fraction, encoder FPS and offered load are DIAGNOSTIC rows: reported with
+from the result. Identity, requested-profile faithfulness and unexpected-event gates are unchanged; the
+stream join gate is defined in the table above. VMAF, SSIM, PSNR, the visible-FPS fraction, encoder FPS and offered load are DIAGNOSTIC rows: reported with
 their v3 verdict as `measured_status`, never deciding a gate, family or case. Screen framing keeps its own gates. Call
 limits apply to private-call receivers; stream limits to broadcast receivers.
 
@@ -144,6 +149,107 @@ python -B tools/run_benchmark_suite.py analyze --profile device-run-v4-user --ma
 ```
 
 `tools/score_device_run.py --profile` scores a single manifest.
+
+### Release-gate join metric
+
+The release gate for joining a call is a suite-level rule over user-launch calls. Join time keeps 3 s as the target and
+ships against a recorded interim line: at least 90% of the calls show a real picture within 6 s, and none takes more
+than 15 s.
+
+Per call and per receiving phone the score records two stages from the app's own `BENCHMARK call_join_stage` lines
+(`stage=dial|ringing|accept|first_frame_shown|...`, `role`, `sinceStartMs`, `atMs` = the phone's elapsedRealtime,
+`callId`; `first_frame_shown` also carries `black=<bool>` and `meanLuma`):
+
+- stage 1, on the caller's clock: `dial` to `ringing`;
+- stage 2, on the receiving phone's own clock: that phone's `accept` to its first `first_frame_shown` with `black=false`;
+- join = stage 1 + stage 2. A stage is a difference of two `atMs` values of one phone, so no clock of one phone is
+  subtracted from another's. The call's join is the slower of its two receiving directions, and it needs both measured.
+
+The score keeps both stages and the sum per direction (`release_join.directions`, and the diagnostic row
+`release_join_ms` of each receiving phone). `setup_to_first_surface_ms` stays as a diagnostic against the 3 s target; in
+a user-launch call it is reported (`measured_status`, `target_ms`) and never a release FAIL.
+
+Unobservable cases are explicit. A first shown picture that is black counts only when the app logs a later non-black
+one; the app logs the stage once, so a black first picture, or `black=unknown`, is UNMEASURED with that reason. A build
+without the stage lines is UNMEASURED, never FAIL. A build with them whose call never rang or never showed a picture is
+a failed join (the call did not connect), unless logd reported dropping that phone's lines, which makes it UNMEASURED.
+
+`suite-result.json` carries `release_join_gate` (`tools/release_join.py suite_gate`, also shown on `report.html`): PASS
+when at least 90% of the counted calls are at most 6 s and none is over 15 s; FAIL when fewer are, or when any call is
+over 15 s or never joined (a measured outlier decides before the minimum is reached); UNMEASURED when fewer than 20
+calls are counted. Twenty is the smallest selection where one slow call moves the share by 5 points and an outlier has
+company; the release selection is about 120 calls. The gate reports the count, share, p90, median, max, the calls over
+6 s and over 15 s, and the calls it did not count (UNMEASURED, benchmark-launch control arms, callees that were not
+idle), each with its reason. Only user-launch calls from an idle callee count.
+
+Idle callee. A case option `callee_idle_s` (number above 0, at most 300; direct calls only) makes the runner wait that
+long, after the callee's launch has produced its `call available` line (and, in a user launch, its `rotid_own` line),
+before the caller dials, so the call goes into the idle state a user calls into and not the launch burst. The caller is
+launched and has discovered the callee during the wait. The manifest records `callee_idle` (anchor, requested and actual
+seconds on the callee's clock); the score treats a callee as idle from 11 s. The app's fast window after an endpoint
+starts is 8 s of full-duty low-latency scan (`LOW_LATENCY_SCAN_BURST_MS`) and 10 s of 100 ms advertising
+(`LOW_LATENCY_ADVERTISE_BURST_MS`), then the in-place balanced step (`adv_set_churn: event=balanced_in_place`, 10.1 s
+after the advertising start). Release-gate cases use `callee_idle_s: 12`
+(`release_join.RELEASE_CALLEE_IDLE_S`), just beyond that window. `callee_idle_s` is part of the request, so a case that
+adds it is a new case ID.
+
+Join diagnostics and call conditions (JT2 P0). The app's DEBUG `call_join_stage: stage=tap` line (written by the dial that
+follows a tap, `sinceStartMs` negative on purpose, `tapToDialMs`, `source=user|debug`) and its camera sub-stages
+(`camera_open_requested`, `preview_surface_ready`, `camera_opened`, `camera_session_configured`, and `camera_first_frame` with
+`sensorLagMs`, `aeState`, `exposureUs`, `iso`) parse like any stage line. `release_join` reports `tap_to_invite_ms` (tap to the
+dial stage) and `tap_to_ringing_ms` on the caller's clock, the stage-1 rows (`stage1_substages`: dial to link up, link up to
+authenticated, authenticated to ringing, the link description, the first `GATT video MTU` line and its delay after the link
+came up, the count of status-133 setup failures between dial and ringing) and each sender's camera sub-stages
+(`sender_camera`) as diagnostics: none of them enters the join or the gate. A direction whose picture stayed black (the app
+logged `first_nonblack_shown ... reached=false`, every shown picture was black, or the first real picture came only after
+the app's 15 s dark bound behind a black first picture) is `SCENE_DARK` (UNMEASURED, `reason_code` SCENE_DARK, listed under
+the suite's `not_counted.unmeasured`), never a join value. Three case options keep old case IDs unchanged when absent:
+`dial_via: intent|broadcast` (default intent), `callee_state: foreground|background|screen_off` (default foreground) and
+`launch_order: [caller, callee]`. `dial_via: broadcast` sends the invite with
+`am broadcast -a com.example.bluetoothtest.debug.DIAL -p <package> --es test_control call:<prefix>` so a backgrounded or
+screen-off caller is reached without an activity start; the case is BLOCKED (`dial_via_not_handled`) unless the app logs
+`BENCHMARK control_broadcast: control=<control> | handled=true` for it. `callee_state` puts the idle callee in the state a
+user's call finds it (Home key, or KEYCODE_SLEEP) after the idle wait and before the dial and proves it from `dumpsys`
+(`callee_state` in the manifest; an unreached state blocks as `callee_state_not_reached`); `screen_off` is refused at
+planning unless `tools/benchmark_devices.json` says `secure_lock: false` for the callee (the ASUS has a pattern, the S24 a
+PIN: both are `true`), and the runner wakes the screen again at the end. Without `launch_order` a direct call launches
+phones the registry marks `slow_start` (the A15s) first, then the callee, then the caller.
+
+The release selection comes from `tools/release_gate_selection.py --date YYYY-MM-DD` (new catalog directory
+`benchmarks/catalog/release-gate-DATE/`: one suite, a bundle per lane, `selection.json` with the composition, seed,
+timing basis and commands). It writes 120 `user_launch` calls tagged `release_gate` (selection id, lane, window), each
+direct call with `callee_idle_s: 12` and a moving-scene environment note, in two windows because six phones cannot make
+three disjoint lanes that also relay: window `direct` runs three phone pairs at once (`lane1` S24/S22 with the Aware
+calls, `lane2` M31/Realme, `lane3` ASUS/A15s; every transport the pair offers at the app's default video rate, both
+directions, Wi-Fi calls with `user_settings.wifi` on the pairs the scope's `carrier_eligibility` lists for that carrier),
+then window `relay` runs two chains at once (`relay1` S22 via ASUS to A15s,
+`relay2` S24 via M31 to Realme; on-demand, `user_settings.relayed_calls`, no `callee_idle_s`, so the join gate does not
+count them). The estimate comes from the gaps of saved runs and must fit 110 minutes (`BUDGET_S`) or generation stops.
+Each lane's order is a deterministic shuffle seeded `seed:lane` and the suite lists cases in run order: plan and run each
+lane bundle with its `--phones` and without `--state` (the state queue re-prioritises and would undo the order).
+The selection id hashes every input that shapes a request and prefixes every case id, so a changed input is a new
+selection with new ids. Every endpoint of the selection takes the app's own video choice (`profile_source: app_default`,
+below), and generation stops when the scope's `required_phones` are not the six release phones.
+
+In a user launch the peer is authenticated by the call's own status lines: the link line names the peer, or, with BMH3
+pseudonyms, says "an unverified stranger" until the reveal, and the line `The other phone's identity is confirmed: <node>`
+that follows the verified reveal names the real node. `authenticated_peer` compares every named node with the requested
+peer and stays UNMEASURED when only a stranger link was logged; `selected_transport` reads the link description either way.
+
+### How a private-call score gets its state
+
+A private-call score (`score.json`, `overall_status`) follows its automated gates, the ones read from the app logs
+and the runner's own records:
+
+- **PASS**: every deciding gate was measured and passed.
+- **FAIL**: at least one deciding gate failed. `failed_gates` names each one with its phone and section.
+- **UNMEASURED**: nothing failed, but at least one deciding gate could not be measured. `unmeasured_gates` names each
+  one with its reason. Missing evidence never reads as a pass.
+
+DIAGNOSTIC rows never decide. The score covers the log gates only: `unmeasured_families` lists the measurement
+families that need their own adapter (picture, camera, acoustic, physical latency, endurance and the user families),
+`quality_status` stays UNMEASURED and `full_experience_status` can never be PASS without those adapters. The suite
+result keeps its own rule: a case is PASS only when the call score and every required family are PASS.
 
 ### Rules that apply to every gate
 
@@ -257,7 +363,10 @@ A phone is ready only when all of these are proven for the current run, and the 
   `certutil -hashfile app-debug.apk SHA256` on Windows). Preflight also pulls the installed base APK and rehashes it;
 - the capability export's build fingerprint equals the phone's `ro.build.fingerprint`;
 - Bluetooth is on, the screen is awake and unlocked, and the camera, microphone and Bluetooth permissions are granted;
-- the offered capabilities include what the case requests.
+- the offered capabilities include what the case requests;
+- for LE L2CAP (CoC) cases, the phone's Bluetooth process is running, Android's Bluetooth manager reports the state ON,
+  no earlier execution recorded that Bluetooth process as wedged, and on Android 10 fewer than 11 app processes have
+  already listened on it (Android 10 never frees a closed LE CoC server, so about 12 app processes use it up).
 
 `python -B tools/deploy_build.py --phones ALIAS1,ALIAS2 --apk PATH --adb PATH_TO_ADB` copies the built APK to
 `benchmarks/builds/<first 16 hex of SHA-256>/` and installs it on the phones in parallel. A normal reinstall and an
@@ -310,7 +419,7 @@ This reads the capability exports named in the scope and the device registry, pe
 MB and takes under a minute. Check the profile and assignment coverage, blocked reasons and the capability path, hash,
 fingerprint and node of each phone. `--phones a,b` limits which cases are *executable* while keeping the omitted
 assignments and their reasons; it is a selection, not live availability. Missing capability evidence, incompatibility
-and unavailability are distinct reasons.
+and unavailability are distinct reasons. The scope's optional `carriers` and `carrier_eligibility` lists add Wi-Fi carrier requests as new case IDs; a scope without them compiles to exactly the earlier inventory. `wifi_aware_native` requests are generated and shown BLOCKED (the runner cannot turn Bluetooth off).
 
 A case keeps every part of its request explicit: ordered sender, receiver and middle assignments, both call setup
 roles, both outgoing profiles, transport, encoder and allocation, geometry, FPS and rate, buffers, lifecycle and input
@@ -390,6 +499,88 @@ has no MeshLive process; an unknown quiet state blocks.
   for a named failure diagnosis. `--hci-snoop-scratch DIR` (or `HCI_SNOOP_SCRATCH`) holds the large bug-report zips.
 - A failed broadcast run tries End only on its recorded live source process before pulling traces. Every run has a
   unique trace session ID.
+- Android's logger can drop app lines under a burst from another process (an Android 11 phone lost them at camera open).
+  liblog then writes the count to the events buffer under the tag `liblog`. Beside each app log, the runner captures
+  that process's drop reports, merges the end-of-run events-buffer dump and hash-binds the file in the manifest. A
+  one-time line that never arrived (call phase ACTIVE, a control acknowledgement, a relay join, the first surface) is
+  UNMEASURED with the reason "log lines dropped by logd" when the process reported drops where that line was due: a
+  report stamped after the point the line became due (the previous call phase, the control request or the launch)
+  and, when a later line such as ENDED was stored, no later than that line. Without such a report
+  the missing line stays a failure. A present line counts as before. ACTIVE is judged on caller and callee alike. A
+  drop that the process never reported, because it wrote nothing more before it exited, stays invisible.
+- In a private-call score a missing line is never a failed call by itself. A gate that is UNMEASURED because a
+  line of that phone is absent (identity, profile, first surface, final counters) carries the reason "log lines
+  dropped by logd" when the phone's drop capture reports drops where the line was due (after the launch for
+  launch-time lines, after the dial for call lines), with its earlier reason kept as `detail`. A control whose
+  acknowledgement the runner never saw is UNMEASURED, not a failed control, when the phone reported drops after the
+  request. A dropped ACTIVE line is proven by the peer when the peer's log shows this phone's call picture
+  (`source: peer_rendered_frames`); without that proof it stays UNMEASURED, and without a drop report a missing
+  line stays a failure. A counter the app never logs is not blamed on log drops.
+- A call case never skips its dial silently. When the runner stops before sending the invite, the manifest records
+  `call_not_dialed` (the step it stopped at and the reason), the score carries `call_dialed: false` and `not_dialed`,
+  and the suite's case result repeats both. No call gate is judged for a call that was not dialed (each reads
+  UNMEASURED "The call was not dialed"); the runner entry alone decides: UNMEASURED when the stop was a confirmed log
+  drop, BLOCKED for the phone's own Bluetooth stack, FAIL otherwise.
+- During a private call the runner stops the case on an end line (`Private call ended:` or its UI teardown record)
+  that it did not plan. Only an end of the measured call counts: the measured call is the first one that went ACTIVE
+  after the runner's dial, and an end line stamped before that moment on the same phone closed an earlier setup
+  attempt (a first attempt that failed before any ring, followed by a retry that connected). Such a line is recorded
+  as a `setup_attempt_failed` runner event and the case runs on to its planned End; the score lists it under the
+  endpoint's `setup_attempts_failed`, the unexpected-event gate still counts it, and the join time still includes the
+  failed attempt. When logd dropped the ACTIVE line the first media evidence the runner waited for on that phone is
+  the proof, and with neither only lines from before the dial are set aside. A call that dropped and came back is
+  still an unexpected termination. A decline or cancel is proven only by an end line after the phone saw the
+  dialled attempt.
+- The freeze the FINAL continuity report counts at the planned hang-up (the gap since the peer's last frame) is
+  planned, not an unexpected freeze: only a FINAL report logged inside the phone's confirmed planned-end interval, and
+  only one freeze event of at most 1.5 freeze thresholds, is listed as `planned_end_freezes` instead of counted. A
+  freeze in a periodic report before the End, a longer one, or a call with no confirmed planned End stays unexpected.
+  A Wi-Fi `BENCHMARK carrier_death:` line counts as an unexpected event (`unexpected_events`) unless it is the close of the
+  planned hang-up: reason `read failed: EOFException` or `SocketException`, logged inside the phone's confirmed
+  planned-end interval or up to 1 s before it (the phone that did not hang up sees the peer close the socket 0.1-0.3 s
+  before its own `call phase ENDED`; when the other phone's terminal records were lost and no interval is confirmed, the
+  phone's own last `call phase ENDED` with an acknowledged runner End control, within 1 s either side, is enough, and
+  the hang-up phone's ENDED must also lie within 2 s of its End acknowledgement). A `write stalled` or `silence` death, a death anywhere else, and any death in a call
+  with no confirmed planned End stay unexpected.
+  The central's own clean close of the GATT link (`BENCHMARK ll_gate: ... event=link_lost | status=0 | class=clean`) is
+  planned inside the same windows; another status or class, or the same line mid-call, stays unexpected. When logd
+  confirmably dropped the app's `Private call ended` or `call available` line after the End, the runner records it in the
+  End control's `terminal_log_loss` and keeps the case running: `ended_and_available` is UNMEASURED with the log-loss
+  reason and the manifest has no `runner_error`; a missing line with no confirmed drop is still a runner error.
+  With such a lost end proof no planned End is confirmed for either phone, so a single short FINAL-report freeze (the one
+  the planned-end rule would have judged) makes `unexpected_freeze_events` UNMEASURED with the log-loss reason instead of
+  a failure (listed as `unjudged_end_freezes`); freezes in earlier periodic reports and longer ones are still counted.
+  `relay_unplanned_closures` counts every `RELAY_CLOSED` line in the relay's own log that is not after a planned
+  terminal control (`end`, `kill`, `decline`, `cancel`), compared on the host clock (the relay's launch plus the line's
+  offset against the control's host timestamp); a closure that cannot be placed is UNMEASURED, never PASS.
+  `app_crash_or_anr` reads one bounded dump of each participant's crash and system log buffers taken when the case
+  ends (`<phone>-crash-events.log`, hash-bound in the manifest's `crash_logs`) and fails the phone with a Java crash,
+  ANR or native crash of the app inside the case window; an unreadable dump is UNMEASURED, and manifests recorded
+  before this capture carry no such gate. The runner presses volume-down eight times on every participant once the call
+  is accepted (never volume-up); a phone that refuses shell input is recorded as `volume_down_failed` and the call
+  goes on.
+- An experiment arm must be seen applied. After each launch the runner reads the app's `BENCHMARK launch_extras:`
+  echo and the effect lines it knows (`applied_arms.EFFECT_LINES`) and records, per requested `test_` extra,
+  `delivered` and `applied` (`applied` is `null` where no effect line is verified, never true by default) in the
+  manifest's `applied_arms`. An extra the echo does not list, or an effect line that shows another value, blocks the
+  case before the dial (`runner_blocked` reason `arm_not_delivered` or `arm_not_applied`); a missing echo is unknown.
+  Preflight scans the frozen APK's dex for each requested tunable's extra name and blocks with `tunable not in this
+  build` when it is absent (`tunables_in_build` in `preflight.json`). Before a case starts, preflight reads every
+  participant's thermal status and waits (30 s polls, at most 10 minutes) while any is MODERATE (2) or higher, then
+  blocks the case with `blocked_reason: thermal`; the status at the start and each poll are recorded in
+  `preflight.json` (`thermal_gate`). The APK pull wakes the phone first and is retried once after a timeout.
+- A phone's Bluetooth stack can stop a call by itself. On one phone the stack thread that reads LE CoC data stopped
+  during a call while other stack threads kept logging; the app then ended the call as "Call peer stopped responding",
+  and every later listen in that Bluetooth process hung inside the stack. After each call run the runner checks the
+  Bluetooth process log: when that thread was silent for 5 s or more before such an end while other threads logged,
+  the run fails with the reason `local_bt_stack_wedged` instead of blaming the peer, and later CoC preflights block
+  that Bluetooth process. While waiting for `call available`, the runner stops early with BLOCKED
+  `coc_listen_stalled_in_stack` when the app reports a stalled listen or the stack began a listen for the app and
+  allocated no socket within 3 s, and BLOCKED `coc_listener_exhausted` when the listen threw `IOException: Error: -1`
+  (Android 10). A stack that wedged during the run's own call keeps that call's failure.
+  The runner never repairs a phone: restarting Bluetooth belongs to the phone's owner. On Android 12 and older use
+  the debug Bluetooth restart receiver and check it reports a verified LE reset; elsewhere turn Bluetooth off and on,
+  or restart the phone if Bluetooth does not come back.
 - A requested arm that cannot act is refused, not scored: a switch can be inert because its parent is off or because
   another switch already decides the same thing (the register's "Requires / masked by" notes list the parents).
 - If a maintainer asks you to stop or pause physical testing, stop all device activity, keep the interrupted evidence
@@ -453,10 +644,12 @@ changed files, the reason and the affected scope:
 ```
 
 Without `affects`, every earlier executed case conservatively needs a retest. A narrower selector uses non-empty exact
-lists for `transports`, `phones` or `encoders` (all given dimensions must match; phones match any participant; encoders
+lists for `transports`, `phones`, `encoders` or `carriers` (all given dimensions must match; phones match any participant; encoders
 match the outgoing profiles), and the `reason` must give the evidence for excluding other combinations. A change to a
 shared stage (receive, decrypt, decoder, controls) affects every combination using that stage, not only the failing
-pair. Rescoring old recordings is not an execution after a fix. Pass the file to state joining or the checkpoint with
+pair. A change that touches no measured behaviour (documentation, test sources, DEBUG logging that only reports) may
+declare `"affects": "none"` with an `"affects_none_reason"` saying why; it is recorded but retests nothing, and
+behaviour changes never use it. Rescoring old recordings is not an execution after a fix. Pass the file to state joining or the checkpoint with
 `--changes`; a duplicate ID with a different definition is rejected.
 
 Adding a phone extends the registry and scope and preserves unrelated case IDs. Changing settings, topology, controls,
@@ -740,6 +933,80 @@ when the shipped configuration is the thing under test.
 Rotating-ID test P3 needs mutual verified contacts, which normally take two people scanning QR codes. On DEBUG builds `python -B tools/debug_verify_contacts.py --phones A,B` reads each phone's `BENCHMARK identity fingerprint=` log line (the apps must have been launched once), writes a one-shot token file plus the peer's fingerprint into each app's private storage with `run-as` (no other phone action), and prints the `--es test_verify_contact <token>` launch extras; the owning runner starts each phone with them and checks `BENCHMARK contact_verified source=debug` before the call. `--forget` prepares `test_forget_contact` for the Forget and Reset cases. The day roll uses the tunable `presence_day_offset` (extra `test_presence_day_offset`, same value on both phones, cold start only): it shifts the discovery wall clock by whole days instead of waiting for 00:00 UTC, so record it as a simulated clock, not a natural roll, and clear app data afterwards. ARCHITECTURE register row "Debug contact verification and day-roll clock" has the details.
 
 Rotating-ID boundary tests can shorten the epoch: launch every phone of the run with `--ei test_rotid_epoch_s 60` (tunable `rotid_epoch_s`, 60-900, DEBUG builds only; the same value on all phones, otherwise rotating adverts fail the two-epoch check as stale) so three boundaries take about 3 minutes, and run `rotid_tracker.py --epoch-s 60`. Check `BENCHMARK rotid_epoch_s: ... applied=true` on each phone first; the extra is ignored in a process whose rotating discovery already started, so force-stop before the launch. It tests the boundary and restart machinery, not 900 s timing (Android's own 7-15 minute address timer does not scale, so the same-address-inside-an-epoch information is moot; the tracker's grace and early offsets default to a third and a sixth of the epoch). Results from short epochs are labelled with the value and never replace the 900 s cases. Afterwards a normal launch restarts the epoch counter by itself.
+
+Stranger (pseudonymous) calls: set tunable `rotating_ids` (`test_rotating_ids`) on BOTH phones of a private-call case. The call runner then waits for the callee's own `BENCHMARK rotid_own: role=call | epoch=N | rdi=<12 hex>` line (DEBUG builds with that line only; a build without it fails the wait with a plain message), dials that rotating ID (`call:<rdi>`), and accepts only a `call discovered` row for an ID the peer itself logged. Another phone's rotating ID is never accepted, a boundary during the wait or before the dial moves the wait to the peer's new ID, and the manifest records a `rotating_peer_bound` event per bound direction. Static relay chains are not supported with rotating IDs, and the on-demand shape accepts the `rotating_ids` tunable never; it runs with rotating IDs only as a user launch (below).
+
+User-launch cases (release gate and promotion evidence, package UL1). Set the tunable `user_launch: true` (launch extra `test_user_launch`) and the debug build resolves everything as a person's launch does: rotating discovery IDs, hidden identities, pseudonyms, video fragments and start-up fallbacks are on as shipped, and every opt-in feature reads the person's stored Settings choice instead of its benchmark extra (the extras are ignored; the benchmark launch stays the named control arm, with its case IDs and tunables unchanged). A user-launch case needs no rotating-ID tunable: the call runner treats every user-launch phone as rotating, waits for its own `rotid_own` line, scans and dials `call:<rdi>` for the ID that line announced, and the scorer binds the scanned ID to the peer through the peer's own log (an ID in a helper's SETUP or a caller's route line must also be one the requested phone announced). The opt-in switches are off in a person's launch, so the case states the choice a person would make in the case field `user_settings`, for example `"user_settings": {"relayed_calls": true}` for a relayed call (Settings "Experimental: relayed calls") or `"user_settings": {"wifi": true}` for a case with `carrier` (Settings "Use Wi-Fi for faster connections"; it also switches on the sub-switch the carrier needs: Wi-Fi Direct for `wifi_direct`, Wider reach for `wifi_aware_wider`). Names: `relayed_calls`, `relayed_calls_help`, `relayed_calls_consent`, `wifi_carrier`, `wifi_wider_reach`, `wifi_direct`, `wifi`; values are booleans, and `user_settings` without `user_launch` is refused at planning. Before each user-launch phone starts (relay helpers included), the runner stops the app and writes exactly the booleans the Settings switch writes into the app's own preferences file with `run-as` (debuggable build, that package only; other stored values are kept; for relayed calls the first switch-on dialog's four values), reads the file back, and records the requested settings, the stored keys and the read-back per phone in the manifest's `user_settings`. After the launch the applied-arm check compares each choice with the app's own line (`BENCHMARK relayed_calls: enabled=`, `BENCHMARK wifi_switches: carrier=|wider=|direct=`); a line that shows another value blocks the case before the dial (`runner_blocked` reason `user_setting_not_applied`, or `user_setting_not_stored` when the file could not be written or read back). A request that cannot work as a user launch is BLOCKED before any phone is launched (stage `precheck`): a relayed route or a `carrier` case without the matching `user_settings` (`user_setting_missing`), a shipped privacy default turned off by a tunable (`rotating_ids`, `bmh3` or `bmh3_pseudonyms` set to false: `user_launch_default_overridden`), and a static relay chain, which finds the callee by a fixed prefix (`user_launch_unsupported_route`; use `relay_shape: on_demand`). The benchmark-only route controls of a relayed case (`relayed_calls_require`, the helper and next-hop pins, `relayed_calls_no_direct`) are read only by a benchmark launch, so a user-launch relayed call takes the app's own shortest route: where the callee is in the caller's direct range the call goes direct, and `confirm_on_demand_route` and the scorer fail it as a missing relay. Example (relayed, S22 via ASUS to A15s): `{"id": "ul-gatt-s22-via-asus-to-a15s", "caller": "s22", "callee": "a15s", "relay": "asus", "relay_shape": "on_demand", "transport": "gatt", "profiles": {...}, "tunables": {"user_launch": true, "reset_learned_state": true}, "user_settings": {"relayed_calls": true}}`; Wi-Fi Direct: `{"caller": "s22", "callee": "asus", "transport": "ble", "carrier": "wifi_direct", "tunables": {"user_launch": true}, "user_settings": {"wifi": true}, ...}`. A user-launch call's `discovery_ms` gate takes the first scan of any ID the peer announced.
+
+A user-launch stream source has confirmed the one-time "Before you go live" notice, as a person who goes live has: the runner stores `video_live_disclosed` true on the source unless the case states `"user_settings": {"live_disclosed": false}` (the first-run notice itself). The app logs no line for this choice, so its read-back is the evidence. Call endpoints are unchanged.
+
+Planned Wi-Fi toggles on a call endpoint: the actions `wifi_off` and `wifi_on` (`{"phone": "b", "action": "wifi_off", "at_s": 40}`) run `svc wifi disable|enable` on that phone and are acknowledged only when its `wifi_on` setting reads back the requested state (otherwise the action fails). They alternate per phone and start with `wifi_off`. After a `wifi_off` the runner records the time to that phone's `carrier_switch: to=BLUETOOTH` line (`back_on_bluetooth`, reported, not a gate), and every phone a `wifi_off` names gets Wi-Fi back at the end of the case whatever ended it (`wifi_restored`; a phone that cannot be read back on is UNCONFIRMED in the suite, like an unrestored settings file). The scorer counts a carrier death after a planned `wifi_off` as planned when its reason names the toggle (`wifi_off`, `aware_down_wifi_off`) or it is a socket read failure within 2 s of the action (the peer sees the close); any other carrier death stays unexpected. Each phone's score lists `wifi_off_events` with the death, the time back on Bluetooth and the freeze counters across the switch (reported; the freeze gates count as everywhere else).
+
+Battery Saver and Wi-Fi. While Android's Battery Saver is on the app withholds Wi-Fi for the whole call
+(`WifiEligibility.batteryOrThermalBlocks`; its log shows `doze_state ... powerSave=true`, `wifi_caps ... reason=BATTERY_OR_THERMAL`
+and `bearers=0x00`), so a Wi-Fi request silently runs on Bluetooth. Battery Saver is the owner's setting; the harness only
+reads it. The preflight parses the `dumpsys power` text it already records (`Battery Saver is currently: ON|OFF`): a case
+that asks for a Wi-Fi carrier (`carrier`) or the Wi-Fi switches (`user_settings.wifi`) is BLOCKED with reason
+`battery_saver_on` naming the phone, before the dial (`blocked_reason` of the attempt). Every execution records
+`battery_saver` per device in the manifest's `devices` (true, false, or null when the dump had no such line), and the
+scorer never counts a Wi-Fi case as a pass when a participant's app log shows `powerSave=true`: the gate
+`wifi_battery_saver` is UNMEASURED with that reason.
+
+The app's own video choice (`profile_source: app_default`). A person's call runs the size, frame rate and bitrate stored
+in Settings and the encoder the app's Automatic choice picks; a case that pins them measures a lab setting instead. A
+user-launch endpoint can therefore take the app's choice: `"profiles": {"s24": {"profile_source": "app_default"}, ...}`
+(per endpoint; the entry holds no other key, and the value is refused without `user_launch: true` on that phone). For
+such an endpoint the runner sends no resolution, frame rate, bitrate, encoder, allocation, playback-buffer or thermal
+extra (the transport stays the case's own dimension); the app then falls back to its stored values
+(`MainActivity.applyDebugLaunchExtras` reads each `test_width`, `test_height`, `test_fps` and `test_bitrate_kbps` with the
+stored value as its default, a launch without `test_codec` leaves the encoder picker on Automatic, and one without
+`test_rate_control` and `test_playback_delay` keeps the mode's own values). Because a lab phone's stored choices can
+differ from the shipped defaults, the runner stops the app, reads the stored video keys back with `run-as` (the same
+file and route as the boolean choices above) and records them per phone in the manifest's `user_settings[].video`
+(`stored`, `shipped_default`, `stated`, `differs`). `video_width` 426, `video_height` 240, `video_fps` 15,
+`video_bitrate_kbps` 200 (stored in bits per second as `video_bitrate`), `advanced_settings` false,
+`automatic_thermal_reduction` true, and, while Advanced settings are on, `manual_rate_control` CBR and
+`receiver_playback_delay` AUTO are the shipped values. A stored value that is not the shipped default (or the case's own
+statement) blocks the case before the dial: `runner_blocked` reason `video_setting_not_default`. The two manual keys are
+read only while `advanced_settings` is on, so a stored `manual_rate_control` or `receiver_playback_delay` is not compared
+while Advanced is off. The stored size also counts as the shipped default when it is the phone's camera-mapped equivalent
+of 426x240 (tools/video_default_equivalents.json, one entry per phone with the app's own `BENCHMARK mode_mapping:
+requested=426x240 effective=WxH` line as its source): the app's mode pickers store the camera's nearest mode and the next
+settings save persists it, so a person's phone that has opened the app holds that size. Only the whole pair counts (one
+half, any other size and a case that states its own size stay strict), a phone without an entry keeps the strict check,
+and the manifest's `user_settings[].video` records `default_equivalent` (true only when the equivalent was what passed),
+`default_equivalent_size` and `default_equivalent_source`. A case that wants a
+person's non-default choice states it in `user_settings` (`video_width`, `video_height`, `video_fps`,
+`video_bitrate_kbps`, `advanced_settings`, `automatic_thermal_reduction`, `manual_rate_control`,
+`receiver_playback_delay`), which is written, read back and restored like the other stored choices. `user_settings` is
+one map for every phone of the case, or the same map plus `"per_phone": {"<alias>": {...}}`, whose values replace the
+shared ones for that phone alone (each phone's values are validated, written, read back and restored on its own; an alias
+outside the call, or a video value for a phone that is not an `app_default` endpoint, is refused at planning). The manifest's
+`app_chosen_profiles` and each device score's `app_chosen_profile` record the encoder, codec, size, frame rate, bitrate,
+allocation, playback buffer and encoder-choice reason the app logged (`BENCHMARK call effective`, `call selected` and
+`encoder_choice role=call`), so a result stays exact; the scorer matches no request for that endpoint
+(`selected_profile_mismatches` and `actual_allocation_mismatches` are absent, `requested_profile_coverage` is
+`APP_DEFAULT`). Recorded raw input and impairment declare a geometry and cannot take the app default. Every case that
+states a profile is unchanged. A case with a changed `profiles` is a new case ID.
+
+A user-launch relayed call (relay_shape `on_demand`) names its callee at the last relay by a per-call pseudonym that the
+callee never logs, so the relay's join line ("Relaying an endpoint-encrypted private call between <parent> and <child>")
+cannot be compared with the registry prefix. The runner (`confirm_relayed_join`) and the scorer
+(`relay_adjacent_child_identity`) bind the child from the callee's own log (`bind_relay_child`), and an unbound child is
+still a failed chain. Method `pseudonym_own`, preferred when the app logs it: the callee's DEBUG line
+`BENCHMARK pseudonym_own: role=call | link=<hop> | id=<12 hex>` names the id the relay joined, inside the window before one
+of its ringing lines. Method `rotid_target`: the last helper SETUP accepted before the join named `next=target:<id>`, `<id>`
+is the callee's own `rotid_own` of the epoch in force at its ringing, and the callee's own log shows the incoming relayed
+call (its link line, `call relayed_cap: relayHops=<requested relays>` and `INCOMING_RINGING`, within 15 s of each other
+on the callee's clock). Another phone's id, an older epoch's id, a callee that never rang or one that rang without the
+requested relay count does not bind. The manifest records `relay_child_binding` per relay (the method) and the hop score
+records the binding with its evidence line.
+
+The planned media window of a call is timed from after the surface wait and the volume presses; the manifest's
+`measurement_window` records `planned_s`, `actual_s`, `overrun_s`, `pre_window_s` (accept to window start) and
+`slowest_health_check_s`. A host or adb stall inside the window cannot be interrupted, but the remaining phones' health
+checks are skipped once the window has elapsed, and an overrun above 5 s is a `measurement_window_overrun` runner event, so
+a longer call is visible instead of silently scored as the planned duration.
 
 `python -B tools/link_capacity.py probe|relay|report` measures integrity-checked link maxima (GATT write and notify, CoC
 primed, Classic), two-link relay airtime and each phone's learned link capacity. Probes restart the app on the

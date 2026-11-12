@@ -26,7 +26,6 @@ internal enum class SettingsPage(val viewId: Int, val titleRes: Int, val parent:
     MAIN(R.id.settingsPageMain, R.string.settings_title, null),
     VIDEO(R.id.settingsPageVideo, R.string.settings_video_title, MAIN),
     PRIVACY(R.id.settingsPagePrivacy, R.string.settings_privacy_title, MAIN),
-    PRIVACY_ADVANCED(R.id.settingsPagePrivacyAdvanced, R.string.settings_privacy_advanced_title, PRIVACY),
     CALLS(R.id.settingsPageCalls, R.string.settings_calls_title, MAIN),
     SHARE(R.id.settingsPageShare, R.string.settings_share_title, MAIN),
     CONNECTION(R.id.settingsPageConnection, R.string.advanced_section_connection, MAIN),

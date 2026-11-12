@@ -66,4 +66,61 @@ class StallRediscoverTest {
                 .contains("dialed=stale"),
         )
     }
+
+    // Release window (test_rediscover_release_window), measured timelines of a15s-rootcause-20261104.
+    private val gatt = StallRediscover.CALLEE_GATT_RESTART_MS
+
+    @Test
+    fun aGattCalleeThatReleasesElevenAndAHalfSecondsAfterOurStallCloseIsDialedFresh() {
+        // ASUS re-advertised 11.56 s after the close in the slowest of 12 GATT runs; the fixed 8 s scan found 0 of 12.
+        val on = StallRediscover.budgetMs(off, stalled = true, earlyLossRemainingMs = 12_000L, releaseWindow = true, calleeRestartMs = gatt)
+        assertTrue(StallRediscover.dialsFresh(on, 11_560L))
+        val offBudget = StallRediscover.budgetMs(off, stalled = true, earlyLossRemainingMs = 12_000L, releaseWindow = false, calleeRestartMs = gatt)
+        assertFalse(StallRediscover.dialsFresh(offBudget, 11_560L))
+    }
+
+    @Test
+    fun aCocCalleeThatReleasesNineSecondsAfterOurStallCloseIsDialedFresh() {
+        val on = StallRediscover.budgetMs(off, stalled = true, earlyLossRemainingMs = 12_000L, releaseWindow = true, calleeRestartMs = 0L)
+        assertTrue(StallRediscover.dialsFresh(on, 9_240L))
+    }
+
+    @Test
+    fun afterALossWeObservedTheCalleeSeenSixAndAHalfSecondsLaterIsDialed() {
+        // A loss after the handshake leaves only the rest of the 15 s window (5 720 ms in one log); the callee came back at 6.53 s.
+        val on = StallRediscover.budgetMs(off, stalled = false, earlyLossRemainingMs = 5_720L, releaseWindow = true, calleeRestartMs = gatt)
+        assertTrue(StallRediscover.dialsFresh(on, 6_530L))
+        val offBudget = StallRediscover.budgetMs(off, stalled = false, earlyLossRemainingMs = 5_720L, releaseWindow = false, calleeRestartMs = gatt)
+        assertFalse(StallRediscover.dialsFresh(offBudget, 6_530L))
+    }
+
+    @Test
+    fun theSlowestCalleesOfTheReleaseWindowAbAreDialedFresh() {
+        // release-window-ab-20261104: CoC callee re-advertised 16.60 s after the close (A15s link down at 11.52 s); the two
+        // on-arm misses re-advertised at 12.62 s (GATT) and 11.98 s (CoC), just after the earlier 12.5 s / 11 s scans ended.
+        val coc = StallRediscover.budgetMs(off, stalled = true, earlyLossRemainingMs = 12_000L, releaseWindow = true, calleeRestartMs = 0L)
+        assertTrue(StallRediscover.dialsFresh(coc, 16_600L))
+        assertTrue(StallRediscover.dialsFresh(coc, 11_980L))
+        val g = StallRediscover.budgetMs(off, stalled = true, earlyLossRemainingMs = 12_000L, releaseWindow = true, calleeRestartMs = gatt)
+        assertTrue(StallRediscover.dialsFresh(g, 12_620L))
+    }
+
+    @Test
+    fun aCalleeThatComesBackAtOnceIsStillDialedAtOnce() {
+        val on = StallRediscover.budgetMs(off, stalled = true, earlyLossRemainingMs = 12_000L, releaseWindow = true, calleeRestartMs = gatt)
+        assertTrue(StallRediscover.dialsFresh(on, 200L))
+    }
+
+    @Test
+    fun anAbsentCalleeIsGivenUpWithinTheCap() {
+        val on = StallRediscover.budgetMs(off, stalled = true, earlyLossRemainingMs = 12_000L, releaseWindow = true, calleeRestartMs = 60_000L)
+        assertTrue(on <= StallRediscover.RELEASE_CAP_MS)
+        assertFalse(StallRediscover.dialsFresh(on, null))
+    }
+
+    @Test
+    fun theReleaseWindowNeverShortensALargerStallArm() {
+        val on = StallRediscover.budgetMs(arm, stalled = true, earlyLossRemainingMs = 12_000L, releaseWindow = true, calleeRestartMs = gatt)
+        assertEquals(20_000L, on)
+    }
 }

@@ -85,6 +85,12 @@ internal class PrivateCallAudioSession(
     private val allowBluetoothOutput: Boolean = false,
     /** Non-null: the call holds audio focus while open ([CallAudioFocus]); null: no focus request (before 2026-10-10). */
     onFocusAction: ((FocusAction) -> Unit)? = null,
+    /**
+     * JT2 `test_call_camera_first` (promoted 2026-11-12, default on): the `call_audio_open` command is queued on the audio command thread instead of
+     * running inline on the caller's thread; [onRouteChanged] is told when it finished, and [CallAudioOpenGate] lets the remote
+     * audio playback wait for it.
+     */
+    private val openQueued: Boolean = false,
 ) : Closeable {
     private val audioManager = context.getSystemService(AudioManager::class.java)
 
@@ -97,10 +103,10 @@ internal class PrivateCallAudioSession(
     private val reassertLimiter = RouteReassertLimiter()
 
     /** True while call audio plays from the loudspeaker (the default), false for earpiece/headset. */
-    var speakerOn = true
+    @Volatile var speakerOn = true
         private set
 
-    var output = CallOutput.SPEAKER
+    @Volatile var output = CallOutput.SPEAKER
         private set
 
     private var explicitSpeakerChoice = false
@@ -181,8 +187,16 @@ internal class PrivateCallAudioSession(
         }
     }
 
+    /**
+     * The device this session last asked for. Reading AudioManager.communicationDevice right after
+     * setCommunicationDevice blocks the calling (main) thread until the route change completes: 288-453 ms on the S22
+     * (Android 16) at every call start, measured with Perfetto. The listener logs the device actually in use.
+     * (Declared before [init]: a queued open can run on the audio thread while the constructor is still finishing.)
+     */
+    @Volatile private var loggedDeviceType: Int? = null
+
     init {
-        AudioCommandQueue.shared.run("call_audio_open") {
+        val open = {
             previousMode = audioManager.mode
             previousSpeakerphone = speakerphoneNow()
             // Signal's order: focus first (a refusal is classified by CallFocusArbiter), then the mode.
@@ -192,6 +206,22 @@ internal class PrivateCallAudioSession(
             // The callback's initial report lists devices already routed above; it changes nothing then.
             runCatching { audioManager.registerAudioDeviceCallback(deviceCallback, null) }
             registerCommunicationDeviceListener()
+        }
+        if (openQueued) {
+            val opened = CallAudioOpenGate.shared.expect()
+            AudioCommandQueue.shared.post("call_audio_open") {
+                try {
+                    // A close that ran first (the call ended before this command did) leaves the audio mode alone.
+                    if (!closed) {
+                        open()
+                        onRouteChanged?.invoke()
+                    }
+                } finally {
+                    opened.countDown()
+                }
+            }
+        } else {
+            AudioCommandQueue.shared.run("call_audio_open", open)
         }
     }
 
@@ -353,13 +383,6 @@ internal class PrivateCallAudioSession(
 
     @SuppressLint("NewApi")
     @Suppress("DEPRECATION")
-    /**
-     * The device this session last asked for. Reading AudioManager.communicationDevice right after
-     * setCommunicationDevice blocks the calling (main) thread until the route change completes: 288-453 ms on the S22
-     * (Android 16) at every call start, measured with Perfetto. The listener logs the device actually in use.
-     */
-    private var loggedDeviceType: Int? = null
-
     private fun logRoute(event: String, requested: CallOutput) {
         val device = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             loggedDeviceType?.let { "requested:$it" } ?: "none"

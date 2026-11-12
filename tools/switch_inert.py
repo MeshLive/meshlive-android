@@ -49,7 +49,10 @@ RULES = (
              lambda e: _bool(e, "test_bounded_media_age", False))
     + _masks({"test_relay_one_pdu_move": False}, "relay_phy_guard=false",
              lambda e: not _bool(e, "test_relay_phy_guard", True))
-    + _masks({"test_relay_one_pdu_move": False}, "adaptive_phy=false", lambda e: not _bool(e, "test_adaptive_phy", True))
+    + _masks({"test_relay_one_pdu_move": False, "test_phy_direction_split": False}, "adaptive_phy=false",
+             lambda e: not _bool(e, "test_adaptive_phy", True))
+    + _masks({"test_adaptive_phy_split": False}, "phy_direction_split=true",
+             lambda e: _bool(e, "test_phy_direction_split", False))
     + _masks({"test_relay_stall_separate": True}, "relay_child_stall_guard=false",
              lambda e: not _bool(e, "test_relay_child_stall_guard", True))
     + _masks({"test_relay_stall_separate": True}, "relay_establish_fallback=false",
@@ -77,6 +80,11 @@ RULES = (
              "call_native_opus=false", lambda e: not _bool(e, "test_call_native_opus", False))
     + _masks({"test_adv_inplace_boost": True, "test_adv_inplace_keep_set": True}, "stable_adv_address=false",
              lambda e: not _bool(e, "test_stable_adv_address", True))
+    + _masks({"test_wifi_wider_reach": False, "test_wifi_direct": False, "test_wifi_icm": False,
+              "test_wifi_ble_standby_low_power": False, "test_wifi_allow_24ghz": False,
+              "test_wifi_share_attach": False, "test_wifi_force_carrier": "auto",
+              "test_wifi_aware_derived_port": True, "test_wifi_aware_require_channel": False},
+             "wifi_carrier=false", lambda e: not _bool(e, "test_wifi_carrier", False))
 )
 
 

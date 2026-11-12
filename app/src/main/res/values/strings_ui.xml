@@ -37,8 +37,8 @@
     <string name="status_bluetooth_unavailable">No Bluetooth</string>
     <string name="status_permissions">Permissions needed</string>
     <string name="status_hidden">Hidden</string>
-    <string name="status_battery_saver">Battery saver: relaying paused</string>
-    <string name="status_hot">Phone hot: quality lowered</string>
+    <string name="status_battery_saver">Relay paused</string>
+    <string name="status_hot">Phone hot</string>
     <string name="status_sheet_title">Status</string>
     <string name="status_row_bluetooth">Bluetooth</string>
     <string name="status_row_calls">Allow calls</string>

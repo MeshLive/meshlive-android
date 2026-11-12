@@ -14,7 +14,11 @@
     <string name="blocked_people_unblock_title">Unblock %1$s?</string>
     <string name="blocked_people_unblock_message">Their calls will ring again and their livestreams will show in Live.</string>
     <string name="blocked_people_unblocked">%1$s unblocked</string>
-    <string name="blocked_people_unreadable">The block list cannot be read right now. Calls are not blocked until it can. Tap to reset it.</string>
+    <string name="blocked_people_unreadable">Block list can\'t be read. Calls aren\'t blocked until you reset it.</string>
+    <string name="block_list_unreadable_title">Block list can\'t be read</string>
+    <string name="block_failed_unreadable">This block wasn\'t saved because the block list can\'t be read, so calls aren\'t blocked. Reset unblocks everyone; then you can block people again.</string>
+    <string name="block_list_reset_done">Block list reset</string>
+    <string name="block_list_reset_failed">Couldn\'t reset the block list. Try again.</string>
     <string name="blocked_people_reset_title">Reset the block list?</string>
     <string name="blocked_people_reset_message">Everyone is unblocked and you can block people again.</string>
     <string name="blocked_people_reset_action">Reset</string>

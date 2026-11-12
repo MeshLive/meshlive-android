@@ -167,3 +167,95 @@ internal class CalleeMediaStart(private val revealRequired: Boolean) {
         return true
     }
 }
+
+/**
+ * Sends this side's presence records (OFFER, PRESENCE_LEASE) that a [PresenceSession] decided should move, re-checking at
+ * each record's own send time whether it may leave. The call endpoint supplies the checks and the wire through [Effects];
+ * records received from the peer (store, reject) stay with the endpoint.
+ */
+internal class PresenceActionRunner(private val session: PresenceSession, private val effects: Effects) {
+    interface Effects {
+        /** Why this call may not exchange leases with the peer now ([PresenceEligibility]), or null. */
+        fun ineligibleReason(): String?
+
+        /** Design QL: the verification visit lets this side offer and lease to the peer now ([QrLeaseRule]). */
+        fun visitAllows(): Boolean
+
+        /** Queues this side's OFFER (throws when it cannot be queued). */
+        fun sendOffer()
+
+        /** RD1: the vault's one locked step (check, durable delivery record, lease). Null lease: nothing was delivered. */
+        fun deliverLease(): LeaseDelivery
+
+        /** Queues the delivered lease. */
+        fun sendLease(lease: DiscoveryExchange.PresenceLease)
+
+        fun log(event: String, detail: String = "")
+    }
+
+    class LeaseDelivery(val lease: DiscoveryExchange.PresenceLease?, val withheldReason: String = "not_deliverable")
+
+    /**
+     * Runs the send actions among [actions] in order; returns the others (the peer's records) for the endpoint. A peer's
+     * lease is passed on to be stored only once this side's own OFFER left: the session accepts it when this side's OFFER
+     * was produced, but that OFFER may still be withheld at its send time (an honest peer leases only after receiving it).
+     */
+    fun run(actions: List<PresenceSession.Action>): List<PresenceSession.Action> = actions.mapNotNull { action ->
+        when (action) {
+            PresenceSession.Action.SendOffer -> {
+                sendOffer()
+                null
+            }
+            PresenceSession.Action.SendLease -> {
+                sendLease()
+                null
+            }
+            is PresenceSession.Action.StoreLease ->
+                if (session.leaseMayFollow()) action else PresenceSession.Action.Reject("lease before this side's offer left")
+            else -> action
+        }
+    }
+
+    private fun offerBlock(): String? = effects.ineligibleReason() ?: if (effects.visitAllows()) null else "verification_visit"
+
+    private fun sendOffer() {
+        val reason = offerBlock()
+        if (reason == null) {
+            effects.sendOffer()
+            session.offerSent()
+            effects.log("offer_sent")
+        } else {
+            session.offerWithheld()
+            effects.log("offer_withheld", "reason=$reason")
+        }
+    }
+
+    private fun sendLease() {
+        // Design QL / RD1: no LEASE follows a withheld (or unsent) OFFER, and the LEASE passes the OFFER's own checks again
+        // at its send time (eligibility and the verification visit), before the vault's locked step.
+        val reason = if (session.leaseMayFollow()) offerBlock() else "offer_not_sent"
+        if (reason != null) {
+            effects.log("lease_withheld", "reason=$reason")
+            return
+        }
+        val delivery = effects.deliverLease()
+        val lease = delivery.lease
+        if (lease != null) {
+            effects.sendLease(lease)
+            effects.log("lease_sent", "generation=${lease.generation}")
+        } else {
+            effects.log("lease_withheld", "reason=${delivery.withheldReason}")
+        }
+    }
+}
+
+/**
+ * Design QL: whether a verification session may offer and lease to [peer] now (any session outside QL: yes). Both roles
+ * follow the visit: [peer] was confirmed and allowed to recognise this phone in the current visit of the Add contact
+ * screen, no reuse alert fired in it and the screen was not left ([MeetVisit.mayLease]). The scanner used to be always
+ * allowed; it now follows the same rule.
+ */
+internal object QrLeaseRule {
+    fun allowed(verificationSession: Boolean, visit: MeetVisit, peer: IdentityFingerprint): Boolean =
+        !verificationSession || visit.mayLease(peer)
+}

@@ -159,8 +159,10 @@ internal object CoreSecurityUi : SecurityUi {
     }
 
     override fun qrPayload(context: Context): String? = runCatching {
-        // The name in the QR is the phone model only, never a contact name.
-        val name = runCatching { IdentityQrCodec.normalizeName(android.os.Build.MODEL.orEmpty().take(32)) }
+        // The QR is shown face to face to add a contact: it carries "Your name" (design decision 2026-11-04, one name)
+        // unless "Who sees my name" is Nobody or no name is set, then the phone model as before. Never a contact's name.
+        val ownName = PeerLabelFeature.localName?.takeIf { it.isNotBlank() && PeerLabelFeature.audience != NamesAudience.NOBODY }
+        val name = runCatching { IdentityQrCodec.normalizeName((ownName ?: android.os.Build.MODEL.orEmpty()).take(32)) }
             .getOrDefault("")
         core(context).qrPayload(name)
     }.getOrNull()

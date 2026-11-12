@@ -70,6 +70,11 @@ class OpusAudioDecoder(
     private val concealer = if (concealment && header.audioChannelCount == 1) AudioConcealer(header.audioSampleRate) else null
     private var concealEventQueuedMs = 0L
     private var lastChunkRms = 0.0
+    /** Experimental call fast recovery ([CallFastRecovery]): quiet chunks left out while the call clock is armed. */
+    private val quietSkipper = if (communicationMode && playoutClock.hasFastRecovery) QuietAudioSkipper() else null
+    /** A chunk the fast-recovery look-ahead took but did not merge: it plays next. */
+    private var heldPcm: PcmPacket? = null
+    private val fastRecoveryLeftOutMs = AtomicLong()
     private val codec: MediaCodec?
     /** Experimental native libopus call decoder (DEBUG `test_call_native_opus`); null = MediaCodec. */
     private val nativeDecoder: NativeOpusDecoder?
@@ -95,7 +100,8 @@ class OpusAudioDecoder(
     fun dropReasonSummary(): String =
         "partial write ${partialWriteDrops.get()} | sender gaps ${senderGaps.get()} " +
             "realigned with ${senderGapSilenceTotalMs.get()} ms silence" +
-            (concealer?.let { " | concealed ${it.concealedSamples * 1_000L / header.audioSampleRate} ms in ${it.events} events" } ?: "")
+            (concealer?.let { " | concealed ${it.concealedSamples * 1_000L / header.audioSampleRate} ms in ${it.events} events" } ?: "") +
+            (quietSkipper?.let { " | fast recovery left out ${fastRecoveryLeftOutMs.get()} ms of quiet" } ?: "")
 
     init {
         require(header.audioCodecId == StreamProtocol.AUDIO_CODEC_OPUS) {
@@ -419,7 +425,7 @@ class OpusAudioDecoder(
                 streamAudioStats?.tick(::streamAudioCounters)?.let { Log.i("BluetoothVideo", it) }
                 val concealer = concealer
                 if (concealer == null) {
-                    val packet = pcmPackets.poll(ACTIVE_POLL_MS, TimeUnit.MILLISECONDS) ?: continue
+                    val packet = recoverQuietAudio(nextPcm(ACTIVE_POLL_MS) ?: continue)
                     onLevel?.invoke(AudioLiveLevel.rms(packet.bytes))
                     // Late audio at startup is played, not discarded (no media loss): a viewer that joined
                     // behind a relay's backlog dropped every packet (463) because each one arrived after
@@ -432,7 +438,7 @@ class OpusAudioDecoder(
                 }
                 // Experimental concealment: poll briefly so a nearly dry AudioTrack gets concealment
                 // before it underruns; real audio is cross-faded in from the concealment.
-                val packet = pcmPackets.poll(CONCEAL_POLL_MS, TimeUnit.MILLISECONDS)
+                val packet = nextPcm(CONCEAL_POLL_MS)?.let(::recoverQuietAudio)
                 if (packet == null) {
                     concealStarvation(concealer)
                     continue
@@ -454,6 +460,63 @@ class OpusAudioDecoder(
         } finally {
             releaseAudioTrack()
         }
+    }
+
+    private fun nextPcm(timeoutMs: Long): PcmPacket? =
+        heldPcm?.also { heldPcm = null } ?: pcmPackets.poll(timeoutMs, TimeUnit.MILLISECONDS)
+
+    /**
+     * Experimental call fast recovery ([CallFastRecovery]): while the call clock is armed after an isolated late burst, a
+     * quiet chunk inside a pause is left out (crossfaded into the next quiet chunk) and the clock moves earlier by its
+     * length from the next chunk's PTS on, so video skips at the same point. Speech, speech tails, concealment and any
+     * chunk while the clock is not armed play unchanged ([QuietAudioSkipper]); nothing is time-stretched.
+     */
+    private fun recoverQuietAudio(packet: PcmPacket): PcmPacket {
+        val skipper = quietSkipper ?: return packet
+        val samples = pcm16ToShorts(packet.bytes)
+        val rms = rmsOf(samples)
+        val chunkMs = exactChunkMs(packet.bytes.size)
+        val pendingMs = if (audioStarted && !packet.concealed) playoutClock.fastRecoveryPendingMs() else 0L
+        val verdict = if (pendingMs > 0L) {
+            skipper.consider(rms, chunkMs, pendingMs, queuedPlaybackNs() / 1_000_000L)
+        } else {
+            QuietAudioSkipper.Verdict.PLAY
+        }
+        if (verdict == QuietAudioSkipper.Verdict.PLAY_SPEECH) playoutClock.noteFastRecoverySpeech()
+        if (verdict != QuietAudioSkipper.Verdict.CANDIDATE) {
+            skipper.onPlayed(rms, chunkMs)
+            return packet
+        }
+        val next = pcmPackets.poll(QuietAudioSkipper.LOOKAHEAD_WAIT_MS, TimeUnit.MILLISECONDS)
+        if (next == null) {
+            skipper.onPlayed(rms, chunkMs)
+            return packet
+        }
+        val nextSamples = pcm16ToShorts(next.bytes)
+        val nextRms = rmsOf(nextSamples)
+        if (next.concealed || !skipper.nextAllowsDrop(nextRms) ||
+            !playoutClock.consumeFastRecovery(chunkMs, next.presentationTimeUs)
+        ) {
+            heldPcm = next
+            skipper.onPlayed(rms, chunkMs)
+            return packet
+        }
+        skipper.onDropped()
+        fastRecoveryLeftOutMs.addAndGet(chunkMs)
+        skipper.onPlayed(nextRms, exactChunkMs(next.bytes.size))
+        val merged = crossfadeOverDroppedChunk(
+            samples,
+            nextSamples,
+            header.audioChannelCount,
+            header.audioSampleRate * QuietAudioSkipper.CROSSFADE_MS / 1_000,
+        )
+        return PcmPacket(shortsToPcm16(merged), next.presentationTimeUs)
+    }
+
+    /** A chunk's length in whole ms, or 0 when it is not a whole number of ms (never left out then). */
+    private fun exactChunkMs(sizeBytes: Int): Long {
+        val frames = sizeBytes.toLong() / bytesPerAudioFrame
+        return if (frames * 1_000L % header.audioSampleRate == 0L) frames * 1_000L / header.audioSampleRate else 0L
     }
 
     /**

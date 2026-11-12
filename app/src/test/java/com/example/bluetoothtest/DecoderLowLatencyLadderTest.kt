@@ -12,7 +12,7 @@ class DecoderLowLatencyLadderTest {
 
     @After
     fun restoreSwitches() {
-        DecoderSwitches.stallRecovery = false
+        DecoderSwitches.stallRecovery = true
         DecoderSwitches.lowLatencyLadder = false
         DecoderSwitches.realtimePriority = false
     }
@@ -132,21 +132,35 @@ class DecoderLowLatencyLadderTest {
     }
 
     @Test
-    fun switchesAreOffByDefaultAndFollowTheLaunchExtras() {
-        assertFalse(DecoderSwitches.stallRecovery)
+    fun stallRecoveryIsOnAfterAPlainLaunchAndTheOtherArmsStayOff() {
+        DecoderSwitches.applyExtras { _, default -> default }
+        assertTrue(DecoderSwitches.stallRecovery)
         assertFalse(DecoderSwitches.lowLatencyLadder)
         assertFalse(DecoderSwitches.realtimePriority)
+    }
+
+    @Test
+    fun theFalseLaunchExtraIsTheDebugOnlyControlArmForStallRecovery() {
+        DecoderSwitches.applyExtras { key, default -> if (key == "test_decoder_stall_recovery") false else default }
+        // A release build ignores the extra: recovery stays on there.
+        assertEquals(!BuildConfig.DEBUG, DecoderSwitches.stallRecovery)
+        DecoderSwitches.applyExtras { _, default -> default }
+        assertTrue(DecoderSwitches.stallRecovery)
+    }
+
+    @Test
+    fun theExperimentalArmsFollowTheLaunchExtrasInDebugOnly() {
         DecoderSwitches.applyExtras { key, default ->
             when (key) {
-                "test_decoder_stall_recovery", "test_decoder_low_latency_ladder", "test_decoder_priority" -> true
+                "test_decoder_low_latency_ladder", "test_decoder_priority" -> true
                 else -> default
             }
         }
         // Unit tests run the debug variant, where the DEBUG-only arms can be set.
-        assertEquals(BuildConfig.DEBUG, DecoderSwitches.stallRecovery)
         assertEquals(BuildConfig.DEBUG, DecoderSwitches.lowLatencyLadder)
         assertEquals(BuildConfig.DEBUG, DecoderSwitches.realtimePriority)
         DecoderSwitches.applyExtras { _, default -> default }
-        assertFalse(DecoderSwitches.stallRecovery || DecoderSwitches.lowLatencyLadder || DecoderSwitches.realtimePriority)
+        assertFalse(DecoderSwitches.lowLatencyLadder || DecoderSwitches.realtimePriority)
+        assertTrue(DecoderSwitches.stallRecovery)
     }
 }

@@ -549,7 +549,7 @@ enum class PolicyConfidence { HIGH, MEDIUM, LOW }
  * BackgroundPolicy, MemoryThermalPolicy, NativeCompat, and from the camera/audio batches CameraPolicy
  * and AudioCapturePolicy); core Bluetooth-stack and call entries stay in DevicePolicyRegistry.
  */
-enum class PolicyArea { CODEC, YUV, BLUETOOTH_TRANSPORT, GRAPHICS, BACKGROUND, MEMORY_THERMAL, NATIVE, CAMERA, AUDIO }
+enum class PolicyArea { CODEC, YUV, BLUETOOTH_TRANSPORT, GRAPHICS, BACKGROUND, MEMORY_THERMAL, NATIVE, CAMERA, AUDIO, WIFI }
 
 /**
  * How far the entry's premise is validated. UPSTREAM_DOCUMENTED: an upstream source documents the
@@ -672,7 +672,7 @@ internal class ResolvedDevicePolicy(
 
 internal object DeviceFamilyPolicy {
     /** Bump when entries, matchers or effects change. */
-    const val REVISION = "2026-10-28.1"
+    const val REVISION = "2026-11-09.1"
 
     val entries: List<DevicePolicyEntry> get() = DevicePolicyRegistry.entries
 

@@ -68,6 +68,77 @@ class ForwardedStreamSecurityTest {
     }
 
     @Test
+    fun resyncChildMakesTheNextNonKeyframeVideoRecordWaitForAKeyframe() {
+        val source = node(21)
+        val upstream = node(22)
+        val local = node(23)
+        val child = node(24)
+        val streamId = UUID.fromString("7ab6355e-1c56-4a4e-bd0e-24cc0f78aa11")
+        val sealer = EndToEndContentSealer(ByteArray(MeshAead.KEY_BYTES) { (it + 11).toByte() })
+        val core = ReceiverNodeForwardingCore(local, upstream, streamId, source, queueCapacity = 4)
+        val header = envelope(streamId, source, 0, 5, 0, sealer.seal(
+            EndToEndContentType.STREAM_HEADER, 0,
+            EndToEndStreamProtocol.encodeHeader(StreamProtocol.CODEC_VP9, VideoSettings.DEFAULT, 0, false),
+        ))
+        assertEquals(RelayRejection.NO_CHILDREN, core.receive(header).rejection)
+        assertTrue(core.addChild(child).isNotEmpty())
+
+        val keyFrame = mediaEnvelope(sealer, streamId, source, 1, StreamProtocol.FLAG_KEY_FRAME, "key".toByteArray())
+        assertEquals(setOf(child), core.receive(keyFrame).queuedChildren)
+        assertEquals(1L, requireNotNull(core.take(child)).sequence)
+        val delta = mediaEnvelope(sealer, streamId, source, 2, 0, "delta".toByteArray())
+        assertEquals(setOf(child), core.receive(delta).queuedChildren)
+        assertEquals(2L, requireNotNull(core.take(child)).sequence)
+
+        core.resyncChild(child)
+        val nextDelta = mediaEnvelope(sealer, streamId, source, 3, 0, "next".toByteArray())
+        val waiting = core.receive(nextDelta)
+        assertEquals(setOf(child), waiting.laggingChildren)
+        assertTrue(waiting.queuedChildren.isEmpty())
+
+        val freshKey = mediaEnvelope(sealer, streamId, source, 4, StreamProtocol.FLAG_KEY_FRAME, "fresh".toByteArray())
+        assertEquals(setOf(child), core.receive(freshKey).queuedChildren)
+        assertEquals(4L, requireNotNull(core.take(child)).sequence)
+        sealer.close()
+    }
+
+    @Test
+    fun resyncChildDoesNothingForAnotherChildOrAnAudioOnlyCore() {
+        val source = node(31)
+        val upstream = node(32)
+        val local = node(33)
+        val child = node(34)
+        val streamId = UUID.fromString("0c9fcc09-1f5b-49e7-8d67-8cf7330cbb22")
+        val sealer = EndToEndContentSealer(ByteArray(MeshAead.KEY_BYTES) { (it + 12).toByte() })
+        val core = ReceiverNodeForwardingCore(local, upstream, streamId, source, queueCapacity = 4)
+        val header = envelope(streamId, source, 0, 5, 0, sealer.seal(
+            EndToEndContentType.STREAM_HEADER, 0,
+            EndToEndStreamProtocol.encodeHeader(StreamProtocol.CODEC_VP9, VideoSettings.DEFAULT, 0, false),
+        ))
+        core.receive(header)
+        core.addChild(child)
+        val keyFrame = mediaEnvelope(sealer, streamId, source, 1, StreamProtocol.FLAG_KEY_FRAME, "key".toByteArray())
+        core.receive(keyFrame)
+        requireNotNull(core.take(child))
+
+        core.resyncChild(node(99))
+        val delta = mediaEnvelope(sealer, streamId, source, 2, 0, "delta".toByteArray())
+        assertEquals(setOf(child), core.receive(delta).queuedChildren)
+        requireNotNull(core.take(child))
+
+        val audioCore = ReceiverNodeForwardingCore(
+            local, upstream, streamId, source, queueCapacity = 4,
+            audioLive = AudioLiveRelaySettings(AudioLiveTunables.ageBound),
+        )
+        audioCore.receive(header)
+        audioCore.addChild(child)
+        audioCore.resyncChild(child)
+        val audio = mediaEnvelope(sealer, streamId, source, 3, StreamProtocol.FLAG_AUDIO, "audio".toByteArray())
+        assertEquals(setOf(child), audioCore.receive(audio).queuedChildren)
+        sealer.close()
+    }
+
+    @Test
     fun lateChildGetsConfigurationThenWaitsForFreshKeyframe() {
         val source = node(1)
         val upstream = node(2)

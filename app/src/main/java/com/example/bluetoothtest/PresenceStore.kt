@@ -16,13 +16,28 @@ import javax.crypto.AEADBadTagException
  */
 class PresenceContact(
     val nodeId: NodeId,
-    /** The per-contact switch "Can see when I'm nearby" (default on). */
-    val visibleToThem: Boolean = true,
+    /**
+     * The per-contact switch "Can see when I'm nearby": true only after the user answered yes. Design decision 2026-11-06
+     * (all platforms): a contact the user was not yet asked about ([answered] false) counts as off.
+     */
+    val visibleToThem: Boolean = false,
     /** Generation of the last lease sent to this contact; 0 = none. */
     val deliveredGeneration: Long = 0L,
     /** The leases this contact gave us (null = none). */
     val presence: ContactPresence? = null,
-)
+    /**
+     * The user answered "Can see when I'm nearby" (yes or no). False = not yet asked: a record made for a received lease
+     * or a delivery. A value an older build stored (always an answer there: its default was on) reads as that answer.
+     */
+    val answered: Boolean = visibleToThem,
+) {
+    init {
+        require(answered || !visibleToThem) { "A yes is an answer" }
+    }
+
+    /** The user's answer, or null while not yet asked. */
+    val answer: Boolean? get() = if (answered) visibleToThem else null
+}
 
 class PresenceState(val generation: Long, dayKeys: Map<Long, ByteArray>, val contacts: List<PresenceContact>) {
     /** The day-key window (independent random keys, PROTOCOL "Keys and epochs"); a private copy, oldest day first. */
@@ -53,6 +68,10 @@ object PresenceStateCodec {
     const val MAX_CONTACTS = VerifiedContactStore.MAX_CONTACTS
     const val MAX_KEYS = 64
     private const val MAX_DAYS = ContactPresence.MAX_DAYS_KEPT
+    /** Per-contact flag: "Can see when I'm nearby" is on. */
+    private const val FLAG_VISIBLE = 1
+    /** Per-contact flag (design decision 2026-11-06): not yet asked. Older builds never wrote it (their contacts were answered). */
+    private const val FLAG_NOT_ASKED = 2
 
     /** [migrated] is true when the bytes were a version 1 store converted with the epoch passed to [decode]. */
     class Decoded(val state: PresenceState, val migrated: Boolean)
@@ -71,7 +90,7 @@ object PresenceStateCodec {
             out.writeShort(state.contacts.size)
             state.contacts.forEach { contact ->
                 out.write(contact.nodeId.toByteArray())
-                out.writeByte(if (contact.visibleToThem) 1 else 0)
+                out.writeByte((if (contact.visibleToThem) FLAG_VISIBLE else 0) or (if (contact.answered) 0 else FLAG_NOT_ASKED))
                 out.writeInt(contact.deliveredGeneration.toInt())
                 val presence = contact.presence
                 if (presence == null) {
@@ -119,7 +138,8 @@ object PresenceStateCodec {
                 val nodeId = NodeId.fromBytes(ByteArray(NodeId.BYTE_COUNT).also(input::readFully))
                 require(seen.add(nodeId)) { "Duplicate presence contact" }
                 val flags = input.readUnsignedByte()
-                require(flags and 1.inv() == 0) { "Reserved presence flags" }
+                require(flags and (FLAG_VISIBLE or FLAG_NOT_ASKED).inv() == 0) { "Reserved presence flags" }
+                require(flags != (FLAG_VISIBLE or FLAG_NOT_ASKED)) { "Reserved presence flags" }
                 val delivered = input.readInt().toLong() and 0xffffffffL
                 val leaseGeneration = input.readInt().toLong() and 0xffffffffL
                 val presence = if (leaseGeneration == 0L) {
@@ -136,7 +156,7 @@ object PresenceStateCodec {
                     }
                     ContactPresence(nodeId.toByteArray(), leaseGeneration, days, skew, receivedAt)
                 }
-                PresenceContact(nodeId, flags and 1 != 0, delivered, presence)
+                PresenceContact(nodeId, flags and FLAG_VISIBLE != 0, delivered, presence, answered = flags and FLAG_NOT_ASKED == 0)
             }
             require(input.read() == -1) { "Trailing bytes in presence store" }
             if (legacyKey == null) return Decoded(PresenceState(generation, keys, contacts), migrated = false)
@@ -200,7 +220,7 @@ class PresenceStore(private val file: File, private val cipher: AtRestCipher) {
         if (latched != null) return false
         return try {
             file.parentFile?.mkdirs()
-            atomicWrite(file, cipher.seal(PresenceStateCodec.encode(state)))
+            WipeGuard.guardedWrite("presence") { atomicWrite(file, cipher.seal(PresenceStateCodec.encode(state))) }
             true
         } catch (error: Exception) {
             false
@@ -422,8 +442,13 @@ class PresenceVault(
     @Synchronized
     fun leaseHolders(): List<ContactPresence> = state?.contacts?.mapNotNull { it.presence }.orEmpty()
 
+    /** "Can see when I'm nearby" is on only after the user answered yes; not yet asked counts as off (design decision 2026-11-06). */
     @Synchronized
-    fun visibleToThem(nodeId: NodeId): Boolean = contact(nodeId)?.visibleToThem ?: true
+    fun visibleToThem(nodeId: NodeId): Boolean = contact(nodeId)?.visibleToThem ?: false
+
+    /** The user's answer for [nodeId], or null while not yet asked. */
+    @Synchronized
+    fun answer(nodeId: NodeId): Boolean? = contact(nodeId)?.answer
 
     /** A lease may be delivered to [nodeId] now: the vault is persistent and the per-contact switch is on. */
     @Synchronized
@@ -442,7 +467,9 @@ class PresenceVault(
      */
     @Synchronized
     fun deliverLease(nodeId: NodeId, epoch: Long, stillVerified: () -> Boolean): DiscoveryExchange.PresenceLease? {
-        if (state == null || !visibleToThem(nodeId) || !stillVerified()) return null
+        // A stored no never gets a lease. A contact not yet asked is refused before this by the session's eligibility
+        // (visibleToThem: no OFFER) and by the call's lease hook ([stillVerified] includes visibleToThem), AB3 R6.
+        if (state == null || answer(nodeId) == false || !stillVerified()) return null
         if (!rollLocked(epoch)) return null
         if (!recordDelivered(nodeId)) return null
         val current = state ?: return null
@@ -477,10 +504,11 @@ class PresenceVault(
     fun setVisible(nodeId: NodeId, visible: Boolean): Boolean {
         val current = state ?: return failClosed(revoke = !visible)
         val existing = current.contacts.firstOrNull { it.nodeId == nodeId }
-        if ((existing?.visibleToThem ?: true) == visible) return false
+        // The answer is stored whenever it differs from the stored one, so a no for a contact not yet asked is kept.
+        if (existing?.answer == visible) return false
         val revoke = !visible && existing != null && existing.deliveredGeneration == current.generation
         mutate { s ->
-            PresenceState(s.generation, s.dayKeys, upsert(s.contacts, nodeId) { it.copyWith(visible = visible) })
+            PresenceState(s.generation, s.dayKeys, upsert(s.contacts, nodeId) { it.copyWith(visible = visible, answered = true) })
         }
         return if (revoke) bump() else false
     }
@@ -693,7 +721,8 @@ class PresenceVault(
         visible: Boolean = visibleToThem,
         delivered: Long = deliveredGeneration,
         presence: ContactPresence? = this.presence,
-    ) = PresenceContact(nodeId, visible, delivered, presence)
+        answered: Boolean = this.answered,
+    ) = PresenceContact(nodeId, visible, delivered, presence, answered)
 
     private fun ephemeralKey(day: Long, epoch: Long): ByteArray {
         ephemeral.headMap(DayKeyWindow.firstDay(epoch)).also { old -> old.values.forEach { it.fill(0) } }.clear()

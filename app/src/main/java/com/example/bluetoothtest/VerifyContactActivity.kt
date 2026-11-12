@@ -36,6 +36,8 @@ class VerifyContactActivity : AppCompatActivity() {
     private var stopWatchingStore: () -> Unit = {}
     private var peerNodeId: String? = null
     private var peerName: String = ""
+    /** The name in the last scanned QR and whose it is: a "Save contact as" suggestion only, never a label by itself. */
+    private var scannedQrName: Pair<String, String>? = null
 
     private val scan = registerForActivityResult(ScanContract()) { result ->
         scanLaunched = false
@@ -52,6 +54,8 @@ class VerifyContactActivity : AppCompatActivity() {
     // ----- BVMID2 (Naming v2, `bvmid2`): expiring one-use code, scan with confirmation, mutual outcome -----
     private var meet = false
     private var scanLaunched = false
+    /** Design QL: this screen's visit ([MeetVisit.begin]); kept across a configuration change. */
+    private var visitToken = 0L
     private var showingCode = false
     private val meetSession = MeetSession()
     private val meetHandler = android.os.Handler(android.os.Looper.getMainLooper())
@@ -115,7 +119,10 @@ class VerifyContactActivity : AppCompatActivity() {
         // its safety code, never by the Meet flow (which would ask the busy endpoint to stay on air for a second connection).
         meet = MeetBridge.available() && !intent.getBooleanExtra(EXTRA_IN_CALL, false)
         // Design QL (review R1): a new visit of this screen; only scans confirmed in it let this phone answer as displayer.
-        if (meet && savedInstanceState == null) QrMeet.visit.begin()
+        if (meet) {
+            visitToken = savedInstanceState?.getLong(STATE_VISIT, 0L) ?: 0L
+            if (savedInstanceState == null) visitToken = QrMeet.visit.begin()
+        }
         // The picture of a live code is a secret: no screenshots or recents thumbnails while it can be shown.
         if (meet) window.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
         findViewById<View>(R.id.verifyBackButton).setOnClickListener { finish() }
@@ -192,12 +199,19 @@ class VerifyContactActivity : AppCompatActivity() {
         super.onStart()
         if (meet) {
             QrMeet.display.events = meetEvents
+            // Back on the screen after leaving it: a new visit (earlier confirmations no longer let anything leave).
+            if (!QrMeet.visit.isOpen(visitToken)) visitToken = QrMeet.visit.begin()
             // Kept while the camera covers the screen (cleared in onDestroy): a lease can arrive during the confirmation.
             QrMeet.onLeaseStored = { peer -> runOnUiThread { if (!isDestroyed) onLeaseStored(peer) } }
             if (debugHarness) meetHandler.post(debugPoll)
             MeetBridge.host?.begin()
             if (showingCode) meetHandler.post(meetTick)
         }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        if (meet) outState.putLong(STATE_VISIT, visitToken)
     }
 
     override fun onStop() {
@@ -208,7 +222,12 @@ class VerifyContactActivity : AppCompatActivity() {
             // Leaving the screen kills the code. The camera covering this screen also leaves it, but the endpoint stays
             // on air for the scan that follows; everything else restores the user's reachability.
             QrMeet.display.leave()
-            if (!scanLaunched) MeetBridge.host?.end()
+            if (!scanLaunched) {
+                MeetBridge.host?.end()
+                // Design QL: leaving the screen ends the visit; a session still open sends nothing more. A configuration
+                // change (dark mode, locale) is not leaving it.
+                if (!isChangingConfigurations) QrMeet.visit.end(visitToken)
+            }
         }
         super.onStop()
     }
@@ -259,6 +278,7 @@ class VerifyContactActivity : AppCompatActivity() {
     override fun onDestroy() {
         if (meet) {
             MeetBridge.host?.end()
+            if (!isChangingConfigurations) QrMeet.visit.end(visitToken)
             QrMeet.display.events = QrDisplayEvents.NONE
             QrMeet.onLeaseStored = null
         }
@@ -453,7 +473,9 @@ class VerifyContactActivity : AppCompatActivity() {
      * session (Names and titles on). Skip or an empty name keeps the handle. The name is only ever on this phone.
      */
     private fun askContactName(contact: ContactEntry) {
-        val shared = SessionPeerLabels.forPrefix(contact.prefixHex)?.selfName
+        // Their name from this session, else the name in the QR they showed you (their "Your name" since 2026-11-04).
+        val fromQr = scannedQrName?.takeIf { (node, _) -> node.equals(contact.nodeIdHex, ignoreCase = true) }?.second
+        val shared = SessionPeerLabels.forPrefix(contact.prefixHex)?.selfName ?: fromQr
         ContactNameDialog.show(
             context = this,
             title = R.string.contact_save_title,
@@ -704,17 +726,17 @@ class VerifyContactActivity : AppCompatActivity() {
 
     private fun markScannedVerified(peer: IdentityFingerprint, recognise: Boolean? = null) {
         val context = applicationContext
+        val visit = visitToken
         worker.execute {
             val outcome = runCatching {
                 security.markVerified(context, peer.nodeId.toString(), peer.hex, "", viaQr = true, bvmid2Scan = true)
             }.getOrDefault(MarkVerifiedOutcome.UNAVAILABLE)
-            if (outcome == MarkVerifiedOutcome.VERIFIED) QrMeet.visit.confirm(peer)
             // Design QL revision 2: the recognition answer is written after the shield and before the session may offer;
             // a declined or failed write withholds the lease (fails closed).
-            val mayOffer = if (outcome == MarkVerifiedOutcome.VERIFIED && recognise != null) {
-                if (!recognise) runOnUiThread { meetSession.declinedRecognition(peer) }
+            val mayOffer = if (outcome == MarkVerifiedOutcome.VERIFIED) {
+                if (recognise == false) runOnUiThread { meetSession.declinedRecognition(peer) }
                 val vault = if (RotatingDiscoveryFeature.enabled) RotatingDiscovery.presenceVault() else null
-                QlConsent.applyAnswer(recognise, vault?.persistent == true) { visible ->
+                QlConsent.confirmScan(QrMeet.visit, peer, recognise, vault?.persistent == true, visit) { visible ->
                     vault!!.setVisible(peer.nodeId, visible)
                     RotatingDiscovery.requestRecognitionRebuild()
                 }
@@ -777,6 +799,7 @@ class VerifyContactActivity : AppCompatActivity() {
                 .show()
             return
         }
+        scannedQrName = scanned.nodeIdHex.lowercase() to scanned.displayName
         // The security core accepts a QR only for a phone with an encrypted connection now, and
         // checks the scanned fingerprint against that connection.
         markVerified(scanned.nodeIdHex, scanned.fingerprintHex, viaQr = true)
@@ -784,6 +807,7 @@ class VerifyContactActivity : AppCompatActivity() {
 
     companion object {
         const val EXTRA_PEER_NODE_ID = "verify_peer_node_id"
+        private const val STATE_VISIT = "verify_meet_visit"
         const val EXTRA_PEER_NAME = "verify_peer_name"
         const val EXTRA_IN_CALL = "verify_in_call"
         const val EXTRA_DEBUG_MEET = "verify_debug_meet"

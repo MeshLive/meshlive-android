@@ -147,9 +147,16 @@ class Bmh3Config(
      * handshake (a listener that would admit a search now); null signs nothing, exactly as before.
      */
     relaySeek: Int? = null,
+    /**
+     * Wi-Fi upgrade: the initiator signs the `WIFI` build marker in its LINK block (msg3). Default false: the signed
+     * bytes, and therefore every Bmh3 test vector, are exactly as before. Only [Bmh3Driver] sets it, from
+     * [Bmh3InitiatorOptions.wifiMarker].
+     */
+    wifiMarker: Boolean = false,
 ) {
     val buildTag: BuildTag? = if (purpose == Bmh3Purpose.LINK) buildTag else null
     val relaySeek: Int? = if (purpose == Bmh3Purpose.LINK) relaySeek else null
+    val wifiMarker: Boolean = purpose == Bmh3Purpose.LINK && wifiMarker
 
     /** The presentation that carries the real identity. */
     val real: Bmh3Presentation = Bmh3Presentation(identity, capabilities, pseudonym = false)
@@ -173,6 +180,10 @@ class Bmh3Extensions(
     val pseudonym: Boolean = false,
     /** Type 5 `RELAY_SEEK` (Design OR, DEBUG prototype): the feature bits of a helper that would admit a search; responder LINK blocks only. */
     val relaySeek: Int? = null,
+    /** Type 8 `WIFI` (Wi-Fi upgrade): this build implements `BWF1`; version 1; initiator LINK blocks only. */
+    val wifi: Boolean = false,
+    /** True when a `WIFI` extension was present on the wire, even one with another version (placement rule only). */
+    internal val wifiSeen: Boolean = wifi,
 ) {
     init {
         opening?.let { value ->
@@ -218,6 +229,12 @@ class Bmh3Extensions(
             body.write(1)
             body.write(value)
         }
+        if (wifi) {
+            body.write(TYPE_WIFI)
+            body.write(0)
+            body.write(1)
+            body.write(WIFI_VERSION)
+        }
         val used = body.size()
         val spare = Bmh3Wire.EXTENSION_BYTES - used
         require(spare >= 0 && (spare == 0 || spare >= 3)) { "Extensions do not fit the 112-byte area" }
@@ -239,6 +256,8 @@ class Bmh3Extensions(
         const val TYPE_BUILD_TAG = 3
         const val TYPE_PSEUDONYM = 4
         const val TYPE_RELAY_SEEK = 5
+        const val TYPE_WIFI = 8
+        const val WIFI_VERSION = 1
         const val BUILD_TAG_BYTES = 2
         const val CRITICAL_BIT = 0x80
         val NONE = Bmh3Extensions()
@@ -254,6 +273,8 @@ class Bmh3Extensions(
             var buildTagSeen = false
             var pseudonym = false
             var relaySeek: Int? = null
+            var wifi = false
+            var wifiSeen = false
             while (position < area.size) {
                 if (position + 3 > area.size) throw Bmh3Failure("truncated extension")
                 val type = area[position].toInt() and 0xff
@@ -290,11 +311,17 @@ class Bmh3Extensions(
                         if (value.size != 1) throw Bmh3Failure("relay seek malformed")
                         relaySeek = value[0].toInt() and 0xff
                     }
+                    TYPE_WIFI -> {
+                        if (value.size != 1) throw Bmh3Failure("wifi marker malformed")
+                        wifiSeen = true
+                        // Another version is a peer without the marker (never a failure): only version 1 counts.
+                        wifi = value[0].toInt() == WIFI_VERSION
+                    }
                     else -> if (type and CRITICAL_BIT != 0) throw Bmh3Failure("unknown critical extension")
                 }
                 position += 3 + length
             }
-            return Bmh3Extensions(opening, intent, buildTag, buildTagSeen, pseudonym, relaySeek)
+            return Bmh3Extensions(opening, intent, buildTag, buildTagSeen, pseudonym, relaySeek, wifi, wifiSeen)
         }
     }
 }
@@ -315,6 +342,9 @@ class Bmh3Peer internal constructor(
 
     /** Design OR: the `RELAY_SEEK` feature bits the peer signed (0 when none). */
     val relaySeek: Int get() = extensions.relaySeek ?: 0
+
+    /** True when the peer's verified initiator block carried the `WIFI` build marker (version 1). */
+    val wifiMarker: Boolean get() = extensions.wifi
 
     /** The opening entries the peer proved in its block (rotating-ID discovery binding), or null when it sent none. */
     fun openingEntries(): List<OpeningEntry>? = extensions.opening?.let { value ->
@@ -566,6 +596,9 @@ internal abstract class Bmh3Party(
     protected var order: Bmh3Order? = null
     protected var result: Bmh3Result? = null
 
+    /** Tests only: replaces the rule above to prove the receiver's placement check (null: the real rule). */
+    internal var testWifiMarkerOverride: Boolean? = null
+
     /** What this phone presents in its block: the real identity until a role decides to present the stranger one. */
     protected var presented: Bmh3Presentation = config.real
 
@@ -601,6 +634,7 @@ internal abstract class Bmh3Party(
             config.buildTag,
             pseudonym = presented.pseudonym,
             relaySeek = if (role == "Responder") config.relaySeek else null,
+            wifi = testWifiMarkerOverride ?: (role == "Initiator" && config.wifiMarker),
         )
         prefix.write(ownExtensions.encodeArea())
         val prefixBytes = prefix.toByteArray()
@@ -672,6 +706,11 @@ internal abstract class Bmh3Party(
         }
         // A throwaway key must not open a rotating ID: the salt would let a prober confirm the owner of a node ID.
         if (extensions.opening != null && extensions.pseudonym) throw Bmh3Failure("opening in a pseudonymous block")
+        // The build marker is an initiator's statement in a link handshake only (a responder tells an unadmitted
+        // initiator nothing; PROTOCOL "Capability: the WIFI marker").
+        if (extensions.wifiSeen && (responderBlock || config.purpose != Bmh3Purpose.LINK)) {
+            throw Bmh3Failure("wifi marker outside an initiator link block")
+        }
         if (extensions.intent != null && (responderBlock || message != 3 || blockOrder != Bmh3Order.I_FIRST)) {
             throw Bmh3Failure("intent outside msg3 of an I_FIRST handshake")
         }

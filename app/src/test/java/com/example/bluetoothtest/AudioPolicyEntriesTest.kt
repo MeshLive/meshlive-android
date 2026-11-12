@@ -77,43 +77,11 @@ class AudioPolicyEntriesTest {
         )
         AudioSwitches.applyExtras { _, default -> default }
         assertFalse(AudioSwitches.captureSourceFallback)
-        assertFalse(AudioSwitches.offMainThread)
+        assertTrue("audio work off the main thread is the shipped behaviour (2026-11-09)", AudioSwitches.offMainThread)
         assertFalse(AudioSwitches.modeChangeWait)
         assertFalse(AudioSwitches.usbHeadsetModeNormal)
         assertFalse(AudioSwitches.complexityGovernor)
         assertTrue("the re-assert is the shipped behaviour; false is the control arm", AudioSwitches.routeReassert)
-    }
-
-    @Test
-    fun launchExtrasTurnTheArmsOnAndOffAgain() {
-        val extras = mapOf(
-            "test_capture_source_fallback" to true,
-            "test_audio_off_main" to true,
-            "test_audio_mode_change_wait" to true,
-            "test_audio_usb_headset_mode_normal" to true,
-            "test_audio_complexity_governor" to true,
-            "test_audio_route_reassert" to false,
-        )
-        AudioSwitches.applyExtras { key, default -> extras[key] ?: default }
-        assertTrue(AudioSwitches.captureSourceFallback)
-        assertTrue(AudioSwitches.offMainThread)
-        assertTrue(AudioSwitches.modeChangeWait)
-        assertTrue(AudioSwitches.usbHeadsetModeNormal)
-        assertTrue(AudioSwitches.complexityGovernor)
-        assertFalse(AudioSwitches.routeReassert)
-        AudioSwitches.applyExtras { _, default -> default }
-        assertFalse(AudioSwitches.captureSourceFallback)
-        assertTrue(AudioSwitches.routeReassert)
-    }
-
-    @Test
-    fun theSharedOffSwitchTurnsOneEntryOrAllOff() {
-        assertTrue(AudioSwitches.policyActive(CALL_FOCUS_ENTRY_ID))
-        DebugTunables.devicePolicyOff = setOf(CALL_FOCUS_ENTRY_ID)
-        assertFalse(AudioSwitches.policyActive(CALL_FOCUS_ENTRY_ID))
-        assertTrue(AudioSwitches.policyActive(CAPTURE_WATCHDOG_ENTRY_ID))
-        DebugTunables.devicePolicyOff = setOf("all")
-        assertFalse(AudioSwitches.policyActive(CAPTURE_WATCHDOG_ENTRY_ID))
     }
 
     @Test

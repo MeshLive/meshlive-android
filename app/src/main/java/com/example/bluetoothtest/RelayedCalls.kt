@@ -26,6 +26,14 @@ object RelayedCallsFeature {
     const val EXTRA_REQUIRE = "test_relayed_calls_require"
 
     /**
+     * AP8 DEBUG benchmark pins (default off, null): the caller uses only a route whose first relay has
+     * [EXTRA_HELPER_PIN]'s signed-node prefix; a helper accepts only [EXTRA_NEXT_HOP_PIN]'s next relay or target
+     * prefix. Exactly 12 hex digits; absent = off, malformed = a pin that matches no route.
+     */
+    const val EXTRA_HELPER_PIN = "test_relayed_calls_helper"
+    const val EXTRA_NEXT_HOP_PIN = "test_relayed_calls_next_hop"
+
+    /**
      * Experimental DEBUG topology mask, default off (SWITCHES register): `test_relayed_calls_no_direct=true` makes this
      * phone's reach tables ignore every target's own offer (see [ReachTable]), as if no target were in its radio
      * range. A co-located lab needs it for any chain of two or more relays: the caller and every helper except
@@ -46,9 +54,9 @@ object RelayedCallsFeature {
     fun showsRoutedRow(isContact: Boolean): Boolean = isContact || listRoutedStrangers
 
     /**
-     * Resolved by the shared rule ([FeatureCatalog.resolve]), with the Advanced gating stated in the spec: the switch is an
-     * Advanced row, so a stored ON counts only while Manual settings is on and the experiment never runs hidden (DECISIONS
-     * "Known interactions", B14). Default off.
+     * Resolved by the shared rule ([FeatureCatalog.resolve]). Design decision 2026-11-06 (Apple gap audit 2, Q2): the switch
+     * is an Experiments row shown with or without Manual video settings, so its stored choice counts either way (until then
+     * it was an Advanced-only row, DECISIONS "Known interactions", B14). Default off.
      */
     val spec = FeatureSpec(
         id = "relayed_calls",
@@ -56,7 +64,6 @@ object RelayedCallsFeature {
         defaultEnabled = false,
         benchmarkExtra = EXTRA,
         group = ConnectivityFeatures.GROUP,
-        advancedOnly = true,
         phoneTest = "Design C",
     )
 
@@ -74,9 +81,76 @@ object RelayedCallsFeature {
     /** Benchmark rule: only a chain of exactly this many relays counts (0 = normal use). Direct fallback fails. */
     @Volatile var requireRelays = 0
 
+    /**
+     * AP8 DEBUG benchmark pin: the caller uses only a route whose first relay has this signed-node prefix. Null = off;
+     * an empty array is a rejected (malformed) pin and matches no route.
+     */
+    @Volatile var helperPin: ByteArray? = null
+
+    /**
+     * AP8 DEBUG benchmark pin: a helper accepts only this next relay or target prefix; anything else is the existing
+     * NO_ROUTE FAIL. Null = off; an empty array is a rejected (malformed) pin and matches nothing.
+     */
+    @Volatile var nextHopPin: ByteArray? = null
+
     /** The cost cap from a DEBUG launch extra; the product value everywhere else. */
     fun resolveMaxRelays(benchmarkLaunch: Boolean, extraValue: Int): Int =
         if (benchmarkLaunch && extraValue in 1..PrivateCallRelayChain.MAX_RELAYS) extraValue else RelayedCalls.DEFAULT_MAX_RELAYS
+
+    /** The lab route controls one launch sets ([resolveRouteControls]); all off by default. */
+    class RouteControls(
+        val requireRelays: Int = 0,
+        val noDirectSightings: Boolean = false,
+        val helperPin: ByteArray? = null,
+        val nextHopPin: ByteArray? = null,
+    )
+
+    /**
+     * The lab route controls [EXTRA_REQUIRE], [EXTRA_NO_DIRECT], [EXTRA_HELPER_PIN] and [EXTRA_NEXT_HOP_PIN] are test
+     * geometry, not product features: like the Wi-Fi extras ([FeatureSpec.extraInAnyDebugLaunch]) a [debug] build reads
+     * them in every launch, a person's launch (`test_user_launch=true`) included, so co-located phones can be made to
+     * use a relayed chain (design decision on the UL1 proposal, 2026-11-10). A release build never reads them, and an
+     * absent extra leaves its control off.
+     */
+    fun resolveRouteControls(
+        debug: Boolean,
+        int: (String, Int) -> Int,
+        flag: (String, Boolean) -> Boolean,
+        string: (String) -> String?,
+    ): RouteControls = if (!debug) {
+        RouteControls()
+    } else {
+        RouteControls(
+            requireRelays = int(EXTRA_REQUIRE, 0).coerceIn(0, PrivateCallRelayChain.MAX_RELAYS),
+            noDirectSightings = flag(EXTRA_NO_DIRECT, false),
+            helperPin = parsePin(string(EXTRA_HELPER_PIN)),
+            nextHopPin = parsePin(string(EXTRA_NEXT_HOP_PIN)),
+        )
+    }
+
+    /** AP8: the pin exists only in a DEBUG benchmark launch; a release or ordinary launch always resolves to null. */
+    fun resolvePin(benchmarkLaunch: Boolean, raw: String?): ByteArray? =
+        if (benchmarkLaunch) parsePin(raw) else null
+
+    /**
+     * AP8: a 12-hex-digit node prefix as its 6 bytes. Null = the extra is absent (no pin, today's choice); a malformed
+     * value is an empty array, a pin that matches no route, so a typo cannot silently select another helper.
+     */
+    fun parsePin(raw: String?): ByteArray? {
+        if (raw == null) return null
+        val hex = raw.takeIf { it.length == 12 && it.all { c -> c in '0'..'9' || c in 'a'..'f' || c in 'A'..'F' } }
+            ?: return ByteArray(0)
+        return ByteArray(DiscoveryAnnouncement.NODE_PREFIX_BYTES) { index ->
+            hex.substring(2 * index, 2 * index + 2).toInt(16).toByte()
+        }
+    }
+
+    /** The launch line's pin label: `none` (off), `invalid` (rejected), or the lowercase 12-hex prefix. */
+    fun pinLabel(pin: ByteArray?): String = when {
+        pin == null -> "none"
+        pin.isEmpty() -> "invalid"
+        else -> pin.joinToString("") { "%02x".format(it) }
+    }
 
     /**
      * Rotating IDs and relayed calls together (PLAN C4, reach pages version 6): helping and consent use role-0 RDIs

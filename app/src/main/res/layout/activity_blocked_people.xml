@@ -54,6 +54,14 @@
         app:drawableStartCompat="@drawable/ic_warning"
         app:drawableTint="@color/text_primary" />
 
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/blockedResetButton"
+        style="@style/Widget.App.Button.Text"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="@string/blocked_people_reset_action"
+        android:visibility="gone" />
+
     <FrameLayout
         android:layout_width="match_parent"
         android:layout_height="0dp"

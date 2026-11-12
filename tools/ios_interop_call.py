@@ -200,7 +200,8 @@ def summarize(rows):
             if fields.get("final") == "true":
                 final_rx = fields
         elif message.startswith("Private call ended: "):
-            ended["reason"] = message[len("Private call ended: "):]
+            # DEBUG builds append " | callId=<uuid>" after the message.
+            ended["reason"] = message[len("Private call ended: "):].split(" | callId=", 1)[0]
             ended["time"] = row["time"]
         elif message.startswith("BENCHMARK call ended_ui: message="):
             ended["reason_ui"] = message[len("BENCHMARK call ended_ui: message="):]

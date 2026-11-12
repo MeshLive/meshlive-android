@@ -112,6 +112,10 @@ internal class CallVideoReassembler(private val maxPacketBytes: Int = CallVideoF
         val offset = header.int
         val length = fragment.size - CallVideoFragments.HEADER_BYTES
         val current = buffer
+        if (current == null && discarding) {
+            if (offset != 0) return null
+            discarding = false
+        }
         if (current == null) {
             require(offset == 0) { "Call video fragment starts at offset $offset" }
             require(total in 1..maxPacketBytes) { "Invalid fragmented call video size $total" }
@@ -135,6 +139,22 @@ internal class CallVideoReassembler(private val maxPacketBytes: Int = CallVideoF
 
     /** The link generation whose records this reassembler holds (null before the first link). */
     private var generation: Int? = null
+
+    /** Wi-Fi upgrade cutover: fragments are discarded until the next frame starts at offset 0 (see [discardUntilFrameStart]). */
+    private var discarding = false
+
+    /**
+     * Wi-Fi upgrade cutover (fragment suppress mode): the frame in progress is dropped and fragments are discarded until the
+     * next frame starts at offset 0 (its first fragments went to the other carrier). Returns true when a partial frame was dropped.
+     */
+    fun discardUntilFrameStart(): Boolean {
+        val dropped = inProgress
+        buffer = null
+        received = 0
+        flags = 0
+        discarding = true
+        return dropped
+    }
 
     /**
      * Call link renewal moved the call to a new link ([gen] changed): a frame left unfinished on the old link can never

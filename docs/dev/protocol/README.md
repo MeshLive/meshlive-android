@@ -37,6 +37,7 @@ For implementers and security reviewers: the normative wire formats and security
 7. **Messaging**: store-and-forward messages and Messaging v2.
    - [Store-and-forward messages](messaging.md#store-and-forward-messages)
    - [Messaging v2: conversations, attachments, receipts, forward secrecy (phases 1a, 1b and 1d built 2026-10-12; on whenever Messages is on since 2026-10-21; phases 1c, 2 to 3 not built)](messaging.md#messaging-v2-conversations-attachments-receipts-forward-secrecy-phases-1a-1b-and-1d-built-2026-10-12-on-whenever-messages-is-on-since-2026-10-21-phases-1c-2-to-3-not-built)
-8. **Experimental transports**: dual listening and the Classic address exchange draft.
+8. **Experimental transports**: dual listening, the Classic address exchange draft and the Wi-Fi transport draft.
    - [Experimental dual listening (off by default)](experimental.md#experimental-dual-listening-off-by-default)
    - [Draft: Classic address exchange and media upgrade (design 2026-10-14, revised after five reviews, not implemented)](experimental.md#draft-classic-address-exchange-and-media-upgrade-design-2026-10-14-revised-after-five-reviews-not-implemented)
+   - [Draft: Wi-Fi transport (Design WF revision 3, not built)](experimental.md#draft-wi-fi-transport-design-wf-revision-3-not-built)

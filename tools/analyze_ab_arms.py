@@ -285,7 +285,8 @@ def pair_label(scenario):
     transport = scenario.get("transport", "?")
     if "caller" in scenario:
         profiles = scenario.get("profiles") or {}
-        rates = sorted({str(profile.get("bitrate_kbps")) for profile in profiles.values()})
+        rates = sorted({"app" if profile.get("profile_source") == "app_default" else str(profile.get("bitrate_kbps"))
+                        for profile in profiles.values()})
         return f"call {scenario['caller']}->{scenario['callee']} {transport} {'/'.join(rates)}k"
     receivers = ",".join(f"{r.get('parent')}>{r.get('phone')}" for r in scenario.get("receivers", []))
     kbps = (scenario.get("profile") or {}).get("bitrate_kbps")

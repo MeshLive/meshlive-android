@@ -277,9 +277,6 @@ def apk_file_name(version_name, apk):
 STABLE_APK_NAME = "MeshLive.apk"
 
 
-STABLE_APK_NAME = "MeshLive.apk"
-
-
 def sha256sums_text(entries):
     """sha256sum -c compatible text for [(name, digest)]."""
     return "".join(f"{digest}  {name}\n" for name, digest in sorted(entries))
@@ -301,7 +298,7 @@ def release_notes(version, app_id, commit, cert, rows, changelog):
     first = rows[0][0]
     return f"""# {RELEASE_BASENAME} {version[0]} (unofficial build)
 
-Unofficial, open-source build signed with the project's release key (not published on Google Play).
+Open-source build signed with the project's release key; Google Play delivers the same app with the same key.
 Application id: `{app_id}`. Source commit: `{commit}`.
 Licence: {LICENSE_ID}; the full text is in `LICENSE` and third-party licences are in `THIRD_PARTY_NOTICES.md` of the source.
 

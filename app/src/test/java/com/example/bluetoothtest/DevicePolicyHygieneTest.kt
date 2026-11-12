@@ -13,6 +13,7 @@ class DevicePolicyHygieneTest {
     @After
     fun restoreArms() {
         GattSwitches.busyWedgeRecovery = false
+        GattSwitches.relayAcknowledgedWrites = false
     }
 
     @Test
@@ -39,10 +40,58 @@ class DevicePolicyHygieneTest {
         assertTrue(line.substringAfter("armOff=").substringBefore(" |").split(",").contains(id))
 
         GattSwitches.busyWedgeRecovery = true // DEBUG unit tests: the arm is settable
+        if (!BuildConfig.DEBUG) {
+            // A release build ignores the arm: the entry keeps waiting for it.
+            assertFalse(GattSwitches.busyWedgeRecovery)
+            assertFalse(DeviceFamilyPolicy.resolve(android14, emptySet()).reportedActive.any { it.id == id })
+            return
+        }
         val on = DeviceFamilyPolicy.resolve(android14, emptySet())
         assertTrue(on.reportedActive.any { it.id == id })
         assertFalse(on.armOff.any { it.id == id })
         assertTrue(GattLinkPolicy.wedgeRecovery(on) != null)
+    }
+
+    @Test
+    fun aLegacyQualcommCallRelayWritesWithoutResponseUnlessItsExperimentalArmIsOn() {
+        val id = "qcom-legacy-call-relay-gatt-acknowledged-writes"
+        val asus = DeviceTraits("qcom", "msmnile", 30, manufacturer = "asus")
+        GattSwitches.relayAcknowledgedWrites = false
+        val off = DeviceFamilyPolicy.resolve(asus, emptySet())
+        // The phone matches the family, but the entry waits for its arm and is not what the phone runs.
+        assertTrue(off.isActive(id))
+        assertTrue(off.armOff.any { it.id == id })
+        assertFalse(off.reportedActive.any { it.id == id })
+        assertFalse(GattLinkPolicy.relayAcknowledgedWrites(off))
+        val line = DeviceFamilyPolicy.benchmarkLine(off)
+        assertTrue(line.substringAfter("armOff=").substringBefore(" |").split(",").contains(id))
+
+        GattSwitches.relayAcknowledgedWrites = true // DEBUG unit tests: the arm is settable
+        if (!BuildConfig.DEBUG) {
+            // A release build cannot turn the arm on: the relay never writes with response.
+            assertFalse(GattSwitches.relayAcknowledgedWrites)
+            assertFalse(GattLinkPolicy.relayAcknowledgedWrites(DeviceFamilyPolicy.resolve(asus, emptySet())))
+            return
+        }
+        val on = DeviceFamilyPolicy.resolve(asus, emptySet())
+        assertTrue(on.reportedActive.any { it.id == id })
+        assertTrue(GattLinkPolicy.relayAcknowledgedWrites(on))
+        // The arm alone changes nothing on a phone outside the family, or with the entry switched off.
+        assertFalse(GattLinkPolicy.relayAcknowledgedWrites(DeviceFamilyPolicy.resolve(android14, emptySet())))
+        assertFalse(GattLinkPolicy.relayAcknowledgedWrites(DeviceFamilyPolicy.resolve(asus, setOf(id))))
+    }
+
+    @Test
+    fun theRelayAcknowledgedWritesLaunchExtraIsTheOnlyWayToTurnTheArmOn() {
+        assertFalse(GattSwitches.relayAcknowledgedWrites)
+        GattSwitches.applyExtras(
+            boolExtra = { key, default -> if (key == "test_relay_gatt_acknowledged_writes") true else default },
+            intExtra = { _, default -> default },
+            stringExtra = { null },
+        )
+        assertEquals(BuildConfig.DEBUG, GattSwitches.relayAcknowledgedWrites)
+        GattSwitches.resetToDefaults()
+        assertFalse(GattSwitches.relayAcknowledgedWrites)
     }
 
     @Test

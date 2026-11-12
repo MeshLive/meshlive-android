@@ -156,7 +156,8 @@ object RelayedCallsRuntime {
         accept: (DiscoveryAnnouncement) -> Boolean,
     ): BleL2capPeer? {
         val required = RelayedCallsFeature.requireRelays
-        val route = current.callerRoutes(target, accept, required).firstOrNull { it.nextHop != null } ?: return null
+        val route = current.callerRoutes(target, accept, required, RelayedCallsFeature.helperPin)
+            .firstOrNull { it.nextHop != null } ?: return null
         val first = route.hop.peer
         val announcement = RelayedCalls.routedAnnouncement(target, route.relays, route.hop.announcement)
         require(announcement.transportOption() == transport) { "Route bearer differs from the call transport" }

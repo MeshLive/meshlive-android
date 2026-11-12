@@ -6,19 +6,18 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-/** When a name and a subject are sent (Design G, G1): audience x contact/stranger x pseudonym x timing, and the callee rule. */
+/** When a name is sent (Design G, G1): audience x contact/stranger x pseudonym x timing, and the callee rule. */
 class CallLabelPolicyTest {
     private fun caller(
         audience: NamesAudience = NamesAudience.EVERYONE,
         negotiated: Boolean = true,
         name: Boolean = true,
-        subject: Boolean = true,
-        beforeAnswer: Boolean = true,
+        beforeAnswer: Boolean = false,
         awaitsReveal: Boolean = false,
         relayed: Boolean = false,
         verifiedContact: Boolean = false,
     ) = CallLabelPolicy.callerPlan(
-        CallerLabelContext(negotiated, name, subject, audience, beforeAnswer, awaitsReveal, relayed, verifiedContact),
+        CallerLabelContext(negotiated, name, audience, beforeAnswer, awaitsReveal, relayed, verifiedContact),
     )
 
     private fun callee(
@@ -27,66 +26,49 @@ class CallLabelPolicyTest {
         name: Boolean = true,
         ownPseudonymous: Boolean = false,
         callerVerified: Boolean = false,
-    ) = CallLabelPolicy.calleeMoment(CalleeLabelContext(negotiated, name, audience, ownPseudonymous, callerVerified))
+        callerPseudonymous: Boolean = false,
+        holdUntilReveal: Boolean = false,
+    ) = CallLabelPolicy.calleeMoment(
+        CalleeLabelContext(negotiated, name, audience, ownPseudonymous, callerVerified, callerPseudonymous, holdUntilReveal),
+    )
 
     // --- caller ---
 
     @Test
     fun aPeerWithoutBit5GetsNothingFromEitherSide() {
         // A 0.2.0-beta phone with names off (its default) never advertises bit 5: nothing is sent, nothing breaks.
-        assertEquals(CallerLabelPlan(LabelSendMoment.NEVER, LabelSendMoment.NEVER), caller(negotiated = false))
+        assertEquals(CallerLabelPlan(LabelSendMoment.NEVER), caller(negotiated = false))
         assertEquals(LabelSendMoment.NEVER, callee(negotiated = false))
     }
 
     @Test
-    fun aStrangerSessionWithShowMyNameBeforeTheyAnswerSendsTheNameNowAndHoldsTheSubject() {
-        val plan = caller(awaitsReveal = true, beforeAnswer = true)
-        assertEquals(LabelSendMoment.NOW, plan.name)
-        assertEquals(LabelSendMoment.AFTER_REVEAL, plan.subject)
+    fun onlyTheExperimentalNameBeforeAnswerArmSendsAStrangersNameNow() {
+        assertEquals(LabelSendMoment.NOW, caller(awaitsReveal = true, beforeAnswer = true).name)
     }
 
     @Test
-    fun theHeldArmKeepsTheDesignFRuleForBoth() {
-        val plan = caller(awaitsReveal = true, beforeAnswer = false)
-        assertEquals(LabelSendMoment.AFTER_REVEAL, plan.name)
-        assertEquals(LabelSendMoment.AFTER_REVEAL, plan.subject)
+    fun aStrangerSessionHoldsTheNameForTheVerifiedRevealByDefault() {
+        assertEquals(LabelSendMoment.AFTER_REVEAL, caller(awaitsReveal = true).name)
     }
 
     @Test
-    fun theSubjectIsAlwaysHeldUntilTheRevealInEveryAudienceAndArm() {
-        for (audience in NamesAudience.entries) for (before in listOf(true, false)) {
-            assertEquals(
-                "$audience/$before",
-                LabelSendMoment.AFTER_REVEAL,
-                caller(audience = audience, beforeAnswer = before, awaitsReveal = true).subject,
-            )
-        }
-    }
-
-    @Test
-    fun aRealKeySessionSendsBothNow() {
-        val plan = caller()
-        assertEquals(CallerLabelPlan(LabelSendMoment.NOW, LabelSendMoment.NOW), plan)
+    fun aRealKeySessionSendsTheNameNow() {
+        assertEquals(CallerLabelPlan(LabelSendMoment.NOW), caller())
     }
 
     @Test
     fun aRelayedCalleeWaitsForItsOpeningAsBefore() {
-        val plan = caller(relayed = true)
-        assertEquals(CallerLabelPlan(LabelSendMoment.AFTER_OPENING, LabelSendMoment.AFTER_OPENING), plan)
+        assertEquals(CallerLabelPlan(LabelSendMoment.AFTER_OPENING), caller(relayed = true))
     }
 
     @Test
-    fun nothingIsSentWhenThereIsNothingToSend() {
-        assertEquals(CallerLabelPlan(LabelSendMoment.NEVER, LabelSendMoment.NEVER), caller(name = false, subject = false))
-        assertEquals(LabelSendMoment.NOW, caller(name = false).subject)
-        assertEquals(LabelSendMoment.NEVER, caller(name = false).name)
+    fun nothingIsSentWhenThereIsNoName() {
+        assertEquals(CallerLabelPlan(LabelSendMoment.NEVER), caller(name = false))
     }
 
     @Test
-    fun audienceNobodySendsNoNameButStillAllowsASubject() {
-        val plan = caller(audience = NamesAudience.NOBODY)
-        assertEquals(LabelSendMoment.NEVER, plan.name)
-        assertEquals(LabelSendMoment.NOW, plan.subject)
+    fun audienceNobodySendsNoName() {
+        assertEquals(LabelSendMoment.NEVER, caller(audience = NamesAudience.NOBODY).name)
         assertEquals(LabelSendMoment.NEVER, caller(audience = NamesAudience.NOBODY, awaitsReveal = true).name)
     }
 
@@ -171,9 +153,16 @@ class CallLabelPolicyTest {
     }
 
     @Test
-    fun aUserLaunchUsesTheStoredChoiceElseTheDefaultOn() {
-        assertTrue(NamingSettings.nameBeforeAnswer(false, { false }, { null }))
+    fun aUserLaunchHoldsAStrangersNameForTheRevealWhateverAnOlderBuildStoredAndKeepsTheAudienceChoice() {
+        // Design decision 2026-11-06: "Show my name before they answer" is Experimental and off for every user launch.
+        assertFalse(NamingSettings.nameBeforeAnswer(false, { false }, { null }))
+        // No switch since 2026-11-04: a choice stored by an older build (on or off) is ignored.
+        assertFalse(NamingSettings.nameBeforeAnswer(false, { false }, { true }))
         assertFalse(NamingSettings.nameBeforeAnswer(false, { false }, { false }))
+        assertEquals(
+            LabelSendMoment.AFTER_REVEAL,
+            caller(awaitsReveal = true, beforeAnswer = NamingSettings.nameBeforeAnswer(false, { false }, { null })).name,
+        )
         assertEquals(NamesAudience.VERIFIED_ONLY, NamingSettings.audience(false, { null }, { "verified" }))
         assertEquals(NamesAudience.EVERYONE, NamingSettings.audience(false, { null }, { null }))
     }
@@ -198,5 +187,40 @@ class CallLabelPolicyTest {
         assertNull("a constant since 2026-10-17", CallFeature.NAMES_AND_TITLES.prefKey)
         assertEquals("test_peer_labels", CallFeature.NAMES_AND_TITLES.benchmarkExtra)
         assertTrue(CallFeatureDefaults.NAMES_AND_TITLES)
+    }
+
+    // --- callee name timing (audit CALL-06): the name waits for the caller's block check, as camera and microphone do ---
+
+    @Test
+    fun aStrangerCallersCalleeNameWaitsForTheirRevealWhenTheHoldIsOn() {
+        assertEquals(
+            LabelSendMoment.AFTER_REVEAL,
+            callee(ownPseudonymous = true, callerPseudonymous = true, holdUntilReveal = true),
+        )
+    }
+
+    @Test
+    fun withTheControlArmTheCalleeNameStillGoesWithAccept() {
+        assertEquals(LabelSendMoment.AT_ACCEPT, callee(ownPseudonymous = true, callerPseudonymous = true))
+    }
+
+    @Test
+    fun theHoldAppliesOnlyWhereARevealIsComing() {
+        // A real-key caller was already checked against the block list before ringing; no reveal follows.
+        assertEquals(LabelSendMoment.AT_ACCEPT, callee(ownPseudonymous = true, holdUntilReveal = true))
+        assertEquals(LabelSendMoment.AT_ACCEPT, callee(callerPseudonymous = true, holdUntilReveal = true))
+        // A verified contact still gets it at Ringing, and the audience rules are unchanged.
+        assertEquals(
+            LabelSendMoment.AT_RINGING,
+            callee(ownPseudonymous = true, callerPseudonymous = true, callerVerified = true, holdUntilReveal = true),
+        )
+        assertEquals(
+            LabelSendMoment.NEVER,
+            callee(audience = NamesAudience.NOBODY, ownPseudonymous = true, callerPseudonymous = true, holdUntilReveal = true),
+        )
+        assertEquals(
+            LabelSendMoment.AFTER_REVEAL_IF_VERIFIED,
+            callee(audience = NamesAudience.VERIFIED_ONLY, ownPseudonymous = true, callerPseudonymous = true, holdUntilReveal = true),
+        )
     }
 }

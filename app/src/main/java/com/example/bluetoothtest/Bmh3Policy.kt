@@ -610,6 +610,11 @@ internal class Bmh3AttemptPlan(
     private val log: (String) -> Unit = {},
     /** Amendment CP (LE only): the relayed route this attempt's link opens, kept in the plan so no layer drops it. */
     val relayRoute: RelayRoute = RelayRoute.NONE,
+    /**
+     * Wi-Fi upgrade: sign the `WIFI` build marker in the LINK block of this attempt, toward a direct callee or a relay edge;
+     * never in an END_TO_END handshake and never in a verification scan. [R M-3]
+     */
+    private val wifiMarker: Boolean = false,
 ) {
     /**
      * The relayed-route fields of Amendment CP: the link toward the first helper presents a declared fresh throwaway and
@@ -629,6 +634,12 @@ internal class Bmh3AttemptPlan(
 
     /** The options of [layer]'s handshake, or null for BMH2. */
     fun initiator(layer: Bmh3Policy.Layer): Bmh3InitiatorOptions? {
+        val options = initiatorWithoutMarker(layer) ?: return null
+        val mark = wifiMarker && layer == Bmh3Policy.Layer.LINK && qrScan == null // [R M-3] relay edges sign it too
+        return options.withWifiMarker(mark)
+    }
+
+    private fun initiatorWithoutMarker(layer: Bmh3Policy.Layer): Bmh3InitiatorOptions? {
         if (qrScan != null) return Bmh3Policy.initiatorOptions(selected, layer, log = log, pinResult = pinResult, qrScan = qrScan)
         if (!decision.bmh3) return null
         return Bmh3Policy.initiatorOptions(
@@ -665,6 +676,7 @@ internal class Bmh3AttemptPlan(
             log: (String) -> Unit = {},
             newAlias: () -> SigningIdentity = Bmh3Policy.pseudonymKeys::fresh,
             relayRoute: RelayRoute = RelayRoute.NONE,
+            wifiMarker: Boolean = false,
         ): Bmh3AttemptPlan {
             // In pseudonym mode the caller never speaks BMH2 either: a BMH2 hello hands the real key to whoever answers,
             // before any ring (PROTOCOL "BMH2 is refused"). Cost: phones with BMH3 off cannot be called.
@@ -683,6 +695,7 @@ internal class Bmh3AttemptPlan(
                 leaseSource = leaseSource,
                 log = log,
                 relayRoute = relayRoute,
+                wifiMarker = wifiMarker,
             )
         }
 

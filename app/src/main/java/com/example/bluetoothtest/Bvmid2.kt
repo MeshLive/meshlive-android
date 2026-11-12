@@ -525,26 +525,53 @@ internal object QrMeet {
 internal class MeetVisit {
     private val confirmed = HashSet<IdentityFingerprint>()
     private var reuse = false
+    private var open = false
+    private var token = 0L
 
+    /** Starts a new visit and returns its token; only that token can end it ([end]) or confirm in it ([confirm]). */
     @Synchronized
-    fun begin() {
+    fun begin(): Long {
         confirmed.clear()
         reuse = false
+        open = true
+        return ++token
     }
 
+    /**
+     * The user confirmed [peer]'s screen and answered "Let <name>'s phone recognise yours nearby" with [recognise] (true
+     * also when no choice was shown and nothing needed storing). Only a yes lets this visit's sessions with [peer] offer
+     * and lease; a later answer for the same person replaces an earlier one.
+     */
     @Synchronized
-    fun confirm(peer: IdentityFingerprint) {
-        confirmed += peer
+    fun confirm(peer: IdentityFingerprint, recognise: Boolean = true, visit: Long? = null) {
+        // An answer given in a visit that has since ended does not carry into a later one.
+        if (visit != null && (visit != token || !open)) return
+        if (recognise) confirmed += peer else confirmed -= peer
     }
+
+    /**
+     * The screen was left (closed or sent to the background): nothing more leaves until a new visit begins. With [visit],
+     * only that visit ends (a second instance of the screen may have begun its own).
+     */
+    @Synchronized
+    fun end(visit: Long? = null) {
+        if (visit != null && visit != token) return
+        confirmed.clear()
+        open = false
+    }
+
+    /** [visit] is the current visit and it is open. */
+    @Synchronized
+    fun isOpen(visit: Long): Boolean = open && visit == token
 
     @Synchronized
     fun onReuseAlert() {
         reuse = true
     }
 
-    /** A displayer may offer and lease to [peer] now. */
+    /** Either role of a verification session may offer and lease to [peer] now. */
     @Synchronized
-    fun displayerMayLease(peer: IdentityFingerprint): Boolean = !reuse && peer in confirmed
+    fun mayLease(peer: IdentityFingerprint): Boolean = open && !reuse && peer in confirmed
 
     /** Any lease of a verification session is withheld after a reuse alert in this visit. */
     @Synchronized

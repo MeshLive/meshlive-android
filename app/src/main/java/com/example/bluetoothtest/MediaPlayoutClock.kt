@@ -42,7 +42,16 @@ class MediaPlayoutClock(
      * it. The lateness rule above still applies, and still reaches [adaptiveMaxDelayMs].
      */
     private val timeTarget: PlayoutJitterTarget? = null,
+    /**
+     * Experimental call fast recovery ([CallFastRecovery], DEBUG `test_call_fast_recovery`, null = off, calls only):
+     * after an isolated late burst the audio writer may lower the delay by leaving out quiet audio
+     * ([consumeFastRecovery]). Without consumption this clock times media exactly as without it.
+     */
+    private val fastRecovery: CallFastRecovery? = null,
 ) {
+    /** Delay left out by fast recovery from [fromPtsUs] on, not yet folded into the anchor. */
+    private class RecoveryShift(val fromPtsUs: Long, val shiftNs: Long)
+
     private val calmBeforeShrinkNs = calmBeforeShrinkMs * NANOS_PER_MILLISECOND
     private var anchorPresentationUs: Long? = null
     private var anchorRenderNs = 0L
@@ -54,6 +63,8 @@ class MediaPlayoutClock(
     private var reservedExtraNs = 0L
     /** Extra delay the time-based target currently asks for; calm shrinking stops there (0 when off). */
     private var timeFloorNs = 0L
+    /** Fast-recovery shifts in PTS order (empty with the experiment off). */
+    private val recoveryShifts = ArrayDeque<RecoveryShift>()
 
     /** Times the anchor moved earlier because packets arrived ahead of a stale anchor. */
     @Volatile var reanchors = 0
@@ -138,13 +149,14 @@ class MediaPlayoutClock(
             anchorRenderNs = nowNs + effectiveDelayNs
             latestPresentationUs = presentationTimeUs
             timeTarget?.reset()
+            recoveryShifts.clear()
         } else if (latest == null || presentationTimeUs > latest) {
             latestPresentationUs = presentationTimeUs
         }
 
         if (adaptive) shrinkWhenCalm(nowNs)
-        var rawTargetNs = anchorRenderNs +
-            (presentationTimeUs - requireNotNull(anchorPresentationUs)) * NANOS_PER_MICROSECOND
+        foldRecoveryShifts(nowNs)
+        var rawTargetNs = mappedTargetNs(presentationTimeUs, requireNotNull(anchorPresentationUs))
         val delayNowNs = delayMs * NANOS_PER_MILLISECOND + extraDelayNs
         val slackNs = maxOf(delayNowNs, EARLY_REANCHOR_SLACK_MS * NANOS_PER_MILLISECOND)
         if (rawTargetNs - nowNs > delayNowNs + slackNs) {
@@ -154,6 +166,7 @@ class MediaPlayoutClock(
             anchorPresentationUs = presentationTimeUs
             anchorRenderNs = nowNs + delayNowNs
             rawTargetNs = anchorRenderNs
+            recoveryShifts.clear()
             reanchors++
         }
         val latenessNs = nowNs - rawTargetNs
@@ -162,6 +175,7 @@ class MediaPlayoutClock(
             val limitNs = growthLimitMs?.let { minOf(maxExtraNs, it.coerceAtLeast(0L) * NANOS_PER_MILLISECOND) }
                 ?: maxExtraNs
             val withinLimit = extraDelayNs <= limitNs
+            val extraBeforeNs = extraDelayNs
             val stepNs = burstGrowthFactor
                 ?.takeIf { latenessNs >= BURST_LATENESS_MS * NANOS_PER_MILLISECOND }
                 ?.let { factor -> (latenessNs * factor).toLong() }
@@ -176,6 +190,11 @@ class MediaPlayoutClock(
             if (withinLimit) {
                 lastLateNs = nowNs
                 lastShrinkNs = nowNs
+                fastRecovery?.onLate(
+                    nowNs / NANOS_PER_MILLISECOND,
+                    extraBeforeNs / NANOS_PER_MILLISECOND,
+                    extraDelayNs / NANOS_PER_MILLISECOND,
+                )
             }
         }
         if (adaptive && timeTarget != null) {
@@ -202,6 +221,68 @@ class MediaPlayoutClock(
             targetTimeNs = rawTargetNs.coerceAtMost(latestAllowedTargetNs),
             latenessMs = max(0L, nowNs - rawTargetNs) / NANOS_PER_MILLISECOND,
         )
+    }
+
+    /** Target of [presentationTimeUs] on the current timeline, after the fast-recovery shifts that apply to it. */
+    private fun mappedTargetNs(presentationTimeUs: Long, anchorUs: Long): Long {
+        var targetNs = anchorRenderNs + (presentationTimeUs - anchorUs) * NANOS_PER_MICROSECOND
+        for (shift in recoveryShifts) if (presentationTimeUs >= shift.fromPtsUs) targetNs -= shift.shiftNs
+        return targetNs
+    }
+
+    /**
+     * Folds a shift into the anchor once media at its PTS is due: anything earlier still unplayed is late by then and
+     * plays at once either way. Keeps the list to a few entries (one per 80 ms of pause at most).
+     */
+    private fun foldRecoveryShifts(nowNs: Long) {
+        val anchorUs = anchorPresentationUs ?: return
+        while (recoveryShifts.isNotEmpty()) {
+            val first = recoveryShifts.first()
+            if (recoveryShifts.size <= MAX_RECOVERY_SHIFTS && mappedTargetNs(first.fromPtsUs, anchorUs) > nowNs) return
+            anchorRenderNs -= first.shiftNs
+            recoveryShifts.removeFirst()
+        }
+    }
+
+    /** Experimental call fast recovery is attached ([CallFastRecovery]). */
+    val hasFastRecovery: Boolean
+        get() = fastRecovery != null
+
+    /** Delay (ms) fast recovery may still remove by leaving out quiet audio now; 0 when off or not armed. */
+    @Synchronized
+    fun fastRecoveryPendingMs(nowNs: Long = System.nanoTime()): Long {
+        val recovery = fastRecovery ?: return 0L
+        if (anchorPresentationUs == null) return 0L
+        return recovery.pendingMs(
+            nowNs / NANOS_PER_MILLISECOND,
+            extraDelayNs / NANOS_PER_MILLISECOND,
+            maxOf(reservedExtraNs, timeFloorNs) / NANOS_PER_MILLISECOND,
+        )
+    }
+
+    /**
+     * The audio writer left out [ms] of quiet audio just before [fromPtsUs]: media at or after that sender time plays
+     * [ms] earlier (video and audio skip at the same point, so lip sync holds). Returns false, changing nothing, unless
+     * fast recovery is armed with at least [ms] still to remove.
+     */
+    @Synchronized
+    fun consumeFastRecovery(ms: Long, fromPtsUs: Long, nowNs: Long = System.nanoTime()): Boolean {
+        val recovery = fastRecovery ?: return false
+        if (ms <= 0L || anchorPresentationUs == null) return false
+        if (fastRecoveryPendingMs(nowNs) < ms) return false
+        foldRecoveryShifts(nowNs)
+        val shiftNs = ms * NANOS_PER_MILLISECOND
+        extraDelayNs -= shiftNs
+        currentDelayMs = delayMs + extraDelayNs / NANOS_PER_MILLISECOND
+        recoveryShifts.addLast(RecoveryShift(fromPtsUs, shiftNs))
+        recovery.onConsumed(nowNs / NANOS_PER_MILLISECOND, ms, extraDelayNs / NANOS_PER_MILLISECOND)
+        return true
+    }
+
+    /** Fast recovery is armed but the audio on offer was speech: logged once per episode. */
+    @Synchronized
+    fun noteFastRecoverySpeech(nowNs: Long = System.nanoTime()) {
+        fastRecovery?.onSpeechSkip(nowNs / NANOS_PER_MILLISECOND, extraDelayNs / NANOS_PER_MILLISECOND)
     }
 
     private fun shrinkWhenCalm(nowNs: Long) {
@@ -232,7 +313,7 @@ class MediaPlayoutClock(
         val rawTargetNs = if (anchorUs == null) {
             nowNs + delayMs * NANOS_PER_MILLISECOND + extraDelayNs
         } else {
-            anchorRenderNs + (presentationTimeUs - anchorUs) * NANOS_PER_MICROSECOND
+            mappedTargetNs(presentationTimeUs, anchorUs)
         }
         return MediaPlayoutTiming(
             targetTimeNs = rawTargetNs.coerceAtMost(nowNs + maxScheduleAheadMs * NANOS_PER_MILLISECOND),
@@ -265,6 +346,8 @@ class MediaPlayoutClock(
         private const val SATURATED_LATE_WINDOW_NS = 2_000_000_000L
         // 1 ms of delay per 100 ms of calm playback: imperceptible frame-time compression.
         private const val SHRINK_DIVISOR = 100L
+        /** Fast-recovery shifts kept unfolded; more fold the oldest (late media then plays at once, as it would). */
+        private const val MAX_RECOVERY_SHIFTS = 32
         private const val NANOS_PER_MICROSECOND = 1_000L
         private const val NANOS_PER_MILLISECOND = 1_000_000L
     }

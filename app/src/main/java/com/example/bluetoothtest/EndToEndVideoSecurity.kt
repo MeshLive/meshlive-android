@@ -241,6 +241,34 @@ class EndToEndContentOpener internal constructor(key: ByteArray) : Closeable {
         return EndToEndContentRecord(metadata.type, metadata.flags, plaintext, metadata.sequence)
     }
 
+    /**
+     * Opens one record without the stream's order check and without moving it: only for the first record of a freshly proved
+     * renewal link (BIND), whose BMS1 layer already makes it fresh and single. Every other record goes through [open].
+     */
+    @Synchronized
+    internal fun openOutOfBand(encoded: ByteArray): EndToEndContentRecord {
+        val metadata = EndToEndContentProtocol.inspect(encoded, acceptVideoFragments, acceptLabels, acceptDiscovery, acceptRenewal)
+        require(metadata.type == EndToEndContentType.RENEW) { "Out-of-band open is for RENEW only" }
+        val plaintext = try {
+            val headerBytes = EndToEndContentProtocol.HEADER_BYTES
+            // Experimental AEAD reuse opens the record in place: the same header as associated data, the same body.
+            aead?.decryptSlice(key, metadata.sequence, encoded, headerBytes, headerBytes, encoded.size - headerBytes)
+                ?: MeshAead.decrypt(
+                    key,
+                    metadata.sequence,
+                    encoded.copyOfRange(headerBytes, encoded.size),
+                    encoded.copyOfRange(0, headerBytes),
+                )
+        } catch (error: GeneralSecurityException) {
+            throw GeneralSecurityException(
+                "End-to-end decrypt failed: type=${metadata.type} sequence=${metadata.sequence} " +
+                    "ciphertextBytes=${metadata.ciphertextBytes}",
+                error,
+            )
+        }
+        return EndToEndContentRecord(metadata.type, metadata.flags, plaintext, metadata.sequence)
+    }
+
     override fun close() {
         key.fill(0)
         aead?.release()
@@ -298,6 +326,21 @@ object EndToEndContentProtocol {
         }
         return EndToEndContentMetadata(type, sequence, flags, ciphertextBytes)
     }
+
+    /**
+     * The sequence of an end-to-end content record, without interpreting its type byte (A7 Am 12: a relay forwards
+     * content types it does not know). Same magic check as [inspect].
+     */
+    fun sequenceOf(encoded: ByteArray): Long {
+        require(encoded.size >= HEADER_BYTES) { "Truncated end-to-end content" }
+        val input = DataInputStream(ByteArrayInputStream(encoded, 0, HEADER_BYTES))
+        val receivedMagic = ByteArray(magic.size).also(input::readFully)
+        require(receivedMagic.contentEquals(magic)) { "Invalid end-to-end content magic" }
+        input.skipBytes(1) // The type byte is never interpreted here.
+        val sequence = input.readLong()
+        require(sequence >= 0) { "Invalid end-to-end content sequence" }
+        return sequence
+    }
 }
 
 data class EndToEndVideoSession(
@@ -316,6 +359,13 @@ data class EndToEndVideoSession(
     val qrTagMatched: Boolean = false,
     /** Experimental in-call link renewal (Design SR): `K_renew`, derived from the two content keys; zeroed at close. */
     val renewalKey: ByteArray? = null,
+    /**
+     * Wi-Fi upgrade (Design WF): `UW` of this call, `HKDF-Expand(EXP_e2e, "BluetoothVideoMesh/WifiUpgrade/1/key", 32)`, derived
+     * from the BMH3 end-to-end exporter before the handshake keys were erased. Null for a BMH2 end-to-end handshake
+     * (package A5 declines such a call) and after a failed derivation. Zeroed by [close] and [dropWifiKey] (call end,
+     * emergency wipe; never on a switch change); survives an in-call link renewal. [R M-5]
+     */
+    val wifiKey: ByteArray? = null,
 ) : Closeable {
     /** True while the peer is only a declared throwaway key: show "unverified stranger", never a node ID. */
     val peerIsPseudonym: Boolean get() = reveal?.peerPseudonymous == true && reveal.revealed == null
@@ -335,11 +385,17 @@ data class EndToEndVideoSession(
     fun peerVerifiedIn(stateOf: (NodeId, IdentityFingerprint) -> VerificationState?): Boolean =
         !peerIsPseudonym && stateOf(effectivePeerNodeId, effectivePeerFingerprint) == VerificationState.VERIFIED
 
+    /** Idempotent; called at call end and by the emergency wipe, never on a switch change. [R M-5] */
+    fun dropWifiKey() {
+        wifiKey?.fill(0)
+    }
+
     override fun close() {
         sealer.close()
         opener.close()
         reveal?.close()
         renewalKey?.fill(0)
+        dropWifiKey()
     }
 }
 
@@ -347,7 +403,7 @@ internal fun meshPacketFlags(mediaFlags: Int): Int =
     mediaFlags and (MeshEnvelope.FLAG_CONTROL or MeshEnvelope.FLAG_TERMINAL).inv()
 
 class EndToEndStreamWriter(
-    private val linkWriter: SecureRecordWriter,
+    private val linkWriter: HopRecordSink,
     private val contentSealer: EndToEndContentSealer,
     sourceNodeId: NodeId,
     useMeshEnvelope: Boolean,
@@ -450,7 +506,7 @@ class EndToEndStreamWriter(
 }
 
 class EndToEndStreamReader(
-    private val linkReader: SecureRecordReader,
+    private val linkReader: HopRecordSource,
     private val contentOpener: EndToEndContentOpener,
     private val expectedSourceNodeId: NodeId,
     private val onMeshEnvelope: (MeshEnvelope) -> Unit = {},
@@ -748,7 +804,7 @@ object EndToEndStreamProtocol {
     }
 
     fun writeHeader(
-        linkWriter: SecureRecordWriter,
+        linkWriter: RecordSink,
         contentSealer: EndToEndContentSealer,
         codecId: Int,
         settings: VideoSettings,
@@ -763,7 +819,7 @@ object EndToEndStreamProtocol {
     }
 
     fun readHeader(
-        linkReader: SecureRecordReader,
+        linkReader: HopRecordSource,
         contentOpener: EndToEndContentOpener,
     ): StreamProtocol.Header {
         val content = readContent(linkReader, contentOpener, EndToEndContentType.STREAM_HEADER)
@@ -771,7 +827,7 @@ object EndToEndStreamProtocol {
     }
 
     fun writePacket(
-        linkWriter: SecureRecordWriter,
+        linkWriter: RecordSink,
         contentSealer: EndToEndContentSealer,
         flags: Int,
         presentationTimeUs: Long,
@@ -789,7 +845,7 @@ object EndToEndStreamProtocol {
      * a video packet with [flags]. Sealed exactly like a media packet, with its own sequence.
      */
     fun writeVideoFragment(
-        linkWriter: SecureRecordWriter,
+        linkWriter: RecordSink,
         contentSealer: EndToEndContentSealer,
         flags: Int,
         fragment: ByteArray,
@@ -803,7 +859,7 @@ object EndToEndStreamProtocol {
         decodePacket(EndToEndContentRecord(EndToEndContentType.MEDIA_PACKET, flags, plaintext))
 
     fun readPacket(
-        linkReader: SecureRecordReader,
+        linkReader: HopRecordSource,
         contentOpener: EndToEndContentOpener,
     ): StreamProtocol.Packet {
         val content = readContent(linkReader, contentOpener, EndToEndContentType.MEDIA_PACKET)
@@ -811,7 +867,7 @@ object EndToEndStreamProtocol {
     }
 
     fun writeState(
-        linkWriter: SecureRecordWriter,
+        linkWriter: RecordSink,
         contentSealer: EndToEndContentSealer,
         state: StreamLifecycleState,
     ): Int = writeContent(
@@ -820,7 +876,7 @@ object EndToEndStreamProtocol {
     )
 
     fun readStreamContent(
-        linkReader: SecureRecordReader,
+        linkReader: HopRecordSource,
         contentOpener: EndToEndContentOpener,
     ): ReceivedStreamContent {
         val record = linkReader.read()
@@ -848,7 +904,7 @@ object EndToEndStreamProtocol {
     }
 
     fun writeKeyFrameRequest(
-        linkWriter: SecureRecordWriter,
+        linkWriter: RecordSink,
         contentSealer: EndToEndContentSealer,
     ): Int = writeContent(
         linkWriter,
@@ -860,7 +916,7 @@ object EndToEndStreamProtocol {
     )
 
     fun writeStreamEndAck(
-        linkWriter: SecureRecordWriter,
+        linkWriter: RecordSink,
         contentSealer: EndToEndContentSealer,
     ): Int = writeContent(
         linkWriter,
@@ -872,7 +928,7 @@ object EndToEndStreamProtocol {
     )
 
     fun readSourceControl(
-        linkReader: SecureRecordReader,
+        linkReader: HopRecordSource,
         contentOpener: EndToEndContentOpener,
         onCapacityReport: (LinkCapacityReport) -> Unit = {},
     ): SourceControlMessage {
@@ -905,11 +961,11 @@ object EndToEndStreamProtocol {
         }
     }
 
-    private fun writeContent(writer: SecureRecordWriter, encoded: ByteArray): Int =
+    private fun writeContent(writer: RecordSink, encoded: ByteArray): Int =
         writer.write(SecureRecordType.END_TO_END_CONTENT, encoded)
 
     private fun readContent(
-        reader: SecureRecordReader,
+        reader: HopRecordSource,
         opener: EndToEndContentOpener,
         expectedType: EndToEndContentType,
     ): EndToEndContentRecord {

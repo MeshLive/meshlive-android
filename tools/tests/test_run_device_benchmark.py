@@ -20,6 +20,36 @@ class BenchmarkPlanTest(unittest.TestCase):
         self.assertEqual({"test_link_pacer_seed": False, "test_fanout_early_release": True},
                          runner.tunable_extras({"link_pacer_seed": False, "fanout_early_release": True}))
 
+    def test_native_wedge_guard_tunable_maps_to_its_debug_extra(self):
+        self.assertEqual({"test_gatt_native_wedge_guard": True},
+                         runner.tunable_extras({"gatt_native_wedge_guard": True}))
+        with self.assertRaises(ValueError):
+            runner.tunable_extras({"gatt_native_wedge_guard": "on"})
+
+    def test_call_prewarm_maps_to_its_debug_extra_and_takes_only_a_boolean(self):
+        self.assertEqual({"test_call_prewarm": True}, runner.tunable_extras({"call_prewarm": True}))
+        self.assertEqual({"test_call_prewarm": False}, runner.tunable_extras({"call_prewarm": False}))
+        with self.assertRaises(ValueError):
+            runner.tunable_extras({"call_prewarm": "on"})
+
+    def test_call_video_restart_arms_map_to_their_debug_extras(self):
+        # B4-media A/B (S22 calls A15s): off, the in-place decoder stall recovery, and the call video restart.
+        self.assertEqual({"test_call_video_restart": True, "test_decoder_stall_recovery": False},
+                         runner.tunable_extras({"call_video_restart": True, "decoder_stall_recovery": False}))
+        with self.assertRaises(ValueError):
+            runner.tunable_extras({"call_video_restart": "on"})
+
+    def test_hop_integrity_resend_diff_maps_to_its_debug_extra_and_takes_only_a_boolean(self):
+        self.assertEqual({"test_hop_integrity_resend_diff": True}, runner.tunable_extras({"hop_integrity_resend_diff": True}))
+        with self.assertRaises(ValueError):
+            runner.tunable_extras({"hop_integrity_resend_diff": "on"})
+
+    def test_relay_acknowledged_writes_tunable_maps_to_its_debug_extra(self):
+        self.assertEqual({"test_relay_gatt_acknowledged_writes": True},
+                         runner.tunable_extras({"relay_gatt_acknowledged_writes": True}))
+        with self.assertRaises(ValueError):
+            runner.tunable_extras({"relay_gatt_acknowledged_writes": "on"})
+
     def test_le_link_tunables_map_to_their_debug_extras(self):
         self.assertEqual(
             {"test_coc_sequenced_phy": False, "test_gatt_request_mtu": 498, "test_ble_phy": "coded-s2",
@@ -125,8 +155,52 @@ class BenchmarkPlanTest(unittest.TestCase):
     def test_relay_establish_budget_maps_to_its_debug_extra(self):
         self.assertEqual({"test_relay_establish_budget": True}, runner.tunable_extras({"relay_establish_budget": True}))
 
+    def test_call_prewarm_maps_to_its_debug_extra_and_takes_only_a_boolean(self):
+        self.assertEqual({"test_call_prewarm": True}, runner.tunable_extras({"call_prewarm": True}))
+        self.assertEqual({"test_call_prewarm": False}, runner.tunable_extras({"call_prewarm": False}))
+        with self.assertRaises(ValueError):
+            runner.tunable_extras({"call_prewarm": "on"})
+
+    def test_call_camera_first_maps_to_its_debug_extra_and_takes_only_a_boolean(self):
+        self.assertEqual({"test_call_camera_first": True}, runner.tunable_extras({"call_camera_first": True}))
+        self.assertEqual({"test_call_camera_first": False}, runner.tunable_extras({"call_camera_first": False}))
+        with self.assertRaises(ValueError):
+            runner.tunable_extras({"call_camera_first": "on"})
+
+    def test_hop_integrity_resend_diff_maps_to_its_debug_extra_and_takes_only_a_boolean(self):
+        self.assertEqual({"test_hop_integrity_resend_diff": True}, runner.tunable_extras({"hop_integrity_resend_diff": True}))
+        with self.assertRaises(ValueError):
+            runner.tunable_extras({"hop_integrity_resend_diff": "on"})
+
     def test_relay_cold_start_maps_to_its_debug_extra(self):
         self.assertEqual({"test_relay_cold_start": False}, runner.tunable_extras({"relay_cold_start": False}))
+
+    def test_ap7_tunables_map_to_their_debug_extras(self):
+        # AP7: the delivered-control write, the slow 2M hop-authentication arm and the DEBUG static relay child guard.
+        self.assertEqual(
+            {"test_gatt_first_write_counts_control": True, "test_stall_slow_auth_ms": 500,
+             "test_relay_start_hop_guard": True},
+            runner.tunable_extras({"gatt_first_write_counts_control": True, "stall_slow_auth_ms": 500,
+                                   "relay_start_hop_guard": True}))
+        with self.assertRaises(ValueError):
+            runner.tunable_extras({"stall_slow_auth_ms": "500"})
+
+    def test_ap5_tunables_map_to_their_debug_extras(self):
+        # AP5: the two Experimental arms, and the codec masters an Automatic-codec A/B needs (a benchmark launch keeps them off).
+        self.assertEqual(
+            {"test_relay_no_ceiling_floor": True, "test_sw_shortfall_avc": True, "test_h264_codec": True,
+             "test_hevc_codec": True, "test_prefer_libvpx": True, "test_codec_power_aware": False},
+            runner.tunable_extras({"relay_no_ceiling_floor": True, "sw_shortfall_avc": True, "h264_codec": True,
+                                   "hevc_codec": True, "prefer_libvpx": True, "codec_power_aware": False}))
+        with self.assertRaises(ValueError):
+            runner.tunable_extras({"sw_shortfall_avc": "on"})
+
+    def test_call_video_restart_arms_map_to_their_debug_extras(self):
+        # B4-media A/B (S22 calls A15s): off, the in-place decoder stall recovery, and the call video restart.
+        self.assertEqual({"test_call_video_restart": True, "test_decoder_stall_recovery": False},
+                         runner.tunable_extras({"call_video_restart": True, "decoder_stall_recovery": False}))
+        with self.assertRaises(ValueError):
+            runner.tunable_extras({"call_video_restart": "on"})
 
     def test_relay_child_reanchor_tunable_maps_to_its_debug_extra(self):
         # Default-on relay child re-anchoring; false is the control arm.
@@ -331,6 +405,29 @@ class BenchmarkPlanTest(unittest.TestCase):
                 self.assertEqual(launches[1][launches[1].index("test_video_presentation_timing") + 1], "true")
             else:
                 self.assertNotIn("test_video_presentation_timing", launches[1])
+
+    def test_phone_tunables_reach_only_their_own_phones_launch(self):
+        case = {**self.case([{"phone": "b", "parent": "a"}]),
+                "tunables": {"stream_buffer_kib": 64}, "phone_tunables": {"b": {"names_before_answer": True}}}
+        self.assertEqual(set("ab"), runner.validate_case(case, self.devices("ab")))
+        instance = runner.Runner("adb", self.devices("ab"), case, Path("unused"))
+        instance.phone_time = Mock(return_value="10-03 17:00:00.000")
+        instance.adb = Mock(return_value="123")
+        with patch.object(Path, "open", mock_open()), patch.object(runner.subprocess, "Popen"):
+            instance.launch("a", source=True)
+            instance.launch("b")
+        launches = [call.args for call in instance.adb.call_args_list if "start" in call.args]
+        for argv in launches:
+            self.assertEqual("64", argv[argv.index("test_stream_buffer_kib") + 1])
+        self.assertNotIn("test_names_before_answer", launches[0])
+        self.assertEqual("true", launches[1][launches[1].index("test_names_before_answer") + 1])
+
+    def test_phone_tunables_are_validated_like_shared_tunables(self):
+        base = self.case([{"phone": "b", "parent": "a"}])
+        for bad in ({"c": {"names_before_answer": True}}, {"b": {"no_such_tunable": True}},
+                    {"b": {"names_before_answer": "yes"}}, {"b": True}, ["b"]):
+            with self.assertRaises(ValueError):
+                runner.validate_case({**base, "phone_tunables": bad}, self.devices("abc"))
 
     def test_output_hold_requires_traces_and_reaches_receivers_only(self):
         case = {**self.case([{"phone": "b", "parent": "a"}]), "video_presentation_timing": True}
@@ -1160,6 +1257,110 @@ class BenchmarkPlanTest(unittest.TestCase):
                 with self.subTest(value=value), self.assertRaises(ValueError):
                     runner.validate_case({**case, "expected_apk_sha256": value}, self.devices("ab"))
 
+    def test_wifi_arm_without_carrier_is_refused_as_inert(self):
+        with self.assertRaises(ValueError):
+            runner.refuse_inert_arms({"tunables": {"wifi_icm": True}})
+        runner.refuse_inert_arms({"carrier": "wifi_aware", "tunables": {"wifi_icm": True}})
+
+    def test_an_arm_masked_on_one_phone_only_is_refused_and_a_user_launch_phone_is_not_checked(self):
+        masked = {"link_pacing": False, "link_pacer_seed": True}
+        with self.assertRaisesRegex(ValueError, "link_pacer_seed because link_pacing=false"):
+            runner.refuse_inert_arms({"tunables": {"link_pacing": False}, "phone_tunables": {"b": {"link_pacer_seed": False}}})
+        runner.refuse_inert_arms({"tunables": {"link_pacing": False}, "phone_tunables": {"b": {"link_pacer_seed": False}},
+                                  "allow_inert_arms": True})
+        runner.refuse_inert_arms({"tunables": {"user_launch": True, **masked}})
+        self.assertEqual({"test_link_pacing": False, "test_link_pacer_seed": False},
+                         runner.case_extras({"tunables": {"link_pacing": False}, "phone_tunables": {"b": {"link_pacer_seed": False}}}, "b"))
+
+    def test_a_reserved_wifi_switch_with_no_consumer_is_refused(self):
+        with self.assertRaises(ValueError):
+            runner.tunable_extras({"wifi_ble_standby_low_power": True})
+
+    def test_carrier_cases_set_the_wifi_extras_and_native_is_refused(self):
+        case = {**self.case([{"phone": "b", "parent": "a"}]), "carrier": "wifi_aware_wider"}
+        runner.validate_case(case, self.devices("ab"))
+        with self.assertRaises(ValueError):
+            runner.validate_case({**case, "carrier": "wifi_aware_native"}, self.devices("ab"))
+        with self.assertRaisesRegex(ValueError, "sets the Wi-Fi switches itself"):
+            runner.validate_case({**case, "tunables": {"wifi_direct": True}}, self.devices("ab"))
+        self.assertIn("test_wifi_direct", runner.WIFI_CARRIER_ARMS["wifi_direct"])
+        self.assertEqual("direct", runner.WIFI_CARRIER_ARMS["wifi_direct"]["test_wifi_force_carrier"])
+
+    def test_a_carrier_case_turns_on_the_wifi_opt_in_and_refuses_it_off(self):
+        case = {**self.case([{"phone": "b", "parent": "a"}]), "carrier": "wifi_direct"}
+        for arms in runner.WIFI_CARRIER_ARMS.values():
+            self.assertIs(True, arms["test_bmh3"])
+        with self.assertRaisesRegex(ValueError, "needs bmh3"):
+            runner.validate_case({**case, "tunables": {"bmh3": False}}, self.devices("ab"))
+        runner.validate_case({**case, "tunables": {"bmh3": True}}, self.devices("ab"))
+
+    def test_a_wifi_exact_rate_may_exceed_the_bluetooth_maximum_only_when_it_covers_the_request(self):
+        case = {**self.case([{"phone": "b", "parent": "a"}]), "carrier": "wifi_direct"}
+        fast = {**case, "profile": {**case["profile"], "bitrate_kbps": 2000}}
+        runner.validate_case({**fast, "tunables": {"wifi_exact_kbps": 2000}}, self.devices("ab"))
+        for tunables in ({}, {"wifi_exact_kbps": 1500}):
+            with self.subTest(tunables=tunables), self.assertRaisesRegex(ValueError, "Settings limit"):
+                runner.validate_case({**fast, "tunables": tunables}, self.devices("ab"))
+        automatic = {**fast, "profile": {**fast["profile"], "rate_control": "automatic"}, "tunables": {"wifi_exact_kbps": 2000}}
+        with self.assertRaisesRegex(ValueError, "ignores it under automatic"):
+            runner.validate_case(automatic, self.devices("ab"))
+        bluetooth = {key: value for key, value in fast.items() if key != "carrier"}
+        with self.assertRaisesRegex(ValueError, "Settings limit"):
+            runner.validate_case({**bluetooth, "tunables": {"wifi_exact_kbps": 2000}}, self.devices("ab"))
+
+    def test_a_carrier_arm_without_the_wifi_opt_in_is_refused(self):
+        case = {**self.case([{"phone": "b", "parent": "a"}]), "carrier": "wifi_direct"}
+        arm = {key: value for key, value in runner.WIFI_CARRIER_ARMS["wifi_direct"].items() if key != "test_bmh3"}
+        with patch.dict(runner.WIFI_CARRIER_ARMS, {"wifi_direct": arm}):
+            with self.assertRaisesRegex(ValueError, "needs bmh3"):
+                runner.validate_case(case, self.devices("ab"))
+
+    def test_aware_band_strict_tunable_maps_to_its_debug_extra(self):
+        # AP9: the old strict Aware band rule as a DEBUG control arm (the new default judges by the 5 GHz data channel).
+        self.assertEqual({"test_aware_band_strict": True}, runner.tunable_extras({"aware_band_strict": True}))
+        self.assertEqual({"test_aware_band_strict": False}, runner.tunable_extras({"aware_band_strict": False}))
+        with self.assertRaises(ValueError):
+            runner.tunable_extras({"aware_band_strict": "on"})
+
+    def test_aware_24ghz_alone_tunable_maps_to_its_debug_extra(self):
+        # AP10 (Experimental, app default off): true lets a phone with no other Bluetooth media link accept a
+        # 2.4 GHz-only Aware path; false is the app default, the 5 GHz rule.
+        self.assertEqual({"test_aware_24ghz_alone": False}, runner.tunable_extras({"aware_24ghz_alone": False}))
+        self.assertEqual({"test_aware_24ghz_alone": True}, runner.tunable_extras({"aware_24ghz_alone": True}))
+        with self.assertRaises(ValueError):
+            runner.tunable_extras({"aware_24ghz_alone": "off"})
+
+    def test_aware_goodput_guard_tunable_maps_to_its_debug_extra(self):
+        # AP10 (Experimental, app default off): the Aware goodput guard only logs the fallback it would have made;
+        # true is the arm in which it returns the hop to Bluetooth.
+        self.assertEqual({"test_aware_goodput_guard": False}, runner.tunable_extras({"aware_goodput_guard": False}))
+        self.assertEqual({"test_aware_goodput_guard": True}, runner.tunable_extras({"aware_goodput_guard": True}))
+        with self.assertRaises(ValueError):
+            runner.tunable_extras({"aware_goodput_guard": 0})
+
+    def test_call_voice_when_camera_refused_tunable_maps_to_its_debug_extra(self):
+        # UI-01: a video call with only the camera refused goes on as voice (app default on; false is the control arm).
+        self.assertEqual({"test_call_voice_when_camera_refused": True},
+                         runner.tunable_extras({"call_voice_when_camera_refused": True}))
+        self.assertEqual({"test_call_voice_when_camera_refused": False},
+                         runner.tunable_extras({"call_voice_when_camera_refused": False}))
+        with self.assertRaises(ValueError):
+            runner.tunable_extras({"call_voice_when_camera_refused": "on"})
+
+    def test_call_quiet_pre_ring_failure_tunable_maps_to_its_debug_extra(self):
+        # CALL-02: an incoming link that failed before it rang shows nothing (app default off; either arm can be set).
+        self.assertEqual({"test_call_quiet_pre_ring_failure": True},
+                         runner.tunable_extras({"call_quiet_pre_ring_failure": True}))
+        self.assertEqual({"test_call_quiet_pre_ring_failure": False},
+                         runner.tunable_extras({"call_quiet_pre_ring_failure": False}))
+        with self.assertRaises(ValueError):
+            runner.tunable_extras({"call_quiet_pre_ring_failure": 1})
+
+    def test_exact_kbps_tunable_maps_to_its_extra(self):
+        self.assertEqual({"test_wifi_exact_kbps": 2000}, runner.tunable_extras({"wifi_exact_kbps": 2000}))
+        with self.assertRaises(ValueError):
+            runner.tunable_extras({"wifi_exact_kbps": True})
+
 
 class AdbRobustnessTest(unittest.TestCase):
     def runner(self, directory):
@@ -1312,6 +1513,31 @@ class StageSequenceGapTests(unittest.TestCase):
         lines = ["BENCHMARK stage v1 {broken", "unrelated", self.stage(5), self.stage(5), self.stage(6)]
         self.assertEqual((0, 1), runner.stage_sequence_gaps(lines))
 
+    @staticmethod
+    def batch(sequences, role="video_decoder", scope="9", stage="receive", pid=7):
+        rows = [[n, stage, n * 10, n * 100, 0, 0, None] for n in sequences]
+        record = {"session": "s", "scope": scope, "role": role, "pid": pid, "clock": "System.nanoTime", "rows": rows}
+        return "10-09 19:11:21.821 17082 17139 I BluetoothVideo: BENCHMARK stage v2 " + json.dumps(record, separators=(",", ":"))
+
+    def test_v2_batches_report_no_loss_when_contiguous_within_and_across_lines(self):
+        lines = [self.batch([1, 2, 3]), self.batch([4, 5]), self.stage(1), self.stage(2),
+                 self.batch([1], role="video_encoder", scope="3")]
+        self.assertEqual((0, 3), runner.stage_sequence_gaps(lines))
+
+    def test_v2_gaps_are_found_inside_a_batch_and_between_batches(self):
+        self.assertEqual((2, 1), runner.stage_sequence_gaps([self.batch([1, 2, 5, 6])]))
+        self.assertEqual((3, 1), runner.stage_sequence_gaps([self.batch([1, 2]), self.batch([6, 7])]))
+
+    def test_a_lost_v2_batch_shows_as_a_gap_and_a_broken_one_is_ignored(self):
+        broken = self.batch([4, 5, 6])[:-9]
+        lines = [self.batch([1, 2, 3]), broken, self.batch([7, 8]), "BENCHMARK stage v2 {broken"]
+        self.assertEqual((3, 1), runner.stage_sequence_gaps(lines))
+
+    def test_v1_and_v2_lines_of_one_stream_are_checked_together(self):
+        lines = [self.stage(1, role="video_decoder", scope="9"), self.batch([2, 3]),
+                 self.stage(7, role="video_decoder", scope="9")]
+        self.assertEqual((3, 1), runner.stage_sequence_gaps(lines))
+
     def test_first_surface_timeout_names_log_loss(self):
         instance = object.__new__(runner.Runner)
         with tempfile.TemporaryDirectory() as directory:
@@ -1439,3 +1665,80 @@ class CleanShutdownTest(unittest.TestCase):
         kinds = [c[:3] for c in calls]
         self.assertNotIn(("shell", "am", "broadcast"), kinds)
         self.assertNotIn(("shell", "am", "start"), kinds)
+
+
+class LoggerDropCaptureTests(unittest.TestCase):
+    """liblog reports lines logd dropped (events buffer, tag liblog) on the process's next stored write.
+    The ASUS (Android 11) lost one-time app lines at camera open that way; the app log alone cannot show it."""
+
+    @staticmethod
+    def drop(second, count, pid=8053):
+        return f"10-02 22:56:{second:06.3f} {pid} {pid + 20} I liblog  : {count}"
+
+    def runner_with_capture(self, directory, live):
+        instance = object.__new__(runner.Runner)
+        instance.output = Path(directory)
+        instance.case = {"connection_timeout_s": 0}
+        instance.pids = {"asus": "8053"}
+        instance.logs = [{"device": "asus", "pid": 8053, "path": "asus-8053.log", "start": "10-02 22:56:00.000",
+                          "end": "10-02 22:56:40.000"}]
+        instance.drop_logs = [{"device": "asus", "pid": 8053, "path": "asus-8053-liblog.log",
+                               "start": "10-02 22:56:00.000"}]
+        instance.events = []
+        (instance.output / "asus-8053.log").write_text("", encoding="utf-8")
+        (instance.output / "asus-8053-liblog.log").write_text(live, encoding="utf-8")
+        instance.check_cancelled = lambda: None
+        instance.phone_time = lambda phone: "10-02 22:56:31.000"
+        instance.dump_log_lines = lambda phone: ([], [])
+        return instance
+
+    def test_drop_capture_merges_the_events_buffer_and_is_hash_bound(self):
+        with tempfile.TemporaryDirectory() as directory:
+            instance = self.runner_with_capture(directory, self.drop(5, 12) + chr(10))
+            dump = chr(10).join([self.drop(5, 12), self.drop(9, 3), self.drop(9.5, 50, pid=77)])
+            instance.adb = Mock(return_value=dump)
+            instance.finalize_drop_logs()
+            entry = instance.drop_logs[0]
+            path = instance.output / entry["path"]
+            self.assertEqual(("MEASURED", 15, 1), (entry["status"], entry["total_dropped"], entry["dump_merged_lines"]))
+            self.assertEqual([{"time": "10-02 22:56:05.000", "dropped": 12}, {"time": "10-02 22:56:09.000", "dropped": 3}],
+                             entry["drops"])
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), entry["sha256"])
+            self.assertEqual(path.stat().st_size, entry["bytes"])
+        with tempfile.TemporaryDirectory() as directory:
+            instance = self.runner_with_capture(directory, self.drop(5, 12) + chr(10))
+            instance.adb = Mock(side_effect=RuntimeError("device offline"))
+            instance.finalize_drop_logs()
+            self.assertEqual(("LIVE_ONLY", 12), (instance.drop_logs[0]["status"], instance.drop_logs[0]["total_dropped"]))
+
+    def scored_timeout(self, live):
+        """(raised error, runner_error gate) of a first-surface timeout scored from its own finalized capture."""
+        with tempfile.TemporaryDirectory() as directory:
+            instance = self.runner_with_capture(directory, live)
+            instance.adb = Mock(return_value="")
+            with self.assertRaises(RuntimeError) as raised:
+                instance.wait_first_frame("asus")
+            instance.finalize_drop_logs()
+            manifest = {"runner_error": str(raised.exception), "log_drops": instance.drop_logs,
+                        **({"runner_error_log_loss": raised.exception.record}
+                           if isinstance(raised.exception, runner.LogLinesDropped) else {})}
+            score = {"execution_gates": {"runner_error": {"status": "FAIL", "value": manifest["runner_error"]}},
+                     "devices": [], "overall_status": "FAIL"}
+            runner.apply_log_loss(score, manifest, instance.output)
+            return raised.exception, score
+
+    def test_a_first_surface_line_lost_in_a_reported_drop_is_unmeasured(self):
+        error, score = self.scored_timeout(self.drop(3, 40) + chr(10))
+        self.assertIsInstance(error, runner.LogLinesDropped)
+        self.assertIn("log lines dropped by logd", str(error))
+        self.assertEqual(("UNMEASURED", "log lines dropped by logd"),
+                         (score["execution_gates"]["runner_error"]["status"], score["execution_gates"]["runner_error"]["reason"]))
+        self.assertEqual("UNMEASURED", score["overall_status"])
+
+    def test_a_first_surface_timeout_without_a_drop_report_stays_a_failure(self):
+        for live in ("", self.drop(3, 40, pid=77) + chr(10)):
+            with self.subTest(live=live):
+                error, score = self.scored_timeout(live)
+                self.assertNotIsInstance(error, runner.LogLinesDropped)
+                self.assertEqual("FAIL", score["execution_gates"]["runner_error"]["status"])
+                self.assertEqual("FAIL", score["overall_status"])

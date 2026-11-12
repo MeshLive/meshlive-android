@@ -114,12 +114,14 @@ internal object RecentCalls {
     private fun store(context: Context, calls: List<RecentCall>): Boolean {
         if (WipeGuard.active) return false
         return runCatching {
-            val sealed = cipher().seal(encode(calls).toByteArray(Charsets.UTF_8))
-            context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE).edit()
-                .putString(SEALED_KEY, java.util.Base64.getEncoder().encodeToString(sealed))
-                .remove(KEY)
-                .remove(OLD_KEY)
-                .commit()
+            WipeGuard.guardedWrite("recent calls") {
+                val sealed = cipher().seal(encode(calls).toByteArray(Charsets.UTF_8))
+                context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE).edit()
+                    .putString(SEALED_KEY, java.util.Base64.getEncoder().encodeToString(sealed))
+                    .remove(KEY)
+                    .remove(OLD_KEY)
+                    .commit()
+            }
         }.getOrElse { error ->
             runCatching { android.util.Log.w("BluetoothVideo", "recent_calls: not stored (${error.javaClass.simpleName})") }
             false

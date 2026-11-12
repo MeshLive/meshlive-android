@@ -4,6 +4,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 
 class ThermalHeadroomSamplerTest {
@@ -172,6 +173,8 @@ class ThermalHeadroomSamplerTest {
 
     @Test
     fun legacyArmReproducesTheOldTenSecondCadenceWithoutWarmup() {
+        // The legacy cadence is a DEBUG control arm; a release build keeps the shipped cadence.
+        assumeTrue("DEBUG arm", BuildConfig.DEBUG)
         val f = fake()
         ThermalSwitches.forecastLegacy10sCadence = true
         try {

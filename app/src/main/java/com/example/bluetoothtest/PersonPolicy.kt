@@ -34,6 +34,12 @@ internal object PersonPolicy {
      */
     private val hiddenStreamTokens = LinkedHashSet<String>()
 
+    /**
+     * AB3: radio addresses of Watch rows hidden by "Hide this livestream" on a route whose advertised ID was not proven
+     * ([LocalReportPolicy.keptRoute]): only that advertiser goes, for this process only (never stored).
+     */
+    private val hiddenAddresses = LinkedHashSet<String>()
+
     private fun routeKey(offer: DiscoveryAnnouncement): String =
         offer.logicalStreamToken().toString() + ":" + offer.nodeIdPrefix.joinToString("") { "%02x".format(it) }
 
@@ -55,6 +61,7 @@ internal object PersonPolicy {
         blockedHook = onBlocked
         installed = true
         synchronized(hiddenStreamTokens) { hiddenStreamTokens.clear() }
+        synchronized(hiddenAddresses) { hiddenAddresses.clear() }
     }
 
     internal fun resetForTest() = installForTest(emptySet())
@@ -92,9 +99,21 @@ internal object PersonPolicy {
 
     fun streamHidden(offer: DiscoveryAnnouncement): Boolean = routeKey(offer).let { key -> synchronized(hiddenStreamTokens) { key in hiddenStreamTokens } }
 
-    /** Emergency wipe: forget the hidden tokens (nothing about them is stored). */
+    /** AB3: hides the advertiser heard at [address] until the app restarts ([hiddenAddresses]). */
+    fun hideAddress(address: String) {
+        synchronized(hiddenAddresses) {
+            hiddenAddresses.remove(address)
+            hiddenAddresses += address
+            while (hiddenAddresses.size > MAX_HIDDEN_STREAMS) hiddenAddresses.remove(hiddenAddresses.first())
+        }
+    }
+
+    fun addressHidden(address: String): Boolean = synchronized(hiddenAddresses) { address in hiddenAddresses }
+
+    /** Emergency wipe: forget the hidden routes and addresses (nothing about them is stored). */
     internal fun clearForWipe() {
         synchronized(hiddenStreamTokens) { hiddenStreamTokens.clear() }
+        synchronized(hiddenAddresses) { hiddenAddresses.clear() }
     }
 
     const val MAX_HIDDEN_STREAMS = 256

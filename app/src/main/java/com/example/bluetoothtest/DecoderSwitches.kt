@@ -4,20 +4,21 @@ import android.content.Intent
 
 /**
  * Experimental decoder-robustness switches (family backlog batch D). Every arm is DEBUG-only (a launch
- * extra from another app must not change a release build's behaviour) and default off; the shipped
- * behaviour is the control arm. Listed in SWITCHES "Experimental, alternative and optional
+ * extra from another app must not change a release build's behaviour) and default off, except the promoted stall
+ * recovery (default on, 2026-11-10; its `false` is the DEBUG control arm); the shipped behaviour is the control arm. Listed in SWITCHES "Experimental, alternative and optional
  * behaviour". The registry arms of the same names are in [DecoderPolicyEntries].
  */
 object DecoderSwitches {
     /**
-     * `test_decoder_stall_recovery=true` (Experimental, default off): a `decoder_stall` (queued input with
-     * no decoder output) rebuilds the decoder once, then excludes the component for the session and
-     * tries the next candidate, asking for a keyframe through the normal needsKeyFrame path. Off: a
-     * stall is only logged.
+     * `test_decoder_stall_recovery` (promoted on 2026-11-10, default on; `false` is the DEBUG control arm): a
+     * `decoder_stall` (queued input with no decoder output) rebuilds the decoder once, then excludes the
+     * component for the session and tries the next candidate, asking for a keyframe through the normal
+     * needsKeyFrame path. Off: a stall is only logged. Read by [VideoStreamDecoder], so calls and streams
+     * share it. The setter keeps the default in release builds (the extra is DEBUG-only).
      */
-    @Volatile var stallRecovery: Boolean = false
+    @Volatile var stallRecovery: Boolean = true
         set(value) {
-            field = value && BuildConfig.DEBUG
+            field = value || !BuildConfig.DEBUG
         }
 
     /**
@@ -43,7 +44,7 @@ object DecoderSwitches {
 
     /** Reads the DEBUG launch extras `test_decoder_*`; release builds keep every default. */
     fun applyExtras(boolExtra: (String, Boolean) -> Boolean) {
-        stallRecovery = boolExtra("test_decoder_stall_recovery", false)
+        stallRecovery = boolExtra("test_decoder_stall_recovery", true)
         lowLatencyLadder = boolExtra("test_decoder_low_latency_ladder", false)
         realtimePriority = boolExtra("test_decoder_priority", false)
     }

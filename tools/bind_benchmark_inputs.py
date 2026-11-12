@@ -80,6 +80,8 @@ def bind_jobs(jobs, index, base, devices, with_reference_audio=False):
         profiles = original["profiles"] if "caller" in original else {original["source"]: original["profile"]}
         inputs = {}
         for phone, profile in profiles.items():
+            if profile.get("profile_source") == "app_default":
+                raise ValueError(f"{original['id']}/{phone}: profile_source app_default declares no geometry, so no raw input binds to it")
             key = (profile["width"], profile["height"], profile["fps"])
             if key not in index:
                 raise ValueError(f"{original['id']}/{phone}: missing native {key[0]}x{key[1]} at {key[2]} FPS; no substitution")

@@ -40,7 +40,7 @@
     <!-- Listening screen and Watch rows -->
     <string name="audio_live_listen_title">Radio</string>
     <string name="audio_live_listen_meter_description">Sound level</string>
-    <string name="audio_live_listen_info">Anyone nearby with MeshLive can listen, including phones that pass it on. Titles from people you have not verified are unconfirmed. Volume is your phone\'s media volume.</string>
+    <string name="audio_live_listen_info">Anyone nearby with MeshLive can listen, including phones that pass it on. While you listen, anyone nearby with radio equipment can recognise your phone. Titles from people you have not verified are unconfirmed. Volume is your phone\'s media volume.</string>
     <string name="audio_live_listen_mute">Mute</string>
     <string name="audio_live_listen_unmute">Unmute</string>
     <string name="audio_live_listen_stop">Stop</string>
@@ -65,7 +65,7 @@
 
     <!-- Disclosure shown before the first broadcast -->
     <string name="audio_live_disclosure_title">Going live</string>
-    <string name="audio_live_disclosure_message">Your livestream is public. Anyone nearby with MeshLive can listen, and it can be passed on to people further away.</string>
+    <string name="audio_live_disclosure_message">Your livestream is public. Anyone nearby with MeshLive can listen, and it can be passed on to people further away. Listeners, and anyone nearby with radio equipment, can tell it is your phone.</string>
     <string name="audio_live_disclosure_confirm">Go live with audio</string>
 
     <!-- Notification (broadcaster; lock-screen text stays neutral) -->

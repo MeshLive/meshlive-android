@@ -11,12 +11,20 @@ For users: what other people can learn about you when you use MeshLive, what is 
 
 ## In short
 
-- The ID your phone broadcasts is random and changes every 15 minutes, so a listener cannot follow you.
+- The ID your phone broadcasts is random and changes every 15 minutes, so a listener cannot follow a phone that is
+  idle or in a call by that ID. Other traces remain; they are listed under "Still stable or exposed".
 - Calls hide both phones' identities from anyone listening in. A stranger sees a throwaway identity until you answer.
-- Your name, if you set one, is never broadcast. A stream title is public, so everyone nearby can read it.
+- **Live streams do not have this protection.** While you send, watch or pass on a live stream (video or audio-only),
+  anyone nearby with radio equipment can record your phone's long-term ID. It is the same ID on every stream and the
+  one your contacts know you by, and it stays the same until you delete everything in the app. Calls do not have this
+  exposure. If you must not be linked to a stream, do not watch it or pass it on.
+- Your name, if you set one, is never broadcast. A stranger you call gets it only after they answer and their phone
+  proves who it is, and never if you blocked them. A stranger you answer learns it the same way: only after their phone
+  proves who it is, and never if you blocked them. "Only people I verified" and "Nobody" are unchanged. A stream title is public, so everyone nearby can read it.
 
-Limits, plainly: a live stream shows its source to everyone who watches; on Android 13 and older a phone that connects
-to yours can read its Bluetooth name; anyone whose call you accept learns who you are; there has been no independent
+Limits, plainly: a live stream shows the long-term ID of everyone taking part (the person streaming, every viewer and
+every phone passing it on) to anyone listening nearby; on Android 13 and older a phone that connects
+to yours can read its Bluetooth name; anyone whose call you accept learns your long-term ID when you answer, and your name only after their phone proves who it is (never if you blocked them); there has been no independent
 security audit. The sections below give the detail.
 
 ## What nearby phones can see
@@ -48,29 +56,76 @@ UTC quarter hour, stays silent for a random 1 to 8 seconds and restarts on a new
 stream already connected keeps its link. In normal use the setting **Allow calls** is on, which means the
 phone advertises that it can take a call while the app is open and, through its session service, in the background;
 turning it off stops that, at the cost that others cannot call you unless your Call screen is open. Rotating IDs are
-one switch (Settings > Advanced > Rotating discovery IDs); the identity-hiding handshake and the throwaway identities
-for strangers are two more (Settings > Features). All three are on by default and each is its own off-switch.
+always on (no switch since 0.4.5: a phone with them off could not find phones that had them on); the identity-hiding
+call handshake and the throwaway identities for strangers are always on too and have no switch. Your QR code shows "Your name" (unless "Who sees my name" is Nobody), because it is shown face to face to add a
+contact.
+
+**Wi-Fi (off by default).** With every Wi-Fi switch off nothing is sent over Wi-Fi: what is on air is exactly the Bluetooth
+announcement above. Between two phones that both include the Wi-Fi feature, the encrypted Bluetooth link also carries a short note
+that the build supports Wi-Fi and a short capabilities note with every Wi-Fi bit clear, so a peer cannot tell why Wi-Fi is not
+offered. *Use Wi-Fi when it helps* (the Private level) moves a link to Wi-Fi only after a Bluetooth link has
+authenticated both phones, and the Wi-Fi data path is encrypted with keys only those two phones can derive. During each move
+to Wi-Fi both phones briefly advertise a one-time Wi-Fi Aware name derived from those keys, exchange short Wi-Fi Aware
+messages and show a random Wi-Fi Aware address on air; the name is new for every attempt and means nothing to others. While a
+Wi-Fi link is open, the other phone can reach other apps on this phone that accept network connections from any network.
+On a call, the other phone is the person you are talking to, or the relaying phone next to yours. On a live stream it can
+be anyone: every phone that watches or passes on your stream, and the phone you get a stream from, which may be a stranger
+or a decoy. A stream link proves that the other phone holds a MeshLive key, not who it is. So with this switch on, a
+stranger who joins your stream, or whose stream you tap, becomes a Wi-Fi neighbour of your phone. If you stream to, or
+watch streams from, people you do not know, keep this switch off.
+On a live stream the first greeting between phones is not encrypted, so anyone listening nearby, not only the phones you
+stream with, can read which MeshLive version you use: whenever "Tell me about newer versions nearby" is on (the default),
+and, while this Wi-Fi switch is on, even if you turned that off. The phones next to this one when it relays a call can
+also see the version while this switch is on. A switch turned on during a call or live stream
+works from the next one. *Wider reach over Wi-Fi* also publishes the same 22-byte announcement that Bluetooth broadcasts,
+inside a Wi-Fi Aware service whose name changes with the rotating ID, so it shows nothing that Bluetooth does not already
+show; nearby Wi-Fi devices can additionally see that the phone uses Wi-Fi Aware. Names rotate at least every 30 minutes, and
+the phone takes a new Wi-Fi Aware address with a new name whenever it can; while a Wi-Fi link is open the phone's Wi-Fi
+address may not change. To connect to a phone seen only over Wi-Fi the phones use a data-path key that anyone can compute
+from the public service name, so any nearby phone can open such a link before it proves who it is, and that layer only
+protects against passive listeners that do not run MeshLive; the signed, encrypted link handshake is what protects the call,
+exactly as on Bluetooth. Until that handshake completes, the device that opened the link is a Wi-Fi neighbour of your phone
+and can reach other apps in the way described above; the app serves one such device at a time and closes the link if the
+handshake has not completed about 10 seconds after the connection was accepted, and a device can try again. A phone that completes that handshake counts as connected for the rest of that call or stream join,
+even if it used a throwaway identity made just for it, the same as on Bluetooth: the handshake proves the other phone holds a
+MeshLive key, not whose phone it is, so check the person before you trust them. On Android 11 and 12 the phone cannot check
+which Wi-Fi band such a link would use, so it finds people over Wi-Fi but does not open Wi-Fi-only links. *Wi-Fi Direct* shows the phone's Wi-Fi Direct name to everyone nearby while a group is active (on both phones: the phone that joins shows its name too; "Hide phone name" changes the Bluetooth name only, so this can still be the name you gave the phone; the switch's description shows the name when Android reports it), its
+network name has a pattern that identifies MeshLive, a nearby device can send the phone an invitation to connect, and the
+Wi-Fi Direct address may be recognised across calls where the phone's maker does not randomise it.
+
+**Wi-Fi Direct cleanup.** Groups created for calls are removed when the call or carrier ends. The app keeps a sealed list of the names of its own groups only to clean up after a crash; the list holds no keys and no addresses. If a group cannot be closed, the app says so and asks you to turn Wi-Fi off and on. With an always-on VPN that blocks connections outside the VPN, a Wi-Fi Direct link may not connect; the call stays on Bluetooth.
 
 **Who learns who you are.** With the defaults, a call link carries both phones' identity keys encrypted. A phone that
 is not one of your verified contacts meets a throwaway identity instead of your real one. Your real identity goes only
 to verified contacts and, after you press Accept, to whoever holds the call you accept, which may be a relaying phone; a declined call reveals nothing.
 Still true: accepting a call from a stranger tells them who you are, and calling a stranger tells whoever answers who
-you are; a live stream source still answers the old handshake, so a viewer, or anyone who connects to the source,
-learns its identity; and a phone with pseudonyms on refuses the old handshake, so it cannot call, or be called by, an
-older version of the app or a phone that has the switches off. Message exchanges work only with verified contacts while pseudonyms are on. Calls relayed through other phones
+you are; live streams still use the old handshake on every link, and it sends each phone's identity key unencrypted, so
+the source, every viewer and every phone that passes the stream on show their long-term identity to each other and to
+anyone listening nearby, and a device that connects to a phone waiting for a stream is given that phone's identity too;
+and this version refuses the old handshake for calls, so it cannot call, or be called by, a phone whose app does not use
+the identity-hiding handshake (a version from before 0.2.0-beta, or a later older version whose owner turned those
+switches off). Message exchanges work only with verified contacts. Calls relayed through other phones
 (experimental) use a throwaway identity on every relay link; in a call between strangers a relaying phone could sit in
 the middle, so a relayed call from a stranger is marked "via a phone nearby".
 
 **Still stable or exposed.**
 
-- **Older app versions** cannot see a phone with rotating IDs, and a rotating phone sees them by their fixed prefix. A
+- **Older app versions.** A version from before rotating IDs, and a later older version (up to 0.4.4) whose owner
+  turned its rotating-ID switch off, cannot see a phone with this version at all, and nothing on that phone says why.
+  This phone still sees them, by their fixed prefix. A
   rotating viewer that joins an older source shows its own fixed prefix while its request is on air (the app says so),
   and anyone can advertise a decoy old-style offer to make a viewer do the same.
 - **Visible by handle.** The Settings button advertises the fixed prefix for 10 to 25 minutes so older builds and
   people who know your handle can find your streams. Every such window can be linked to every other window and to the
   minutes just before it. A phone with pseudonyms on still refuses calls from older versions.
-- **Live streams** show their source's identity to every viewer, stay linkable by their route token while they run,
-  and a stream title, if you set one, is advertised openly.
+- **Live streams** (video and audio-only) show the long-term identity of every phone taking part: the person
+  streaming, every viewer and every phone passing the stream on. The first greeting on a stream link is not encrypted,
+  so anyone nearby with a Bluetooth sniffer can record these identities without joining, and can recognise the same
+  phones at any later stream. A device that connects to a phone asking for a stream is given that phone's identity as
+  well. Rotating IDs do not prevent this, and the app shows no warning when you watch. Calls do not have this exposure.
+  What you can do: do not watch or pass on a stream you must not be linked to. "Delete everything" gives the phone a
+  new identity afterwards; your contacts then have to verify you again. A stream also stays linkable by its route
+  token while it runs, and a stream title, if you set one, is advertised openly.
 - **Classic Bluetooth** uses the phone's permanent hardware address. A first Classic contact with an unpaired phone
   shows its name and address while it is discoverable.
 - **Paired phones.** A phone that is paired with yours through Android can work out your rotating LE addresses.
@@ -82,7 +137,8 @@ the middle, so a relayed call from a stranger is marked "via a phone nearby".
   other side. "Hide phone name" (Settings > Privacy) uses the neutral name "Phone" instead. It is the default: the
   first time you open the app it asks "Hide your phone's name" (Hide name / Keep my name), and nothing is renamed
   until you answer. It renames the phone for everything (headphones, car, watch, PC), so those devices show "Phone";
-  nearby phones and scanners no longer see your real name. It shows your original name so you can restore it, turning
+  nearby phones and scanners no longer see your real name over Bluetooth. It does not change the device name the phone
+  shows over Wi-Fi while the Wi-Fi Direct switch or Share app nearby is in use; an app cannot change that name. It shows your original name so you can restore it, turning
   it off restores that name, and if you uninstall the app while it is on the name stays "Phone" until you rename the
   phone in Android settings. While it is
   on, the call-ready and viewer-request announcements let an unpaired device that connects read the name, so a Mac can
@@ -91,7 +147,9 @@ the middle, so a relayed call from a stranger is marked "via a phone nearby".
 - **Capability bits.** The codec set, transport and relay hint bits stay the same across IDs: a few bits that can
   single out a phone when few others are nearby.
 - **Verified contacts.** After a call you both answered, mutual verified contacts exchange keys that let each recognise
-  the other's IDs nearby ("seen nearby, unconfirmed", never a check mark) for up to four weeks or until you forget the
+  the other's IDs nearby, but only when you allowed it ("Can see when I'm nearby" on their contact screen, or "Let
+  <name>'s phone recognise yours nearby" when you scan their code; until you answer it counts as off)
+  ("seen nearby, unconfirmed", never a check mark) for up to four weeks or until you forget the
   contact or reset the presence key. A phone read on day D reveals its IDs up to 27 days ahead, so use **Reset presence
   key** after a phone was out of your hands.
 - **Legacy chips.** A phone whose Bluetooth chip only supports legacy advertising may keep its address when the ID
@@ -112,8 +170,10 @@ stream, but it is for anyone: every phone that completes the handshake can liste
 on hears it too.
 
 - **Who learns what.** A listener (and a relay) learns the broadcaster's long-term identity key, because streams do
-  not yet use a throwaway identity: broadcasts from different days can be linked to one phone, and a verified contact
-  is recognised. The broadcaster sees how many listeners are connected, and a relay sees its one child; neither sees
+  not use a throwaway identity: broadcasts from different days can be linked to one phone, and a verified contact
+  is recognised. It works the other way too: a listener's phone shows its own long-term identity key to the phone it
+  gets the broadcast from, and both are readable by anyone nearby with a Bluetooth sniffer, so listening on different
+  days can be linked to one phone as well. If you must not be linked to a broadcast, do not listen to it. The broadcaster sees how many listeners are connected, and a relay sees its one child; neither sees
   more of the chain. Titles from people you have not verified show as unconfirmed.
 - **Signed audio.** The broadcaster signs every audio record with a key that is certified by its identity key, so a
   phone that passes the stream on cannot alter or forge the audio. It can still stop passing it on, or present
@@ -131,15 +191,26 @@ None of this is sent anywhere. These are the extra permissions and local records
 when the screen is off, and what each one can and cannot reveal.
 
 - **"Always run in the background" prompt.** The app declares `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` so it can open
-  Android's own one-tap dialog, in onboarding, in Settings and when you switch on relaying or "Reachable for calls".
+  Android's own one-tap dialog, in onboarding, in Settings and when you switch on relaying or "Allow calls".
   It only opens the system dialog; nothing changes without your tap. It affects battery use, not what is shared.
 - **Location type on Android 10 and 11 only.** Those versions deliver Bluetooth search results to an app in the
   background only if its foreground service declares the location type, so the app declares `FOREGROUND_SERVICE_LOCATION`
   and uses the type on Android 10-11, and only while the phone's Location switch is on. MeshLive never reads,
   stores or sends your location, and it requests no background-location permission. On those versions Android also needs
-  the Location switch on for Bluetooth searches at all; Settings says so when it is off.
+  the Location switch on for Bluetooth searches at all. When it is off, only Settings > Advanced > Help and feedback
+  says so; the status dot still shows "Ready" and the Calls list only says "No one found yet".
+- **Network permissions for the Wi-Fi option.** The app declares `CHANGE_NETWORK_STATE` and `ACCESS_NETWORK_STATE`, two
+  install-time permissions without a prompt, so the optional Wi-Fi carrier can ask Android for a direct Wi-Fi link to the
+  phone you are already connected to. They do not give the app internet access and are not used while the Wi-Fi switches are off.
+  The app also holds Android's `INTERNET` permission, which any app needs to open a network connection of any kind, local ones included.
+- **Nearby Wi-Fi devices and Location, for the Wi-Fi switches.** The app asks only when you turn a Wi-Fi switch on. On
+  Android 13 and newer every Wi-Fi switch asks for "Nearby Wi-Fi devices". On Android 10 to 12, Android allows Wi-Fi
+  discovery only with the Location permission, so *Wider reach over Wi-Fi* (Android 11 and 12) and *Wi-Fi Direct*
+  (Android 10 to 12) ask for Location instead ("Precise" is needed, "Approximate" is not enough) and need the Location
+  switch on. *Use Wi-Fi when it helps* asks for nothing before Android 13. The app never reads where you are.
 - **Start after a restart.** `RECEIVE_BOOT_COMPLETED` is declared for an opt-in "resume relaying after a restart".
-  The receiver is disabled in the manifest and stays inert unless you turn that option on (it is not offered in Settings yet).
+  The receiver is disabled in the manifest and stays inert unless you turn that option on, and Settings does not offer
+  it. So after the phone restarts, MeshLive does not run, and nobody can call you, until you open it again.
 - **Why the app stopped.** At each start the app reads Android's own record of why the previous process ended (for
   example the system freed memory, the phone maker's battery manager stopped it, or you swiped it away) and keeps the newest
   timestamp and the last unexpected reason on the phone, in its private storage and its local log, to explain a missed
@@ -160,6 +231,10 @@ when the screen is off, and what each one can and cannot reveal.
 your own email app. Nothing is sent until you choose to send it. MeshLive adds no identifiers, logs or
 attachments. We only see what you write and the sender information your email app sends, including
 your email address. If no email app is available, you can copy the address instead.
+
+**Report** by itself tells nobody. It blocks the person and hides them on this phone ("Blocked and hidden on this
+phone"); MeshLive and the person you reported learn nothing unless you then tap **Tell MeshLive** and send the email
+yourself.
 
 ## Measurements
 
@@ -211,12 +286,25 @@ problem privately, read [SECURITY.md](../SECURITY.md).
   in an encrypted thread store and file vault on the phone, read receipts are off unless you turn them on, and a contact
   connected over an authenticated link can tell that your app supports the newer format (nothing about it is in any
   advertisement). Older messages stay readable as they were.
-- Your call history (Recent) and the small memories the app keeps about phones it met (which ones speak the newer
-  handshake, Classic Bluetooth addresses, which links were slow on 2M) are also encrypted at rest with a Keystore key,
-  and the emergency wipe deletes them.
+- Your call history (Recent) and the small memories the app keeps about phones it met are also encrypted at rest with a
+  Keystore key: which phones speak the newer handshake, Classic Bluetooth addresses, which links were slow on 2M, the
+  link speeds learned per phone, the people you reported, the live streams you hid, the chats you muted and the Call back
+  of a missed call. Several of them name the other phone by the first characters of its ID; for a stranger in a call that
+  is a throwaway ID, for a verified contact and for every phone on a live stream it is the long-term ID. Each is kept only
+  as long as it is used. A learned link speed is deleted a day after it was measured while the app runs; if the app was
+  closed or Android paused it, that happens when it runs again. A missed call's Call back is kept while its notification
+  shows (checked when the app starts and at the next missed call or Call back) and at most a week, again counted while
+  the app runs or at its next start. A mute stays until you unmute; reports and hidden streams stay until you delete
+  everything. They stay in the app's private storage and are never sent.
+  The emergency wipe, or clearing the app's data, deletes all of these.
 - After you accept a call from a stranger, the other side must prove the identity of whoever holds the call (which may
   be a relaying phone) within seconds, more through relays, or your phone ends the call; until then nothing it sends is
   played and your camera and microphone stay off.
+- When you call a stranger, your name (if you set one) waits until they answer and their phone proves who it is, and it
+  is never sent to someone on your block list. When you answer a stranger, your name waits the same way: it goes only
+  after their phone proves who it is, and never to someone on your block list. If the saved block list cannot be read, nobody is blocked until you reset
+  it: Settings and Blocked people say "Block list can't be read" and offer Reset, and the app logs it. The app keeps
+  calls working rather than stopping every call over a file it cannot read; nobody else can make that file unreadable.
 - **No cloud or device-to-device backup.** The app opts out of Android backup (`allowBackup="false"`) and excludes all its data from cloud backup and from phone-to-phone transfer (Android 12+ data-extraction rules). Its keys live in
   the hardware-backed Keystore and cannot be restored on another phone, so a backup would be useless, and nothing
   about your calls, contacts or messages (for example call history by peer prefix) is sent to Google's backup.
@@ -228,8 +316,8 @@ problem privately, read [SECURITY.md](../SECURITY.md).
 
 - **Discovery is public.** Anyone with a Bluetooth scanner can see that a MeshLive phone is nearby, whether it offers a
   stream or accepts calls, and the stream's rough size and bitrate.
-- **Rotating IDs, with limits.** Announcements carry a random ID that changes every 15 minutes (on by default), so a passive scanner could not follow a phone across the three ID changes we measured. A live stream
-  source's identity, Classic Bluetooth addresses, paired phones, a lone phone's announcement timing and a few capability
+- **Rotating IDs, with limits.** Announcements carry a random ID that changes every 15 minutes (on by default), so a passive scanner could not follow a phone across the three ID changes we measured. The identity of
+  everyone taking part in a live stream (source, viewers and phones passing it on), Classic Bluetooth addresses, paired phones, a lone phone's announcement timing and a few capability
   bits remain linkable; see [What nearby phones can see](#what-nearby-phones-can-see).
 - **Bluetooth metadata.** Bluetooth names and addresses, the existence of a connection, and the size and timing of
   encrypted records are visible to a radio observer and to every relay on the path. That reveals "a call is

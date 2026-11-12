@@ -15,7 +15,8 @@ On Google Play: tap **[Get it on Google Play](https://play.google.com/store/apps
 
 1. On your phone, tap **[Download MeshLive](https://github.com/MeshLive/meshlive-android/releases/latest/download/MeshLive.apk)**.
 2. Open the file. If Android asks, allow your browser to **install unknown apps**, then tap **Install**.
-3. Open MeshLive and allow **Nearby devices**, **Camera** and **Microphone**.
+3. Open MeshLive and allow **Nearby devices** (on Android 10 and 11: **Location**), **Microphone** and, on
+   Android 13 and newer, **Notifications**. It asks for the **Camera** the first time you use video.
 
 The phone must run Android 10 or newer, and both people need MeshLive. The rest of this section covers updates (automatic, inside the app, or from a friend with no internet), the file list, and how to check a download.
 
@@ -33,7 +34,7 @@ MeshLive can check for a newer version itself, but only after you say yes: the f
 
 #### A friend has a newer version
 
-When two phones connect, each tells the other which MeshLive release it runs (in the signed greeting phones already exchange; never in what a phone broadcasts). If a phone this phone connected to (a call, a stream or a relay you started; a stranger who connects to you is not counted) says it runs a newer release you see a quiet note on the home screen. It is only that phone's claim: nothing is downloaded or checked until you pick a file yourself. It explains how to get the file from that phone (Settings > About and updates > Share this app on its screen, or any other way you like), and **Choose the file** checks it the same way before offering to install it. Settings > Tell me about newer versions nearby turns this off, in both directions.
+When two phones connect, each tells the other which MeshLive release it runs (in the signed greeting phones already exchange; never in what a phone broadcasts). On a live stream that greeting is not encrypted, so anyone listening nearby can read the release number too. If a phone this phone connected to (a call, a stream or a relay you started; a stranger who connects to you is not counted) says it runs a newer release you see a quiet note on the home screen. It is only that phone's claim: nothing is downloaded or checked until you pick a file yourself. It explains how to get the file from that phone (Settings > About and updates > Share this app on its screen, or any other way you like), and **Choose the file** checks it the same way before offering to install it. Settings > Tell me about newer versions nearby turns this off, in both directions, with one exception: while "Use Wi-Fi for faster connections" is on, your phone still tells its release on live streams and when it relays a call.
 
 #### No internet at all
 
@@ -119,28 +120,56 @@ Signing certificate SHA-256 (also in each release's notes and `signing-cert.sha2
   and newer some phones turn off full-screen call alerts for apps that are not the phone's dialer; the Calls
   screen then asks once ("Allow full-screen incoming calls") and Settings keeps the link to Android's page.
 - **A call can move to a new Bluetooth link.** On a direct Bluetooth LE (GATT) call, if one direction goes quiet (you can be heard but cannot hear, or the other way round), the app can set up a new link to the same person by itself and keep the same call going, with the same keys. It is not a redial and it never calls anyone else. If the new link cannot be set up within about 12 seconds, the call ends as before. Relayed, Classic and L2CAP calls are not moved.
-- **Experimental: store-and-forward messages** (text, voice notes, photos between accepted contacts) and **calls
-  through up to four relays**.
-- **Names and titles.** An optional name (Settings > Your ID) and an optional stream title on Go live. Leave them
-  empty if you like. Your name is never broadcast: it goes, encrypted, only to people you call. A stream title is
-  public: everyone nearby can read it.
+- **Wi-Fi (optional, off by default).** The top of Settings has one row, "Use Wi-Fi when it helps", with two options under
+  it. "Use Wi-Fi when it helps" lets calls and live streams move to Wi-Fi after they connect over Bluetooth, when both phones support it;
+  Bluetooth stays connected and takes over if Wi-Fi stops. Turned on during a
+  call or live stream, it works from the next one. A call that stays on Bluetooth says why in Link health ("Wi-Fi not
+  used: ..." with the reason, such as battery saver, heat, a 2.4 GHz network, a hotspot or the other phone). While a call or stream is on Wi-Fi, the other phone can reach other
+  apps on your phone that accept network connections; on a live stream that other phone can be any stranger who watches
+  your stream or whose stream you watch, so keep the switch off when you stream with people you do not know. While it is
+  on, anyone listening near a live stream you take part in, and the phones next to yours when it relays a call, can see
+  which MeshLive version you use. On Android 11 and 12 it also needs "Wider reach over
+  Wi-Fi". "Wider reach over Wi-Fi" also finds and connects to people over Wi-Fi, even when Bluetooth is blocked; it uses
+  more battery. On Android 11 and 12 it finds people over Wi-Fi but connects only over Bluetooth, because the phone cannot
+  check that a Wi-Fi link would use the 5 GHz band. Turning it off stops Wi-Fi discovery at once; a Wi-Fi link already open stays until its call or stream
+  ends. "Wi-Fi Direct" is for phones without Wi-Fi Aware; turning it on shows what it does and this phone's own Wi-Fi Direct
+  name, as other phones see it, and waits for "Turn on"; turning it off moves Wi-Fi Direct calls and streams back to
+  Bluetooth at once (a call whose Bluetooth link is not working stays on Wi-Fi until Bluetooth is back or the call ends,
+  with a notice). Turning a switch on asks for the Android permission it needs: "Nearby Wi-Fi devices" on Android 13 and
+  newer. On Android 10 to 12, "Wider reach over Wi-Fi" (Android 11 and 12) and "Wi-Fi Direct" ask for Location instead
+  (choose "Precise") and need Location turned on, because Android allows Wi-Fi discovery only then; the app never reads
+  where you are. If you refuse, the switch stays off, and a switch whose permission was removed later says "Not active". Android 10 phones cannot use Wi-Fi Aware. What each switch shows to nearby devices is in the privacy
+  notes.
+- **Experimental, off unless you turn them on in Settings > Experiments: store-and-forward messages** ("Chats (beta)":
+  text, voice notes, photos between accepted contacts) and **calls through up to four relays** ("Relayed calls (beta)").
+- **Names and titles.** An optional name (Settings > Your name) and an optional stream title on Go live. Leave them
+  empty if you like. Your name is never broadcast: it goes, encrypted, only to the people "Who sees my name" allows. A
+  stream title is public: everyone nearby can read it.
 - **Audio-only live (radio).** Go live with sound only: announcements, an event, a neighbourhood
   channel. It uses a fraction of the Bluetooth capacity of video, reaches more phones, and keeps playing with the
   screen off. Choose it from Go live.
-- **Privacy by default .** A rotating Bluetooth ID ("Private Bluetooth ID"), an identity-hiding call handshake ("Hide my ID from strangers") and throwaway
-  identities for strangers ("New identity for each stranger") are on; each has a switch under Settings > Privacy > Advanced privacy.
+- **Privacy by default.** A rotating Bluetooth ID, an identity-hiding call handshake and throwaway identities for
+  strangers are always on; they have no switch. They protect calls. Live streams are different: while you send, watch
+  or pass on a live stream (video or audio-only), anyone nearby with radio equipment can record your phone's long-term
+  ID. If you must not be linked to a stream, do not watch it or pass it on. Details: [privacy.md](privacy.md).
+- **One name .** "Your name" (Settings) is the name others see, and "Who sees my name" decides who: people you call or who call
+  you, only your contacts, or nobody. It is sent encrypted inside the call, never broadcast; a stranger you call gets it only after they answer and their phone proves who it is, and never if you blocked them; a stranger you answer gets it the same way, only after their phone proves who it is. Your QR code carries it, so a new
+  contact is saved under it (they can rename you). Phones whose name you cannot see show a made-up name such as "Blue Otter".
   "Hide phone name" (Settings > Privacy) is on too, after you say yes on the first start.
 - **Offline app sharing.** Hand the installed APK to a nearby phone (see [No internet at all](#no-internet-at-all)).
-- **Delete everything.** Delete the app's keys and data from inside the app (type DELETE to confirm; an optional
-  triple-tap gesture).
+- **Delete everything.** Settings > Delete everything (the red row at the bottom) deletes the app's keys and data:
+  type DELETE, then tap Delete everything. For a faster way, turn on Settings > Privacy > "Triple-tap to delete
+  everything" (off by default). After that, tap the word "MeshLive" at the top of the Live tab three times quickly: a
+  3-second countdown with Undo appears, then everything is deleted. It works only on the Live tab.
 - **No tracking.** No account, no ads, no analytics, no internet connection for media.
 - **Device-family policy registry.** Known Bluetooth-stack and codec quirks are handled in one registry where each
   entry cites official sources and can be switched off.
 
 ## Use the app
 
-Install the same APK on the phones. Grant Camera, Microphone and Nearby devices through Android's prompts, and
-enable Bluetooth.
+Install the same APK on the phones. Grant Nearby devices (Location on Android 10 and 11), Microphone and, on
+Android 13 and newer, Notifications through Android's prompts on the first start, and enable Bluetooth. The Camera prompt comes the first
+time you use video.
 
 - **Tabs.** The bottom bar has Live (the live streams near you, with Go live pinned at the bottom), Calls (Nearby:
   everyone in range with voice and video buttons; Recent: your call history, tap to call back), Contacts (the people
@@ -151,21 +180,31 @@ enable Bluetooth.
   all is well, or the one thing that needs you (Bluetooth off, permissions, Hidden, battery saver, phone hot); tap it
   for details. Your code and ID are shown only on Add contact (Show my code).
 - **Hide your phone's name.** On the first start, after the permissions, one step asks whether to hide your phone's
-  name. **Hide name** (the default) renames the phone to "Phone": nearby devices no longer see its real name, and a Mac
+  name. **Hide name** (the default) renames the phone to "Phone" for Bluetooth: nearby devices no longer see its real
+  name over Bluetooth (the Wi-Fi Direct switch and Share app nearby still show the phone's own device name), and a Mac
   or PC can call you without a pairing prompt; headphones, your car and other Bluetooth devices also show "Phone".
   **Keep my name** leaves it alone. Change it any time in Settings > Privacy > Hide phone name; turning it off restores
   your original name. If MeshLive may not use Nearby devices, the switch shows off with the reason. People updating
   from an older version who never chose are asked once.
-- **Keeping the app helping in the background.** On the first start a short step ("Keep helping in the background")
+- **Keeping the app helping in the background.** On the first start a short step ("Work with the screen off")
   explains the cost and offers Android's one-tap "allow background running" dialog; "Not now" is fine and the same offer
   comes back once, with the reason, when you switch on Relay video for others or Allow calls, and any time from
-  Settings. A phone that relays can lose battery noticeably faster and may get warm in a bag. Settings > Connection reliability shows only what
+  Settings. A phone that relays can lose battery noticeably faster and may get warm in a bag. The top of Settings > Advanced > Help and feedback shows only what
   needs you: the battery allowance, the phone maker's own battery manager (with the steps for your brand), a recent phone
   update that may have reset those settings, a Bluetooth search the phone maker is pausing, and a note when Bluetooth
   itself looks stuck ("turn Bluetooth off and on"). A healthy phone shows "No background limits found".
+- **Closing the app stops calls.** You can be called only while MeshLive is running. With Allow calls on, leaving it
+  with the Home button keeps it running, and its notification says "Reachable for calls". If you swipe MeshLive away from the recent-apps
+  list, if the phone maker's battery manager stops it, or after the phone restarts, your phone stops announcing itself:
+  nobody can call you, a stream you were sending, watching or passing on stops, and a call in progress is cut (the
+  other person sees a lost connection, not a hang-up). Nothing tells you this has happened; the sign is that the
+  notification is gone. Open MeshLive again to be reachable.
 - **Android 10 and 11: turn Location on.** On those versions Android finds nearby phones over Bluetooth only while the
   phone's Location switch is on, and delivers results in the background only through a notification of type "location".
-  MeshLive never reads or stores where you are; if Location is off, Settings says so and the status points to the switch.
+  MeshLive never reads or stores where you are. If Location is off, nothing on the main screens tells you: the status
+  at the top right still shows "Ready" and Calls says "No one found yet". Only Settings > Advanced > Help and feedback
+  says "Turn on Location so Android lets this phone find nearby phones", with a Fix button that opens Android's
+  Location settings. If nobody shows up on an Android 10 or 11 phone, check the Location switch first.
 - **Video quality: Auto.** Auto chooses the picture size, frame rate and bitrate from how much the Bluetooth
   link to the other phone can carry, starting at 360p for a typical link, and moves up or down while you stream
   or talk; on a very weak link it keeps the audio and drops the video. (Experimental: the measured Auto ladder
@@ -183,8 +222,9 @@ enable Bluetooth.
   or Audio only (the last choice is remembered). Audio only has no camera: add an optional title, pick Voice, Low data
   or Music, tap Start, and watch the level meter and the listener count. Mute keeps the microphone open and sends
   silence, so Android's microphone indicator stays on; Pause stops the microphone; End stops the broadcast. The
-  first time, the app tells you that anyone nearby with MeshLive can listen, including phones that pass it on, and
-  that listeners can tell it is your phone. A reminder appears after 30 minutes without a listener or two hours on the
+  first time, the app tells you that the livestream is public: anyone nearby with MeshLive can listen, it can be
+  passed on to people further away, and listeners, and anyone nearby with radio equipment, can tell it is your phone.
+  The same is true of each listener's phone, and the listening screen says so ([privacy.md](privacy.md#audio-only-live-streams)). A reminder appears after 30 minutes without a listener or two hours on the
   air, and the broadcast stops five minutes after an unanswered reminder. Listeners see the broadcast under Live with a
   radio icon and "Audio only"; tapping it opens a listening screen (title, route, state, level meter, Mute, Stop,
   Block this person) that keeps playing with the screen off. The volume is your phone's media volume; the app never
@@ -204,7 +244,10 @@ enable Bluetooth.
   showing as an ID or, for phones that change their ID, as a made-up two-word name such as "Gold Fox" (a name for picking a
   phone out of a room, not proof of who it is). A name another person gave themselves shows with a tilde, "~Rahul"; the tilde
   means they said it and nobody checked. Your own name for a contact always wins. 0.2.0-beta phones do not show these
-  names, cannot read the new verification code and do not take part in the names features.
+  names, cannot read the new verification code and do not take part in the names features. If you scan the code of a
+  phone that still shows the older kind of code (MeshLive 0.3.0 or older), the contact is saved only as "Checked by
+  code": your phone does not recognise that person nearby and Contacts cannot call them. Ask them to update, then scan
+  each other again.
 - **Messages (Experimental).** With Settings › Experiments › Chats (beta) on, every person in Contacts is also a conversation: the row shows the
   last message (or Photo, Voice note, File), its time, how many are unread and, for your own last message, a small mark for its state.
   Tap a row to open the conversation. The top bar has Back, the name with the verified check, "Nearby" or "Not nearby", voice
@@ -220,7 +263,7 @@ enable Bluetooth.
   by default) and Read receipts (off; both of you must turn them on). A banner appears when something stops messages: a person who is not yet a
   contact, a safety number you still need to compare, keys that changed (nothing is sent until you compare again or accept the new keys), or
   an older app on their side. A new message gives one notification per conversation (channel "Messages" in the system settings, where you choose its sound); a locked phone shows only "New message" unless you allowed names on the lock screen, and the text appears only on an unlocked phone. Tap it to open that conversation; "Mark as read" appears when the notification showed the whole message. Android asks once for permission to show notifications. With the switch off, Contacts keeps its single contact sheet.
-- **Blocking calls.** Settings > Block unknown callers (off by default) declines, without ringing, every call from someone who is not a verified contact; it shows in Recent as "Blocked call", and the caller sees an ordinary decline. Settings > Blocked people lists everyone you blocked and unblocks them; block from a Recent row (press and hold), from a contact, or with "Decline and block" on an incoming call. A blocked person's calls are declined, their live streams and radio are hidden (one that is playing stops as soon as the app knows who is sending it), your phone exchanges no messages with theirs, relays nothing for them and sends them none of your streams, and if they were a contact who could recognise your phone nearby, that stops too (your other contacts then recognise your phone again after your next call with each of them). A block follows the person's real ID, which a phone shows before ringing only to its verified contacts and to phones that do not hide their ID; a stranger calls under a one-time ID that changes every call, so for strangers use Block unknown callers. If you answer a stranger who turns out to be someone you blocked, the call ends within a few seconds without your camera or microphone having been on, and Recent shows a blocked call; if you call a stranger who turns out to be someone you blocked, the call ends within a few seconds before your phone shows them who you are (a name you set may already have been shown when their phone rang).
+- **Blocking calls.** Settings > Block unknown callers (off by default) declines, without ringing, every call from someone who is not a verified contact; it shows in Recent as "Blocked call", and the caller sees an ordinary decline. It does not stop a stranger from tying up your phone: each declined attempt keeps your phone busy for 3 to 7 seconds (so that the caller cannot tell the decline was automatic), and while it is busy nobody else can call you. Someone who keeps calling can keep you hard to reach for your real contacts; the only sign is the "Blocked call" rows in Recent. Settings > Blocked people lists everyone you blocked and unblocks them; block from a Recent row (press and hold), from a contact, or with "Decline and block" on an incoming call. A blocked person's calls are declined, their own live streams and radio are hidden from the list (a copy another phone relays can stay listed, because the list only knows who sends a stream it hears directly; opening it stops it as soon as the app knows who is sending it, and one that is playing stops too), your phone exchanges no messages with theirs, relays nothing for them and sends them none of your streams, and if they were a contact who could recognise your phone nearby, that stops too (your other contacts then recognise your phone again after your next call with each of them). A block follows the person's real ID, which a phone shows before ringing only to its verified contacts and to phones that do not hide their ID; a stranger calls under a one-time ID that changes every call, so for strangers use Block unknown callers. In plain words: blocking a person who is not your verified contact does not stop their phone from ringing yours. "Report" (in the Block dialog and on a nearby person's row) does the same as Block and also keeps the person hidden on your phone; it tells nobody, unless you then tap Tell MeshLive and send the email yourself. If you answer a stranger who turns out to be someone you blocked, the call ends within a few seconds without your camera or microphone having been on, and Recent shows a blocked call; if you call a stranger who turns out to be someone you blocked, the call ends within a few seconds before your phone shows them who you are (your name is not sent to them either). If you call someone whose phone shows it is someone you blocked, their phone rings briefly and the call then ends within a few seconds like any call that is not answered; your name, camera and microphone are not sent to them. If the saved block list can't be read, Settings and Blocked people show "Block list can't be read" with Reset: until you reset it nobody is blocked and calls ring as usual, and Reset unblocks everyone so you can block people again.
 - **Transport and pairing.** LE GATT is the pairing-free default. Classic needs the two phones paired once in Android
   Bluetooth settings (a mutual bond: discovery is BLE, whose rotating private addresses only a bond can resolve, and
   Android hides a phone's own Classic address from apps), unless both phones turn on the experimental Classic without
@@ -233,7 +276,7 @@ enable Bluetooth.
 | Broadcast rate | Requested video rate. The picker maximum is this phone's measured link minus audio and headers (Classic 1500, CoC 1200, GATT 1100 kbps until a first measurement); a choice above the measurement is labelled, never lowered. In Automatic the sender lowers the effective rate only on sustained backlog or late-arrival reports from its own child. |
 | Playback buffer | Adaptive local playout ranges: Low 100-600, Balanced 250-1200, High 500-2500 ms, Auto 250-2000 ms (default). The delay grows only while this link delivers late and shrinks after calm; frames and audio are never dropped to stay inside it. Calls keep their own, shorter budgets. |
 | Fill / full frame | Aspect-preserving local crop or fit; coded size and rate stay the same. |
-| Thermal reduction | Source-local limits; requested versus effective settings stay visible; a critical thermal status stops streaming. |
+| Thermal reduction | Source-local limits; requested versus effective settings stay visible; a critical thermal status stops streaming and turns call video off, while voice calls still ring, start and continue. |
 
 Normal broadcast audio is mono 48 kHz Opus at 32 kbps. Some phone families carry visible call protections that can
 reduce effective video or audio and change buffering (older Qualcomm Android 10-12 stacks are the main case). They
@@ -242,9 +285,21 @@ are policy limits that still need measured challenges, not hardware ceilings; th
 
 ## FAQ
 
-**Does it need the internet or an account?** No. Nothing is sent to a server. Media travels only over Bluetooth. The
-app declares internet and Wi-Fi permissions only for the experimental "Share app nearby" screen, which uses a local
-Wi-Fi Direct link and never contacts the internet.
+**Does it need the internet or an account?** No. There are no accounts and no servers: calls and live streams go
+directly from phone to phone, never through the internet. They use Bluetooth only, unless you turn on a Wi-Fi option
+(Settings > "Use Wi-Fi when it helps"; it and its two options are off by default). With one on, a call or live stream
+can also use a direct Wi-Fi link between the two phones (Wi-Fi Aware or Wi-Fi Direct), still without a router or the
+internet; see "Wi-Fi (optional, off by default)" above. The app declares Android's internet and Wi-Fi permissions for
+three things: those direct Wi-Fi links (Android requires the internet permission for any network connection, even one
+between two phones), the experimental "Share app nearby" screen, which serves the app file over a local Wi-Fi Direct
+link, and, in release-page builds, the update check, which runs only after you say yes (see "Updates inside the app").
+Android asks you for a Wi-Fi permission only when you turn a Wi-Fi switch on or open the share screen: "Nearby Wi-Fi
+devices" on Android 13 and newer, Location on Android 10 to 12 (for "Wider reach over Wi-Fi", "Wi-Fi Direct" and the
+share screen). It is used to find the other phone over Wi-Fi and connect to it; the app never reads where you are.
+
+**Why is my call on Wi-Fi?** If you turned on Wi-Fi in Settings, a call can move to Wi-Fi after it connects. The call screen's
+Link health sheet says "Connection: Wi-Fi" while it is. If Bluetooth is not connected the call stays on Wi-Fi until
+Bluetooth is back or the call ends, even if you turn the Wi-Fi switch off meanwhile; the call shows a notice.
 
 **How far does it reach?** Bluetooth reaches one site, not a city: typically tens of metres in the open and much
 less through walls, and it depends on the two phones. We have not yet run a controlled range test (see
@@ -255,11 +310,22 @@ as voice, but both phones must support it. Relaying extends range, at a cost in 
 serve several direct viewers within its measured link budget. Every hop spends airtime twice, so quality drops
 quickly: in a multi-phone relay test (2026-10-08) relayed or fanned-out viewers played at 0.9-7.6 FPS at 300 kbps.
 Short chains of low-rate video are realistic; long chains of high-rate video are not. Private calls can cross up to
-four relays in the protocol, but the call relay is still a debug feature.
+four relays in the protocol, but the call relay is experimental and off unless you turn on Settings > Experiments >
+Relayed calls (beta).
 
-**Does it work on iPhone?** Not yet. An iOS client is in progress in the sibling repository `MeshLive/meshlive-ios`,
-and Android's "Find iPhones" discovery switch (on by default) is ready for it. Until then, both phones must run
-Android 10 or newer.
+**Does it work with an iPhone or a Mac?** Only in part, and not out of the box. The iPhone and Mac app is a source
+build that you compile yourself (see the Download table in the [README](../README.md)). Android
+looks for iPhones by default ("Find iPhones" under Settings > Advanced > Connection); an iPhone whose app is in the
+background cannot be found. The Apple app as currently published has its three privacy options (rotating IDs, hidden
+identities, pseudonyms toward strangers) off, and with them off it does not see an Android phone running this version
+and neither can call the other. Turn all three on in the Apple app first. This Android version cannot turn its own
+off to meet it.
+
+**What about older MeshLive versions?** Update both phones when you can. A phone on 0.4.4 or older whose owner turned
+its private (rotating) Bluetooth ID switch off does not see a phone with this version at all, and nothing on that
+phone says why; your phone still lists it. A version from before 0.2.0-beta, or an older version with its
+identity-hiding switches off, cannot call or be called by this version. A contact added by scanning the code of a
+0.3.0 or older phone is not recognised nearby (see Contacts and names above).
 
 **What about battery?** Bluetooth LE is frugal, but live video keeps the camera, encoder and radio busy, so expect
 substantial drain while broadcasting. Forwarding pauses itself below 20% battery (when not charging) or in Battery

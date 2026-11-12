@@ -7,6 +7,7 @@ import javax.crypto.spec.SecretKeySpec
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -92,6 +93,70 @@ class CallBlockingTest {
             assertTrue(delay >= CallBlockingPolicy.DECLINE_DELAY_MIN_MS)
             assertTrue(delay < CallBlockingPolicy.DECLINE_DELAY_MIN_MS + CallBlockingPolicy.DECLINE_DELAY_SPREAD_MS)
         }
+    }
+
+    // ---- a call this phone makes (AB3, Windows WP6N real-key screen) ----
+
+    /**
+     * AB3: a callee whose endpoint handshake shows the real key of someone this phone blocked ends the call the ordinary
+     * way, as after a blocked reveal. Only that full fingerprint counts. A throwaway callee is judged at its reveal and a
+     * callee judges its caller at the Invite, so neither asks the list here.
+     */
+    @Test
+    fun aCallerEndsTheCallWhenTheCalleeShowsABlockedPersonsRealKey() {
+        val blocked = fingerprint(1)
+        val someoneElse = fingerprint(2)
+        PersonPolicy.installForTest(setOf(blocked))
+        try {
+            assertTrue(CallBlockingPolicy.endsRealKeyCall(caller = true, peerPseudonymous = false, blocked = { PersonPolicy.blocked(blocked) }))
+            assertFalse(CallBlockingPolicy.endsRealKeyCall(caller = true, peerPseudonymous = false, blocked = { PersonPolicy.blocked(someoneElse) }))
+            var asked = 0
+            assertFalse(CallBlockingPolicy.endsRealKeyCall(caller = true, peerPseudonymous = true, blocked = { asked++; true }))
+            assertFalse(CallBlockingPolicy.endsRealKeyCall(caller = false, peerPseudonymous = false, blocked = { asked++; true }))
+            assertEquals("a throwaway callee or the callee role never asks the list here", 0, asked)
+        } finally {
+            PersonPolicy.resetForTest()
+        }
+    }
+
+    /** AB3, CF-CALL-24: an unreadable block list blocks nobody, so a real-key call then goes on as for anyone else. */
+    @Test
+    fun anUnreadableBlockListEndsNoRealKeyCall() {
+        val person = fingerprint(1)
+        store().add(person)
+        val otherKey = AesGcmAtRestCipher { SecretKeySpec(ByteArray(32) { 9 }, "AES") }
+        BlockedPeople.installForTest(BlockedPeopleStore(file, otherKey, onUnreadable = {}))
+        try {
+            PersonPolicy.install(FakePhone(File(base, "phone")).start())
+            assertFalse(CallBlockingPolicy.endsRealKeyCall(caller = true, peerPseudonymous = false, blocked = { PersonPolicy.blocked(person) }))
+        } finally {
+            PersonPolicy.resetForTest()
+        }
+    }
+
+    /**
+     * AB3 (S4): the presence session a caller builds at the handshake with a blocked person takes no part, even with a
+     * verified contact whose switch is on: no OFFER, no LEASE in answer to theirs, and nothing of theirs is stored.
+     */
+    @Test
+    fun aBlockedRealKeyCalleeGetsNoPresenceAndGivesNone() {
+        val reason = PresenceEligibility.reason(
+            vaultPresent = true,
+            persistent = true,
+            peerState = VerificationState.VERIFIED,
+            visibleToThem = true,
+            blocked = true,
+        )
+        assertNotNull(reason)
+        val session = PresenceSession(reason == null)
+        assertTrue("no OFFER", session.start().isEmpty())
+        assertTrue("no LEASE in answer to their OFFER", session.onRecord(DiscoveryExchange.RecognitionOffer, peerVerifiedNow = true).isEmpty())
+        val epoch = 1_990_656L
+        val theirLease = DiscoveryExchange.PresenceLease(7, epoch, PresenceLeases.dayOf(epoch), List(28) { ByteArray(32) { 1 } })
+        assertTrue(
+            "nothing of theirs is stored",
+            session.onRecord(theirLease, peerVerifiedNow = true).none { it is PresenceSession.Action.StoreLease },
+        )
     }
 
     // ---- store ----
@@ -200,14 +265,65 @@ class CallBlockingTest {
 
     private fun prefixOf(announcement: DiscoveryAnnouncement) = announcement.nodeIdPrefix.joinToString("") { "%02x".format(it) }
 
+    /**
+     * Review 2026-11-06 (finding 2): the token and the advertised prefix are chosen by the advertiser, so only the cost-0
+     * route attributed to a blocked person is hidden. A relayed copy stays listed; watching it leaves as soon as its
+     * source authenticates as the blocked person (aRelayedCopyLeavesTheListOnceItsSourceAuthenticatedAsTheBlockedPerson).
+     */
     @Test
-    fun aBlockedSourcesStreamIsHiddenWithTheRoutesThatRelayIt() {
+    fun aBlockedPersonsOwnDirectRouteIsHiddenAndARelayedCopyStaysListed() {
         val blockedSource = offer(0x10, cost = 0, logical = 1111)
         val relayOfBlocked = offer(0x40, cost = 1, logical = 1111)
         val other = offer(0x20, cost = 0, logical = 2222)
         val peers = listOf(blockedSource, relayOfBlocked, other)
         val visible = CallBlocking.hideBlockedStreams(peers, { it }, setOf(prefixOf(blockedSource)), { null })
-        assertEquals(listOf(other), visible)
+        assertEquals(listOf(relayOfBlocked, other), visible)
+    }
+
+    /** A blocked person who copies a genuine broadcast's token hides only its own direct route, never the genuine one. */
+    @Test
+    fun aSpoofedAttributedRouteCannotHideAnotherAdvertisersRoutesOfTheSameToken() {
+        val spoofer = offer(0x10, cost = 0, logical = 42)
+        val spooferRelay = offer(0x40, cost = 1, logical = 42)
+        val genuine = offer(0x30, cost = 0, logical = 42)
+        val genuineRelay = offer(0x50, cost = 1, logical = 42)
+        assertEquals(spoofer.logicalStreamToken(), genuine.logicalStreamToken())
+        val peers = listOf(spoofer, spooferRelay, genuine, genuineRelay)
+        val visible = CallBlocking.hideBlockedStreams(peers, { it }, setOf(prefixOf(spoofer)), { null })
+        assertEquals(listOf(spooferRelay, genuine, genuineRelay), visible)
+    }
+
+    @Test
+    fun unblockingBringsTheAttributedRouteBack() {
+        val blocked = offer(0x10, cost = 0, logical = 7)
+        val other = offer(0x20, cost = 0, logical = 8)
+        val peers = listOf(blocked, other)
+        assertEquals(listOf(other), CallBlocking.hideBlockedStreams(peers, { it }, setOf(prefixOf(blocked)), { null }))
+        assertEquals(peers, CallBlocking.hideBlockedStreams(peers, { it }, emptySet(), { null }))
+    }
+
+    /**
+     * The relayed copy the list could not attribute: once a viewer joined it and its source authenticated as the blocked
+     * person (MainActivity onMediaSourceAuthenticated, AudioLiveController.onListenFormat), that route leaves the list;
+     * another relay's route of the same token stays.
+     */
+    @Test
+    fun aRelayedCopyLeavesTheListOnceItsSourceAuthenticatedAsTheBlockedPerson() {
+        PersonPolicy.resetForTest()
+        try {
+            val blockedSource = offer(0x10, cost = 0, logical = 9)
+            val relayOfBlocked = offer(0x40, cost = 1, logical = 9)
+            val otherRelaySameToken = offer(0x50, cost = 1, logical = 9)
+            val peers = listOf(blockedSource, relayOfBlocked, otherRelaySameToken)
+            fun visible() = CallBlocking.hideBlockedStreams(
+                peers, { it }, setOf(prefixOf(blockedSource)), { null }, PersonPolicy::streamHidden,
+            )
+            assertEquals(listOf(relayOfBlocked, otherRelaySameToken), visible())
+            PersonPolicy.hideStream(relayOfBlocked)
+            assertEquals(listOf(otherRelaySameToken), visible())
+        } finally {
+            PersonPolicy.resetForTest()
+        }
     }
 
     @Test

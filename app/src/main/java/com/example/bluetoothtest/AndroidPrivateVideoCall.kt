@@ -96,6 +96,8 @@ class AndroidPrivateVideoCall(
     private val relayHelper: RelayHelperHost? = null,
     /** Call blocking (CallBlocking.kt): decides at INVITE time whether an incoming call may ring. Local only. */
     private val callGate: CallGate = CallBlocking.gate(context),
+    /** AB3/AP3 D2: a blocked call's ordinary end is scheduled (the caller's ringback must stop at once). */
+    private val onBlockedEndScheduled: () -> Unit = {},
 ) : Closeable {
     private sealed interface OutboundControl {
         data class Signal(val message: PrivateCallSignalMessage, val closeAfter: Boolean = false) : OutboundControl
@@ -116,6 +118,9 @@ class AndroidPrivateVideoCall(
 
         /** Experimental in-call link renewal: one `RENEW` record (BME1 type 12), ordered with the signals. */
         class Renew(val payload: ByteArray) : OutboundControl
+
+        /** Wi-Fi upgrade: one `BWF1` hop record for carrier [carrier] (not sealed under BME1), ordered with the other controls. */
+        class Wifi(val carrier: Int, val payload: ByteArray) : OutboundControl
     }
 
     private data class OutboundMedia(
@@ -163,6 +168,19 @@ class AndroidPrivateVideoCall(
         val phySummary: () -> String = { "" },
         /** Experimental dual listening: the transport this incoming link arrived on when it is not the endpoint's own. */
         val arrivedOn: BluetoothTransportOption? = null,
+        /** The kind of byte stream this connection is; A8's native Wi-Fi call link sets WIFI_AWARE. */
+        val carrierKind: CarrierKind = CarrierKind.BLUETOOTH,
+        /** A8/F-3: the consumer calls this once the BMH3/BMH2 link handshake on this connection succeeded. */
+        val onAuthenticated: () -> Unit = {},
+        /**
+         * `test_call_1m_first` / `test_call_1m_first_coc`: asks this live link for a PHY (the GATT client, or the CoC control
+         * link); null unless it opened 1M-first.
+         */
+        val requestPhy: ((BlePhyPreference) -> Boolean)? = null,
+        /** Experimental `test_slow_2m_in_place`: asks this live outgoing LE link for a PHY now (GATT client, or the CoC control link). */
+        val movePhy: ((BlePhyPreference) -> Boolean)? = null,
+        /** Experimental `test_slow_2m_in_place`: reads the link's PHY (no LL procedure) so [phySummary] follows a move. */
+        val readPhy: (() -> Boolean)? = null,
     ) : Closeable {
         override fun close() = closeConnection()
     }
@@ -263,8 +281,18 @@ class AndroidPrivateVideoCall(
     @Volatile var endedQuietly = false
         private set
 
+    /**
+     * Design PP package A: the phases (generation, monotonic milestones and the two default-off incoming timers) of the connection
+     * this endpoint accepted last. A new accept replaces it, and a timer only ever closes the connection it was armed for.
+     */
+    @Volatile private var incomingPhases: IncomingPhaseTimers? = null
+    private val incomingPhaseGeneration = java.util.concurrent.atomic.AtomicLong()
+
     /** Call blocking after a stranger's reveal (review 2026-10-27, finding 2): media is dropped, Recent names nobody. */
-    @Volatile private var blockedAfterReveal = false
+    private val blockedCall = BlockedCallLatch()
+
+    /** AB3/AP3 D2: a blocked person ended this call and its ordinary end is pending (no ringback meanwhile). */
+    fun blockedEndScheduled(): Boolean = blockedCall.active
 
     /** The route the current outgoing call asked for (relayed calls only) and when its setup began. */
     @Volatile private var pendingRelayRoute: RelayRoute? = null
@@ -276,12 +304,19 @@ class AndroidPrivateVideoCall(
 
     /** True while this phone relays someone else's call. */
     val relayingNow: Boolean get() = relayDuty != null
+    /**
+     * True while an incoming (or outgoing) link is accepted, including one that has not delivered its first record yet:
+     * the caller's phase is still null then, but rebuilding the endpoint would close the link under its peer.
+     */
+    val acceptedLinkNow: Boolean get() = callRunning.get() || connection != null
     /** Epoch of the call offer on air (rotating IDs only); -1 when none. */
     @Volatile private var advertisedEpoch = -1L
     /** The offer on air is a Visible-by-handle window (version 2) rather than a rotating ID. */
     @Volatile private var advertisedVisible = false
     /** Advances when a boundary restart closes the listener on purpose, so its accept thread stays quiet. */
     @Volatile private var listenerGeneration = 0
+    /** Wider reach, Bluetooth off: only the Wi-Fi offer is on air; no Bluetooth listener or advertiser exists. */
+    @Volatile private var wifiOnlyListening = false
     /** Counts stopAvailability calls not caused by an incoming connection (calls, exchanges, close). */
     @Volatile private var fullAvailabilityStops = 0
     private val boundaryListener: (Long) -> Unit = { epoch -> onDiscoveryBoundary(epoch) }
@@ -314,6 +349,8 @@ class AndroidPrivateVideoCall(
             }
         }
     private val running = AtomicBoolean(true)
+    /** startAvailability publishes under this fence, so a close() that overtook it never leaves its listener up (CallEndpointStarts.kt). */
+    private val listenerStartFence = ListenerStartFence(running)
     private val callRunning = AtomicBoolean(false)
     private val endedCallbackSent = AtomicBoolean(false)
     /** Set when this phone's own media pipeline ended the call; reported instead of "Call ended". */
@@ -357,10 +394,212 @@ class AndroidPrivateVideoCall(
     @Volatile private var bleControlConnection: BleL2capControlConnection? = null
     /** System.nanoTime when this call's hop link authenticated (0 = not yet); for early-loss memory. */
     @Volatile private var authenticatedAtNs = 0L
+    /** Hop-local measurements of one carrier (the Bluetooth carrier's values are the call's old fields, see below). */
+    private class CarrierLinkState {
+        @Volatile var lastHeartbeatNs = 0L
+        @Volatile var lastSendProgressNs = 0L
+        @Volatile var receivedDelivery = LinkDeliveryCounter()
+        @Volatile var peerDelivery = PeerDeliveryEstimate()
+        @Volatile var deliveryReports = CallDeliveryReports(enabled = true)   // carrier 0: the call's value, set in establish as today; an added carrier: DebugTunables.deliveryReports (stateOf, amendment 18)
+        @Volatile var helloSent = false   // amendment 18: the version-1 hello of an added carrier was handed to its writer
+    }
+    private val carrierState0 = CarrierLinkState()
+    private val extraCarrierStates = java.util.concurrent.ConcurrentHashMap<Int, CarrierLinkState>()
+    private fun stateOf(id: Int): CarrierLinkState = if (id == 0) carrierState0 else extraCarrierStates.computeIfAbsent(id) { CarrierLinkState().also { it.deliveryReports = CallDeliveryReports(DebugTunables.deliveryReports) } }   // amendments 18, 20 d
+
+    /** The sink sealed content goes to (null = the link's own writer): the carrier router after fan-out. */
+    @Volatile private var contentSink: RecordSink? = null
+
+    private fun sinkFor(link: SecureBluetoothSession): RecordSink = contentSink ?: link.writer
+
+    /** Placeholder marker codec: nothing can reach it before A5 installs its codec (it needs a second carrier). [X3] */
+    private object CallMarkerCodec : CarrierMarkerCodec {
+        override fun encode(wire: CarrierCutover.Wire): ByteArray = throw IllegalStateException("no BWF1 codec yet")
+
+        override fun decode(payload: ByteArray): CarrierCutover.Wire? = null
+    }
+
+    /** The call's carrier host: what [CarrierSet] calls. Carrier 0 is the Bluetooth link; every method may run on any thread. */
+    private inner class CarrierHost(
+        private val endpoint: EndToEndVideoSession,
+        private val initiator: Boolean,
+    ) : CarrierSet.Host {
+        override fun heard(carrierId: Int, generation: Int): Boolean {
+            if (carrierId != 0) {
+                stateOf(carrierId).lastHeartbeatNs = System.nanoTime()
+                return true
+            }
+            // SW1 F3: with the switch the liveness stamp is taken before the record lock, which a blocked consumer can hold for seconds.
+            return heardOnBluetoothLink(
+                CutoverSwitches.livenessBeforeRecordLock,
+                recordLock,
+                generation,
+                { linkGeneration.get() },
+                { lastHeartbeatNs = System.nanoTime() },
+            ) {
+                if (generation != reassemblerLinkGen) {
+                    reassemblerLinkGen = generation
+                    if (videoReassembler.enterLinkGeneration(generation)) {
+                        Log.i("BluetoothVideo", "BENCHMARK call_video_fragments: renewal_dropped_partial_frame | gen=$generation")
+                    }
+                }
+                lastHeartbeatNs = System.nanoTime()
+                noteRenewedLinkHeard()
+            }
+        }
+
+        override fun onHeartbeat(carrierId: Int, generation: Int, record: SecureRecord) {
+            synchronized(recordLock) {
+                if (carrierId == 0 && generation != linkGeneration.get()) return
+                if (carrierId == 0) noteRenewalPeerHeard()
+                val report = SecureLinkControlProtocol.requireHeartbeat(record)
+                if (report == null) notePeerHeartbeat(carrierId, null) else onPeerReport(carrierId, report)
+            }
+        }
+
+        override fun deliver(carrierId: Int, generation: Int, payload: ByteArray) {
+            synchronized(recordLock) {
+                if (carrierId == 0 && generation != linkGeneration.get()) return
+                val content = endpoint.opener.open(payload)
+                if (carrierId == 0 && content.type != EndToEndContentType.RENEW) noteRenewalPeerHeard()
+                arrivalCarrier = carrierId
+                handleContent(content, initiator)
+            }
+        }
+
+        override fun onWifiRecord(carrierId: Int, payload: ByteArray) {
+            peerSentWifiRecord = true   // an authenticated BWF1 record: the peer reads BWF1 (R-1, a BMH3 initiator's proof)
+            val handler = wifiRecordHandler
+            if (handler != null) {
+                handler(carrierId, payload)
+            } else {
+                Log.i("BluetoothVideo", "wifi_record_unhandled kind=${payload.firstOrNull() ?: -1}")
+            }
+        }
+
+        override fun onCutoverAction(action: CarrierCutover.Action) {
+            when (action) {
+                CarrierCutover.Action.ForceLocalKeyframe -> onLocalKeyFrameNeeded()
+                CarrierCutover.Action.RequestPeerKeyframe -> controls.offerKeyed("key-frame-request", OutboundControl.KeyFrameRequest)
+                CarrierCutover.Action.ReassertState -> reassertAfterRenewal()
+                CarrierCutover.Action.ResetSendFragments -> abandonFrame = true
+                CarrierCutover.Action.SuppressFragments -> synchronized(recordLock) {
+                    if (videoReassembler.discardUntilFrameStart()) {
+                        Log.i("BluetoothVideo", "BENCHMARK call_video_fragments: carrier_dropped_partial_frame")
+                    }
+                }
+                else -> Unit
+            }
+        }
+
+        override fun onSendCarrierChanged(sendOn: Int, kind: CarrierKind?, reason: String) {
+            activeCarrierLabel = if (kind == null || kind == CarrierKind.BLUETOOTH) null else kind.label
+            LinkChangeEvents.sendCarrierChanged(reason)
+            if (kind != null && !kind.isWifi && reason != "attach") {
+                // Back on Bluetooth: the pacer's seed describes a Bluetooth link again.
+                if (pacedWrites) LinkPacerSeed.seed(pacer, transport, carrier = CarrierKind.BLUETOOTH)
+            }
+            if (reason != "attach") onStatus(if (kind != null && kind.isWifi) WifiCallNotices.MOVED_TO_WIFI_STATUS else WifiCallNotices.BACK_ON_BLUETOOTH_STATUS)
+            if (BuildConfig.DEBUG && reason != "attach") Log.i("BluetoothVideo", "BENCHMARK carrier_switch: to=${kind?.name ?: "none"} | reason=$reason | live=${carriers?.liveCount()}")
+            notifyCarrierListeners(CarrierEvent.SEND_CHANGED, sendOn, kind, reason)
+        }
+
+        override fun onEndSession(reason: String) {
+            val error = lastLossError
+            val current = state
+            // SW1 END: a call this phone ended always finishes as "Call ended", whichever carrier failure raced the hang-up.
+            when (privateCallEndSessionAction(error != null, callRunning.get(), current?.phase, current?.callId, localEndCallId)) {
+                EndSessionAction.FINISH_LOCAL_END -> finish(CALL_ENDED_MESSAGE)
+                EndSessionAction.LINK_ERROR -> onCallLinkError(requireNotNull(error), lastLossMessage ?: "Call link lost")
+                EndSessionAction.FAIL -> fail(lastLossMessage ?: "Call link lost")
+            }
+        }
+
+        /**
+         * The heartbeat a fan-out carrier writer sends: this phone's view of the media it receives on that carrier.
+         * Only the carrier that currently receives media reports the receiver's lateness; a standby reports arrival only.
+         */
+        override fun heartbeatPayload(carrierId: Int): ByteArray? {
+            val set = carriers ?: return null
+            if (carrierId == 0 && !set.fanout) return null
+            val carrierState = stateOf(carrierId)
+            if (carrierId != 0 && carrierState.deliveryReports.sendsHello && !carrierState.helloSent) {
+                // The plain version-1 hello tells the peer this hop accepts version 3 reports.
+                carrierState.helloSent = true
+                return null
+            }
+            val arrivalKbps = set.linkOf(carrierId)?.reader?.arrivalCapacityKbps() ?: 0
+            val report = if (set.acceptCarrier == carrierId) {
+                mediaReceiver?.takeLinkReport(arrivalKbps) ?: LinkCapacityReport(arrivalKbps, linkLate = false)
+            } else {
+                LinkCapacityReport(arrivalKbps, linkLate = false)
+            }
+            val delivery = carrierState.deliveryReports.deliveryFor(state != null, relayHops) { carrierState.receivedDelivery.snapshot() }
+            return SecureLinkControlProtocol.encodeCapacityReport(report.copy(delivery = delivery))
+        }
+
+        // Review A3 P1-2 (step 9 item 4): in fan-out the monitor judges the Bluetooth carrier with today's stall rule.
+        override fun bluetoothSilent(carrierId: Int): Boolean {
+            val s = stateOf(carrierId)
+            return CarrierLossPolicy.bluetoothSilent(
+                stallTolerance || renewalPossible(),
+                System.nanoTime(),
+                s.lastHeartbeatNs,
+                s.lastSendProgressNs,
+                renewalOwnsLiveness(),
+            )
+        }
+
+        override fun onProgress(carrierId: Int, nowNs: Long) {
+            stateOf(carrierId).lastSendProgressNs = nowNs
+        }
+
+        override fun onProtocolError(carrierId: Int, message: String) {
+            throw IllegalStateException(message)
+        }
+
+        override fun onConsumerError(error: Exception) {
+            if (error is LocalMediaPipelineException) {
+                if (callRunning.get() && state?.phase != PrivateCallPhase.ENDED) endForLocalMediaFailure(error)
+            } else {
+                // A call whose only carrier is Wi-Fi (A8 step 11): the notice says the Wi-Fi link ended (AM 29).
+                val message = if (connection?.description == WifiCallNotices.LABEL) WifiCallNotices.WIFI_NATIVE_ENDED
+                else "Call link lost: ${error.message ?: error.javaClass.simpleName}"
+                onCallLinkError(error, message)
+            }
+        }
+
+        override fun requeueUndelivered(cookies: List<Any>) {
+            requeueSignals(cookies.filterIsInstance<OutboundControl>())
+        }
+
+        override fun atFrameBoundary(): Boolean = !midVideoFrame
+
+        override fun renewalBusy(): Boolean = this@AndroidPrivateVideoCall.renewalBusy()
+
+        override fun onCarrierEvent(event: CarrierEvent, carrierId: Int, kind: CarrierKind?, reason: String) {
+            if (event == CarrierEvent.ENDED) extraCarrierStates.remove(carrierId)
+            notifyCarrierListeners(event, carrierId, kind, reason)
+        }
+
+        override fun log(line: String) {
+            Log.i("BluetoothVideo", line)
+        }
+    }
+
     /** System.nanoTime of the last call-writer flush that returned (send-side progress). */
-    @Volatile private var lastSendProgressNs = 0L
+    private var lastSendProgressNs: Long
+        get() = carrierState0.lastSendProgressNs
+        set(value) {
+            carrierState0.lastSendProgressNs = value
+        }
     /** Advertised prefix of a relayed outgoing offer (null for direct or incoming calls). */
     @Volatile private var offerViaPrefix: String? = null
+    /**
+     * Experimental test_phy_direction_split: the split remembered for the peer of the current dial, with the address it was
+     * looked up for (null: none); the GATT dial to that address asks for it at setup.
+     */
+    @Volatile private var dialPhySplit: Pair<String, GattPhySplit>? = null
     /** System.nanoTime when this call first became ACTIVE (0 = not yet); the early-loss window start. */
     @Volatile private var activeAtNs = 0L
     /** PHY this endpoint asked for on the current LE link (both roles; 2M unless remembered or retried). */
@@ -372,8 +611,37 @@ class AndroidPrivateVideoCall(
     /** Review A1: the call this phone ended itself (End/Cancel/Decline); a later link failure finishes it. */
     @Volatile private var localEndCallId: UUID? = null
     @Volatile private var connection: CallConnection? = null
+
+    /** Experimental `test_call_1m_first`: the upgrade/fallback decisions of a call that opened 1M-first; null for every other call. */
+    @Volatile private var phyFirstGate: CallPhyUpgradeGate? = null
     @Volatile private var secureSession: SecureBluetoothSession? = null
     @Volatile private var contentSession: EndToEndVideoSession? = null
+
+    // ----- Wi-Fi upgrade (Design WF, package A3): the call's carriers; carrier 0 is the Bluetooth link -----
+    /** The call's carriers. Created per link establishment; carrier 0 is the Bluetooth link. */
+    @Volatile private var carriers: CarrierSet? = null
+    /** The marker codec the cutover uses; A5 installs its `WifiMarkerCodec` from `createWifiHop`. [X3] */
+    @Volatile internal var markerCodec: CarrierMarkerCodec = CallMarkerCodec
+    private val markerForwarder = object : CarrierMarkerCodec {
+        override fun encode(wire: CarrierCutover.Wire) = markerCodec.encode(wire)
+
+        override fun decode(payload: ByteArray) = markerCodec.decode(payload)
+    }
+    /** Carrier 0's real link generation whose records the reassembler holds (guarded by `recordLock`). */
+    private var reassemblerLinkGen = Int.MIN_VALUE
+    /** Fan-out: a fragmented video frame is being written (the cutover must wait for a frame boundary). */
+    @Volatile private var midVideoFrame = false
+    /** `ResetSendFragments`: the fragment writer stops after the fragment it is writing. */
+    @Volatile private var abandonFrame = false
+    /** The carrier the record being handled arrived on (its own delivery counters). */
+    @Volatile private var arrivalCarrier = 0
+    /** Why the last carrier died, for `Host.onEndSession` (the cutover holds the end, not the error). */
+    @Volatile private var lastLossError: Exception? = null
+    @Volatile private var lastLossMessage: String? = null
+    /** A5 (Wi-Fi upgrade) sets this before the call is ACTIVE; called on the reader or consumer thread and must not block. [API] */
+    @Volatile var wifiRecordHandler: ((carrierId: Int, payload: ByteArray) -> Unit)? = null
+    /** The peer sent this call an authenticated `BWF1` record (R-1: what proves a BMH3 initiator's peer reads them). */
+    @Volatile private var peerSentWifiRecord = false
     @Volatile private var listenerThread: Thread? = null
     @Volatile private var connectionThread: Thread? = null
     @Volatile private var writerThread: Thread? = null
@@ -383,7 +651,11 @@ class AndroidPrivateVideoCall(
     /** A connection that arrived during an exchange; answered as a call once the exchange stops. */
     @Volatile private var pendingCallConnection: CallConnection? = null
     @Volatile private var mediaReceiver: PrivateCallMediaReceiver? = null
-    @Volatile private var lastHeartbeatNs = 0L
+    private var lastHeartbeatNs: Long
+        get() = carrierState0.lastHeartbeatNs
+        set(value) {
+            carrierState0.lastHeartbeatNs = value
+        }
     /** F19: when this call started ringing (elapsedRealtime), for the ring timeout and the callee's "Missed call". */
     @Volatile private var ringingSinceMs: Long? = null
     /** F17 Stage A (Experimental, `test_call_stall_tolerance`), fixed for this endpoint. */
@@ -395,6 +667,9 @@ class AndroidPrivateVideoCall(
     private val renewalOn = DebugTunables.callLinkRenewal
     /** Both end-to-end hellos of this call carried bit 4. */
     @Volatile private var renewalNegotiated = false
+
+    /** Wi-Fi carrier (A5): the per-call attempt owner; null on verification scans, peers without BWF1 and a call whose carrier 0 is itself Wi-Fi (A8 native link); relayed calls are included. [R M-3][X14] */
+    @Volatile private var wifiHop: WifiHopAgent? = null
     /** This endpoint's end-to-end role in the call: 0 caller, 1 callee (collision rule). */
     @Volatile private var renewalRole = 0
     @Volatile private var renewalOfferer = RenewalOfferer(SystemClock::elapsedRealtime)
@@ -427,6 +702,8 @@ class AndroidPrivateVideoCall(
     @Volatile private var activeCodec = codec
     /** codec_power_aware: the power state read once, when this call first chooses its codec; never re-read mid-call. */
     @Volatile private var codecPowerAtStart: CodecPowerState? = null
+    /** AP5 `test_sw_shortfall_avc`: the remembered software-encoder shortfalls, read once with [codecPowerAtStart]. */
+    @Volatile private var slowSoftwareAtStart: Set<String>? = null
     @Volatile private var activePlaybackDelayProfile = playbackDelayProfile
     @Volatile private var relayHops = 0
     @Volatile private var peerMaxBitrateKbps: Int? = null
@@ -494,11 +771,20 @@ class AndroidPrivateVideoCall(
     @Volatile var onQrScanReached: ((IdentityFingerprint, NodeId) -> Unit)? = null
 
     /**
-     * Naming v2: what the caller still holds back and until when ([CallLabelPolicy]). A name or subject whose moment is
-     * [LabelSendMoment.AFTER_REVEAL], [LabelSendMoment.AFTER_REVEAL_IF_VERIFIED] or [LabelSendMoment.AFTER_OPENING] is
-     * queued by the reveal or the opening handler; [LabelSendMoment.NOW] was queued before the Invite.
+     * Naming v2: the caller's name in this call, held and released only by [CallerNameRelease] (planned before the Invite;
+     * released after a relayed callee's OPENING or after the callee's verified, unblocked REVEAL; design decision
+     * 2026-11-06). The container is the same `BLB1` record as before, signed by [endpointSigner] for this call ID.
      */
-    @Volatile private var heldLabels = CallerLabelPlan(LabelSendMoment.NEVER, LabelSendMoment.NEVER)
+    private val callerNames = CallerNameRelease(
+        signName = {
+            LocalLabels.signed(endpointSigner, LabelKind.PERSON_NAME, LabelBinding.call(requireNotNull(state).callId), PeerLabelFeature.localName)
+        },
+        offerLabels = { container -> controls.offerMust(OutboundControl.Labels(container)) },
+        onSent = { count -> Log.i("BluetoothVideo", "BENCHMARK peer_labels call_tx: role=caller | count=$count") },
+        onWithheld = { reason ->
+            if (BuildConfig.DEBUG) Log.i("BluetoothVideo", "BENCHMARK call_label_withheld: role=caller | reason=${reason.name.lowercase()}")
+        },
+    )
 
     /** The key this phone signed its end-to-end handshake with (the real identity, or the pseudonym it presented). */
     @Volatile private var endpointSigner: SigningIdentity = identity
@@ -506,8 +792,19 @@ class AndroidPrivateVideoCall(
     /** The callee's pinned opening entries, kept for its reveal (a pseudonymous callee sends no OPENING at the Invite). */
     @Volatile private var revealEntries: List<OpeningEntry> = emptyList()
     @Volatile private var awaitedOpening: AwaitedOpening? = null
-    /** Callee, audience "Only people I verified" in a stranger session: the name waits for the caller's verified reveal. */
-    @Volatile private var pendingRevealLabels: ByteArray? = null
+    /**
+     * Callee, in a stranger session: the name waits for the caller's verified reveal and block check (audience "Only people I
+     * verified", or "Everyone" with `test_callee_name_after_reveal` (default on), audit CALL-06). Held by [CalleeNameRelease].
+     */
+    private val calleeNames = CalleeNameRelease(
+        offerLabels = { container ->
+            controls.offerMust(OutboundControl.Labels(container))
+            if (BuildConfig.DEBUG) Log.i("BluetoothVideo", "BENCHMARK peer_labels call_tx: role=callee | count=1")
+        },
+        onWithheld = { reason ->
+            if (BuildConfig.DEBUG) Log.i("BluetoothVideo", "BENCHMARK call_label_withheld: role=callee | reason=${reason.name.lowercase()}")
+        },
+    )
 
     /** Callee: the role-0 entries pinned when the connection was accepted, sent once with the answer to the Invite. */
     @Volatile private var openingToSend: List<OpeningEntry>? = null
@@ -519,8 +816,6 @@ class AndroidPrivateVideoCall(
     private var callLabels: LabelInbox? = null
     /** R1: this callee's own name, signed at Invite time, sent only with Accept (or at Ringing to a verified contact). */
     @Volatile private var pendingAcceptLabels: ByteArray? = null
-    /** Subject typed for this outgoing call (captured when the call starts). */
-    @Volatile private var outgoingSubject: String? = null
 
     @Volatile private var peerAcceptsVideoFragments = false
     private val videoReassembler = CallVideoReassembler()
@@ -568,15 +863,27 @@ class AndroidPrivateVideoCall(
     /** Experimental call-link pacing (DebugTunables.callLinkPacing): socket transports only. */
     private val pacer = LinkPacer()
     private val pacedWrites: Boolean
-        get() = callLinkPaced(transport, DebugTunables.callLinkPacing, DebugTunables.linkPacing)
+        get() = callLinkPaced(transport, DebugTunables.callLinkPacing, DebugTunables.linkPacing, carriers?.sendKind ?: CarrierKind.BLUETOOTH)
     @Volatile private var peerLateUntilNs = 0L
     private val peerLateness = PeerLatenessTrend()
     // Version 3 delivery reports (hop-local, 2026-10-09): media this phone received from the peer,
     // what the peer reports it received from this phone (against this phone's own write times), and
     // whether the peer accepts version 3. Recreated for every link.
-    @Volatile private var receivedDelivery = LinkDeliveryCounter()
-    @Volatile private var peerDelivery = PeerDeliveryEstimate()
-    @Volatile private var deliveryReports = CallDeliveryReports(enabled = true)
+    private var receivedDelivery: LinkDeliveryCounter
+        get() = carrierState0.receivedDelivery
+        set(value) {
+            carrierState0.receivedDelivery = value
+        }
+    private var peerDelivery: PeerDeliveryEstimate
+        get() = carrierState0.peerDelivery
+        set(value) {
+            carrierState0.peerDelivery = value
+        }
+    private var deliveryReports: CallDeliveryReports
+        get() = carrierState0.deliveryReports
+        set(value) {
+            carrierState0.deliveryReports = value
+        }
     @Volatile private var largeFrameGraceUntilNs = 0L
     private var typicalVideoBytes = 0L
     private val pendingAudioPackets = ArrayList<OutboundMedia>(CONSTRAINED_COC_AUDIO_BATCH_SIZE)
@@ -597,11 +904,19 @@ class AndroidPrivateVideoCall(
         check(running.get()) { "Private-call endpoint is closed" }
         check(listenerThread == null && gattServer == null) { "Private-call availability already started" }
         openCallListener()
-        if (rotatingAdvert) RotatingDiscovery.addBoundaryListener(boundaryListener)
-        if (rotatingAdvert) NameWindowRuntime.addListener(windowListener)
-        // Bluetooth ON recovery (BluetoothOnRecovery.kt): the listener's native parts die with the adapter.
-        BluetoothEpoch.register(listenerEpochName, onOff = {}, onOn = ::recoverListenerAfterBluetoothOn)
-        onStatus("Available for a private call over ${endpointTransport.shortLabel}")
+        // close() may have run while the listener opened (a stream join overtook this start): stop what was opened
+        // here instead of leaving a call listener up beside the viewer (STREAM-INTEROP block 1).
+        val published = listenerStartFence.publish(
+            stopOpened = { stopAvailability(forActiveConnection = false) },
+        ) {
+            if (rotatingAdvert) RotatingDiscovery.addBoundaryListener(boundaryListener)
+            if (rotatingAdvert) NameWindowRuntime.addListener(windowListener)
+            // Bluetooth ON recovery (BluetoothOnRecovery.kt): the listener's native parts die with the adapter.
+            BluetoothEpoch.register(listenerEpochName, onOff = {}, onOn = ::recoverListenerAfterBluetoothOn)
+        }
+        check(published) { "Private-call endpoint closed while starting" }
+        if (wifiOnlyListening) onStatus("Available for a private call over Wi-Fi")
+        else onStatus("Available for a private call over ${endpointTransport.shortLabel}")
     }
 
     private val listenerEpochName = "call-listener-" + Integer.toHexString(System.identityHashCode(this))
@@ -621,7 +936,7 @@ class AndroidPrivateVideoCall(
                 BluetoothOnRecoveryPolicy.callListener(
                     running = running.get(),
                     idle = state == null && !callRunning.get(),
-                    listening = listenerThread != null || gattServer != null || cocControlServer != null || classicAdvertiser != null,
+                    listening = listenerThread != null || gattServer != null || cocControlServer != null || classicAdvertiser != null || wifiOnlyListening,
                 )
             }
             if (!decision.restart) {
@@ -652,10 +967,12 @@ class AndroidPrivateVideoCall(
                 BluetoothOnRecovery.log(component, "restarted", decision.reason, "transport=${endpointTransport.shortLabel}")
                 onStatus("Available for a private call over ${endpointTransport.shortLabel}")
             }.onFailure { error ->
+                WifiDiscovery.offers.clear(WifiOfferRole.CALL_OFFER)   // availability is paused: nothing stays on Wi-Fi (A8 review P1-2)
                 BluetoothOnRecovery.log(
                     component, "skipped", "reopen_failed", "transport=${endpointTransport.shortLabel} | error=${error.message ?: error.javaClass.simpleName}",
                 )
                 onStatus("Private-call availability paused after Bluetooth came back: ${error.message ?: error.javaClass.simpleName}")
+                reportReopenFailure(error)
             }
         }
     }
@@ -665,16 +982,62 @@ class AndroidPrivateVideoCall(
      * for 1-8 s (RV12) and reopens with the new RDI on a new advertising set; on LE CoC stacks with
      * per-session listeners the PSM changes too (RV1). A call or connection in progress keeps its
      * link (availability is already stopped then); the next listener uses the current epoch (RV4).
+     * A GATT central that is connected but not admitted yet is a connection in progress too (R1 C9): the
+     * old address leaves the air at the boundary and the restart waits for it, bounded (BoundaryRestartPlan).
      */
+    /**
+     * R1 C9 (2026-11-10): an iPhone's call connected 1.1 s before a boundary and was orphaned when the restart
+     * closed the GATT server under it (the call only counts as running once the central's subscribe is admitted,
+     * 0.6-2.5 s after it connects). While a central is connected: stop advertising the old ID at once (the
+     * address still leaves the air at the boundary) and wait, at most [BoundaryRestartPlan.SETUP_GRACE_MS], for
+     * the call to start (keep its link: false) or the link to go (restart: true). Runs on the rotation thread.
+     */
+    private fun holdBoundaryForLinkInFlight(): Boolean {
+        // The GATT call server, or the LE CoC control server (its GATT control link is up from the connect until the L2CAP accept).
+        val server = gattServer
+        val control = cocControlServer
+        if (server == null && control == null) return true
+        var waitedMs = 0L
+        var held = false
+        while (true) {
+            val step = synchronized(this) {
+                BoundaryRestartPlan.decide(
+                    !running.get() || state != null || callRunning.get(),
+                    server?.linkInFlight() == true || control?.linkInFlight() == true,
+                    waitedMs,
+                )
+            }
+            if (step == BoundaryRestartPlan.Step.STOP_ADVERT_AND_WAIT) {
+                if (!held) {
+                    runCatching { server?.stopAdvertisingNow() }
+                    runCatching { control?.stopAdvertising() }
+                }
+                held = true
+                try {
+                    Thread.sleep(BoundaryRestartPlan.POLL_MS)
+                } catch (_: InterruptedException) {
+                    return false
+                }
+                waitedMs += BoundaryRestartPlan.POLL_MS
+                continue
+            }
+            if (held && BuildConfig.DEBUG) {
+                Log.i("BluetoothVideo", "BENCHMARK rotid_boundary_hold: role=call | waitedMs=$waitedMs | outcome=${BoundaryRestartPlan.outcome(step)}")
+            }
+            return step != BoundaryRestartPlan.Step.SKIP
+        }
+    }
+
     private fun onDiscoveryBoundary(epoch: Long) {
         if (!running.get()) return
         // Also restarts when a Visible-by-handle window starts or ends (always on a new set, RV5).
         if (epoch == advertisedEpoch && RotatingDiscovery.visibleByHandle() == advertisedVisible) return
         thread(name = "PrivateCallIdRotation") {
             val silenceMs = RotatingDiscovery.boundarySilenceMs()
+            if (!holdBoundaryForLinkInFlight()) return@thread
             synchronized(this) {
                 if (!running.get() || state != null || callRunning.get()) return@thread
-                if (listenerThread == null && gattServer == null) return@thread
+                if (listenerThread == null && gattServer == null && !wifiOnlyListening) return@thread
                 listenerGeneration++
                 stopAvailability(forActiveConnection = false)
                 advertisedEpoch = -1L
@@ -709,11 +1072,13 @@ class AndroidPrivateVideoCall(
                     )
                 }
             }.onFailure { error ->
-                // The old ID never comes back (design 4.4); the status line says availability dropped.
+                // The old ID never comes back (design 4.4), on Wi-Fi either (A8 review P1-2); the status line says availability dropped.
+                WifiDiscovery.offers.clear(WifiOfferRole.CALL_OFFER)
                 onStatus(
                     "Private-call availability paused while changing discovery ID: " +
                         (error.message ?: error.javaClass.simpleName),
                 )
+                reportReopenFailure(error)
             }
         }
     }
@@ -763,13 +1128,60 @@ class AndroidPrivateVideoCall(
         }
     }
 
-    @SuppressLint("MissingPermission")
+    /**
+     * Experimental partial-open cleanup (`test_listen_partial_cleanup`, off): an open that fails after the LE CoC listen
+     * succeeded (the control server, for one) releases the parts this open created, so an orphaned lease cannot keep the
+     * role busy (on Android 10 the next session would open a dedicated listener and leak one more registration). Off,
+     * the parts stay open until the endpoint closes, as before.
+     */
     private fun openCallListener() {
+        val before = listOf<Any?>(serverSocket, cocListener, cocControlServer, classicAdvertiser, gattServer, dualSecondary)
+        PartialOpen.run(
+            CocAvailabilitySwitches.partialCleanup,
+            release = { releasePartialListener(before) },
+            log = { Log.i("BluetoothVideo", it) },
+        ) { openCallListenerParts() }
+    }
+
+    /** Closes what the failed open created: every listener part that differs from [before] (the parts held when it began). */
+    private fun releasePartialListener(before: List<Any?>) {
+        cocControlServer?.takeIf { it !== before[2] }?.let { cocControlServer = null; runCatching { it.close() } }
+        cocListener?.takeIf { it !== before[1] }?.let { cocListener = null; runCatching { it.close() } }
+        serverSocket?.takeIf { it !== before[0] }?.let { serverSocket = null; runCatching { it.close() } }
+        classicAdvertiser?.takeIf { it !== before[3] }?.let { classicAdvertiser = null; runCatching { it.close() } }
+        gattServer?.takeIf { it !== before[4] }?.let { gattServer = null; runCatching { it.close() } }
+        dualSecondary?.takeIf { it !== before[5] }?.let { dualSecondary = null; runCatching { it.close() } }
+    }
+
+    /**
+     * A rotating-ID or Bluetooth-on reopen failed while idle: with the partial-open cleanup (or a watchdog stall) the
+     * endpoint stops its availability and reports it unavailable, so the activity can show it and run the CoC -> GATT
+     * fallback; otherwise only the status line says so, as before.
+     */
+    private fun reportReopenFailure(error: Throwable) {
+        if (!CocAvailabilitySwitches.partialCleanup && error !is ListenStalledException) return
+        synchronized(this) {
+            if (!running.get() || state != null || callRunning.get()) return
+            stopAvailability(forActiveConnection = false)
+        }
+        CallAvailabilityFaults.report(this, error)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun openCallListenerParts() {
         val generation = listenerGeneration
         val visible = rotatingAdvert && RotatingDiscovery.visibleByHandle()
         val rotatingEntry = if (rotatingAdvert && !visible) RotatingDiscovery.advertise(RotatingDiscoveryIds.ROLE_CALL_OFFER) else null
         advertisedVisible = visible
         advertisedEpoch = rotatingEntry?.epoch ?: if (visible) RotatingDiscovery.currentEpoch() else -1L
+        // DEBUG harness proof: which scanned rotating ID is this phone (the only line that binds an ID to its owner).
+        if (BuildConfig.DEBUG && rotatingEntry != null) {
+            Log.i(
+                "BluetoothVideo",
+                "BENCHMARK rotid_own: role=call | epoch=${rotatingEntry.epoch} | " +
+                    "rdi=${rotatingEntry.rdi.joinToString("") { "%02x".format(it) }}",
+            )
+        }
         val baseAnnouncement = DiscoveryAnnouncement(
             nodeIdPrefix = rotatingEntry?.rdi ?: identity.nodeId.toByteArray()
                 .copyOf(DiscoveryAnnouncement.NODE_PREFIX_BYTES),
@@ -807,6 +1219,31 @@ class AndroidPrivateVideoCall(
         // Experimental hidden identities (BMH3): a version 2 offer carries the hint bit "this endpoint accepts BMH3
         // handshakes" (the same instance when the switch is off, so the offer is byte-identical).
         val announcement = Bmh3Hint.offerFor(relayedAnnouncement, Bmh3Feature.enabled)
+        // Wider reach: the same bytes the Bluetooth advertiser sends are offered over Wi-Fi Aware; a peer that dials us there
+        // arrives at acceptIncoming() exactly like a Bluetooth connection (BMH3/BMH2 dispatch by first-frame magic in establish()).
+        // Offered only once this listener is really open (Wi-Fi only, or after the Bluetooth branch below succeeded): a failed
+        // open must never leave this RDI published on Wi-Fi (A8 review P1-2).
+        val wifiGeneration = generation
+        val wifiAcceptor: (WifiNativeConnection) -> Unit = { native ->
+            if (!running.get() || wifiGeneration != listenerGeneration) {
+                native.close()
+            } else {
+                acceptIncoming(
+                    CallConnection(
+                        native.input, native.output, WifiCallNotices.LABEL, native.close,
+                        socket = null, link = null, address = null,
+                        carrierKind = CarrierKind.WIFI_AWARE,
+                        onAuthenticated = native.admitted,
+                    ),
+                )
+            }
+        }
+        if (!runCatching { adapter.isEnabled }.getOrDefault(false) && WifiDiscovery.widerReachOn()) {
+            wifiOnlyListening = true   // no Bluetooth listener or advertiser exists in this state
+            WifiDiscovery.publishOffer(WifiOfferRole.CALL_OFFER, announcement, wifiAcceptor)
+            return
+        }
+        wifiOnlyListening = false
         when (endpointTransport) {
             BluetoothTransportOption.CLASSIC_RFCOMM -> {
                 val activeServer = ClassicSockets.listen(adapter, "Bluetooth Private Video Call", ClassicRole.PRIVATE_CALL)
@@ -830,6 +1267,7 @@ class AndroidPrivateVideoCall(
                 cocListener = activeServer
                 // Experimental dual listening (default off): the GATT call service first, the hint only once it
                 // runs. Off: no server is created and the control server advertises `announcement` itself.
+                CallListenInject.failControlIfRequested()
                 val advertisedOffer = dualListeningOffer(announcement)
                 cocControlServer = BleL2capControlServer(
                     appContext,
@@ -864,9 +1302,13 @@ class AndroidPrivateVideoCall(
                     } else {
                         acceptIncoming(gattConnection(activeConnection))
                     }
-                }.also(GattVideoServer::start)
+                }.also {
+                    it.callEndpoint = true
+                    it.start()
+                }
             }
         }
+        WifiDiscovery.publishOffer(WifiOfferRole.CALL_OFFER, announcement, wifiAcceptor)   // the Bluetooth listener is open
         // A Visible-by-name window adds its sets to this listener (and follows its rotation).
         syncWindowAdvertiser()
     }
@@ -948,6 +1390,9 @@ class AndroidPrivateVideoCall(
     /** True while this endpoint scans a verification code (it dials like a call but is not one). */
     val isQrScan: Boolean get() = qrScanPayload != null
 
+    /** DEBUG: this call's ID for benchmark lines (`state` is never cleared, so it outlives the end); null in release. */
+    val benchmarkCallId: String? get() = if (BuildConfig.DEBUG) state?.callId?.toString() else null
+
     /**
      * The stalled first link's ACL-down watch (SetupRetryAclWait, test_setup_retry_acl_wait): armed by the stall guard before it
      * closes the link, awaited by the 1M retry before it dials, released by the connect thread in every case.
@@ -987,7 +1432,6 @@ class AndroidPrivateVideoCall(
             return false
         }
         negotiation = VoiceCallNegotiation.outgoing(voiceCallsEnabled, callType)
-        outgoingSubject = PeerLabelFeature.pendingCallSubject.also { PeerLabelFeature.pendingCallSubject = null }
         relayHops = hops
         pendingRelayRoute = if (relayedCallsOn) peer.relayRoute else null
         // Which helper this relayed dial selected (the "Calling relayed [target] via N" line names only the target):
@@ -1000,6 +1444,9 @@ class AndroidPrivateVideoCall(
         activeSettings = routeSettings(relayHops)
         val initial = PrivateCallState.outgoing()
         state = initial
+        CallJoinStages.begin("caller")
+        CallJoinStages.current.callId(if (BuildConfig.DEBUG) initial.callId.toString() else null)
+        CallJoinStages.mark(CallJoinStage.DIAL)
         historyTarget = if (peer.announcement.rotating) {
             peer.announcement.rotatingId()?.let { StrangerNames.derive(StrangerNames.Input.rdi(it)) }?.let {
                 RecentCall("", callType == CallType.VIDEO, 0, strangerName = it.text.lowercase())
@@ -1031,7 +1478,7 @@ class AndroidPrivateVideoCall(
         offerViaPrefix = if (direct) null else AdaptivePhyMemory.prefixLabel(peer.announcement.nodeIdPrefix)
         // The bad-2M memory key of this offer: a rotating ID recognised as one contact keys by that contact's node, the
         // key the 1M retry records (test_phy_memory_contact_key); the recognition is local only.
-        val memoryNode = AdaptivePhyMemory.offerMemoryNode(
+        val memoryNode = if (peer.wifiOnly) null else AdaptivePhyMemory.offerMemoryNode(
             rotating = peer.announcement.rotating,
             nodePrefix = peer.announcement.nodeIdPrefix,
             contactKey = DebugTunables.phyMemoryContactKey,
@@ -1054,7 +1501,7 @@ class AndroidPrivateVideoCall(
                 },
             )
         }
-        val firstPhy = if (transport != BluetoothTransportOption.CLASSIC_RFCOMM) {
+        val firstPhy = if (peer.wifiOnly) phyPreference else if (transport != BluetoothTransportOption.CLASSIC_RFCOMM) {
             val offerPhy = AdaptivePhyMemory.phyFor(
                 transport,
                 peer.announcement.nodeIdPrefix,
@@ -1078,10 +1525,34 @@ class AndroidPrivateVideoCall(
         } else {
             phyPreference
         }
+        // Experimental test_call_1m_first (JT2-P3, default off): a direct GATT dial opens on 1M with no PHY request; the call asks
+        // for 2M after its first picture when it needs it (noteRemotePictureShown), and the 2M -> 1M setup retry below is inert
+        // for it (setupPhy). Off: firstPhy, the setup retry and the stall guard are exactly as before.
+        val oneMFirst = CallOneMFirst.appliesToDial(
+            enabled = PhySwitches.call1mFirst,
+            gatt = transport == BluetoothTransportOption.BLE_GATT,
+            dualListening = dualPlan.size > 1,
+            direct = direct,
+            wifiOnly = peer.wifiOnly,
+            relayedRoute = peer.relayRoute != null,
+            firstPhy = firstPhy,
+            le2MSupported = LinkCapacity.features?.le2MPhy != false,
+            // Experimental test_call_1m_first_coc: the same start for a direct CoC dial (the control link asks for 1M).
+            cocEnabled = PhySwitches.call1mFirstCoc,
+            coc = transport == BluetoothTransportOption.BLE_L2CAP,
+        )
+        val setupPhy = CallOneMFirst.setupPhy(firstPhy, oneMFirst)
+        phyFirstGate = if (oneMFirst) CallPhyUpgradeGate(linkLimitUpgrade = PhySwitches.call1mFirstLinkLimit) else null
+        if (oneMFirst) {
+            Log.i(
+                "BluetoothVideo",
+                CallOneMFirst.linkPhyLine("1M", "1M", "call_1m_first", offerLogLabel(peer.announcement), "deferred=true"),
+            )
+        }
         val startedAtMs = SystemClock.elapsedRealtime()
         // Experimental test_peer_address_book: a direct callee whose address is stale or replaced is
         // rescanned by node prefix first (same prefix and route cost; the handshake verifies identity).
-        val firstPeer = if (PeerAddressBook.enabled() && direct && transport != BluetoothTransportOption.CLASSIC_RFCOMM) {
+        val firstPeer = if (PeerAddressBook.enabled() && direct && transport != BluetoothTransportOption.CLASSIC_RFCOMM && !peer.wifiOnly) {
             val key = PeerAddressBook.prefixKey(peer.announcement.nodeIdPrefix)
             val reason = PeerAddressBook.shared.rescanReason(key, peer.device.address)
             if (reason == null) {
@@ -1098,20 +1569,50 @@ class AndroidPrivateVideoCall(
         } else {
             peer
         }
+        // Experimental test_phy_direction_split: a direct GATT peer remembered with one failing 2M direction starts split.
+        dialPhySplit = if (direct && firstPhy == phyPreference && !oneMFirst && transport == BluetoothTransportOption.BLE_GATT) {
+            memoryNode?.let { node -> AdaptivePhyMemory.splitFor(transport, node, "call") }?.let { split -> firstPeer.device.address to split }
+        } else {
+            null
+        }
+        // Experimental test_own_2m_memory (OwnControllerTwoM): this dial's outcome is evidence about this phone's own controller
+        // only when it is a symmetric 2M setup to a hop that carries nothing else.
+        val ownTwoMEvidence = OwnControllerTwoM.symmetricTwoMSetup(
+            setupPhy = setupPhy,
+            le = transport != BluetoothTransportOption.CLASSIC_RFCOMM && !peer.wifiOnly,
+            idleHop = direct || helperRoute != null,
+            splitApplied = dialPhySplit?.first == firstPeer.device.address,
+            blePhyArm = DebugTunables.experimentalBlePhy != null,
+            staticSplit = DebugTunables.experimentalPhySplit != null,
+        )
+        // Experimental test_slow_2m_in_place (SlowTwoMInPlace): a stalled or crawling first symmetric 2M link of a direct offer
+        // with no memory key (an unrecognised rotating offer) asks the same link for 1M before today's close and retry.
+        val slowTwoMInPlace = SlowTwoMInPlace.applies(
+            enabled = PhySwitches.slow2mInPlace,
+            setupPhy = setupPhy,
+            le = transport != BluetoothTransportOption.CLASSIC_RFCOMM && !peer.wifiOnly,
+            direct = direct,
+            hasMemoryKey = memoryNode != null,
+            splitApplied = dialPhySplit?.first == firstPeer.device.address,
+            blePhyArm = DebugTunables.experimentalBlePhy != null,
+            staticSplit = DebugTunables.experimentalPhySplit != null,
+        )
         try {
             try {
                 // One setup deadline for this dial (SetupDeadline): inner GATT/CoC retries may only use the part of the
                 // early-loss window that still leaves room for the 2M -> 1M setup retry below (leSetupRetryAllowed), and the
                 // Experimental test_fast_0x3e_dials (off) redials a fast 0x3E on this first dial with jitter (FastEstablishDials).
-                val retryPossible = adaptivePhySetupRetryAllowed(firstPhy, 0L)
+                val retryPossible = adaptivePhySetupRetryAllowed(setupPhy, 0L)
                 val firstDeadline = SetupDeadline.forFirstDial(
                     startedAtMs + AdaptivePhyMemory.EARLY_LOSS_MS,
                     boundsOrdinary = retryPossible,
                     fastDials = connectConfig.fastFirstDial,
                 )
                 // Experimental test_setup_stall_ms (review A14): the guard's arm, e.g. 2000; 0 keeps SETUP_STALL_MS.
-                val stallGuardMs = if (retryPossible && DebugTunables.phySetupStallGuard) connectConfig.stallGuardMs() else 0L
-                openAndEstablishOutgoing(firstPeer, firstPhy, stallGuardMs, firstDeadline)
+                val stallGuardMs = if (!peer.wifiOnly && retryPossible && DebugTunables.phySetupStallGuard) connectConfig.stallGuardMs() else 0L
+                openAndEstablishOutgoing(firstPeer, setupPhy, stallGuardMs, firstDeadline, deferPhy = oneMFirst, slowTwoMInPlace = slowTwoMInPlace)
+                // A link moved to 1M in place (test_slow_2m_in_place) was no clean symmetric 2M setup.
+                if (ownTwoMEvidence && stallGuardMs > 0L && !slowTwoMMovedThisLink) AdaptivePhyMemory.recordOwnTwoMSuccess()
             } catch (error: IOException) {
                 if (PeerAddressBook.enabled()) {
                     val elapsedMs = SystemClock.elapsedRealtime() - startedAtMs
@@ -1119,7 +1620,8 @@ class AndroidPrivateVideoCall(
                     val action = LeConnectFailureClassifier.classify(elapsedMs, status, fastRetriesUsed = 0)
                     Log.i("BluetoothVideo", LeConnectFailureClassifier.line("call", elapsedMs, status, action))
                 }
-                if (!adaptivePhySetupRetryAllowed(firstPhy, SystemClock.elapsedRealtime() - startedAtMs)) {
+                if (ownTwoMEvidence && error is CallSetupStalledException) AdaptivePhyMemory.recordOwnTwoMStall("setup_stall")
+                if (peer.wifiOnly || !adaptivePhySetupRetryAllowed(setupPhy, SystemClock.elapsedRealtime() - startedAtMs)) {
                     throw error
                 }
                 // Review A6: whether the failed 2M attempt is evidence against 2M (a stall, or a link lost after its hop
@@ -1175,7 +1677,11 @@ class AndroidPrivateVideoCall(
                     }
                 }
                 val retryPeer = if (adaptivePhyRetryRediscovers(DebugTunables.phySetupStallGuard, peer.announcement.routeCost)) {
-                    rediscoverPeer(peer, startedAtMs, stalled = error is CallSetupStalledException)
+                    rediscoverPeer(
+                        peer, startedAtMs, stalled = error is CallSetupStalledException,
+                        // test_slow_2m_in_place: after its fallback close, scan until the callee's incoming deadline released it.
+                        inPlaceCloseSinceOpenMs = slowTwoMCloseSinceOpenMs.takeIf { it >= 0L && error is CallSetupStalledException },
+                    )
                 } else if (helperRoute != null && DebugTunables.phySetupStallGuard) {
                     // The helper dropped the dead link and re-advertised under a new address (relay-showcase p01/g04: the
                     // retry redialed the old address until "BLE control did not respond" / "Timed out connecting GATT video").
@@ -1391,24 +1897,53 @@ class AndroidPrivateVideoCall(
         linkPhy: BlePhyPreference,
         stallGuardMs: Long = 0L,
         deadline: SetupDeadline? = null,
+        deferPhy: Boolean = false,
+        /** Experimental test_slow_2m_in_place: a stall or crawl of this guarded 2M link first asks it for 1M ([SlowTwoMInPlace]). */
+        slowTwoMInPlace: Boolean = false,
     ) {
         hopAuthenticatedThisLink = false
+        slowTwoMMovedThisLink = false
+        slowTwoMCloseSinceOpenMs = -1L
         // One BMH3 plan for every handshake of this attempt (a Classic connector's included): one choice, one throwaway.
         val plan = attemptPlan(peer.announcement)
-        val activeConnection = try {
-            openOutgoing(peer, linkPhy, plan, deadline)
+        val openedConnection = try {
+            openOutgoing(peer, linkPhy, plan, deadline, deferPhy)
         } catch (error: Exception) {
             // A dual attempt already tried GATT too: the safety net's retry would repeat that.
-            if (running.get() && transport == BluetoothTransportOption.BLE_L2CAP && dualPlan.size < 2) {
+            if (running.get() && transport == BluetoothTransportOption.BLE_L2CAP && dualPlan.size < 2 && !peer.wifiOnly) {
                 onCocConnectFailed(error.message ?: error.javaClass.simpleName)
             }
             throw error
+        }
+        // Experimental test_slow_2m_in_place: the watched attempt notes when the peer's bytes arrive (the bytes pass unchanged).
+        val slowWatch = if (slowTwoMInPlace && stallGuardMs > 0L && openedConnection.movePhy != null) SlowTwoMInPlace.Watch(stallGuardMs) else null
+        val slowProgress = slowWatch?.let { SlowTwoMInPlace.Progress(SystemClock::elapsedRealtime) }
+        val activeConnection = if (slowProgress != null) {
+            openedConnection.copy(input = SlowTwoMInPlace.ProgressInputStream(openedConnection.input, slowProgress))
+        } else {
+            openedConnection
         }
         val setupState = CallSetupStallState()
         val settled = CountDownLatch(1)
         val openedAtMs = SystemClock.elapsedRealtime()
         val node = offerLogLabel(peer.announcement)
-        if (stallGuardMs > 0L) {
+        val hopAuthAtMs = AtomicLong(-1L)
+        val setupDone = AtomicBoolean(false)
+        // The stall guard's close (also the in-place fallback's); the caller has already won setupState.claimStall().
+        fun closeStalled(sinceOpenMs: Long) {
+            Log.i(
+                "BluetoothVideo",
+                "BENCHMARK adaptive_phy: link=call | node=$node | phy=${linkPhy.label} | reason=setup_stall | " +
+                    "sinceOpenMs=$sinceOpenMs | guardMs=$stallGuardMs | action=close",
+            )
+            // Armed before the close so the ACL_DISCONNECTED broadcast cannot be missed (test_setup_retry_acl_wait).
+            if (connectConfig.setupRetryAclWait) {
+                runCatching { AclDownWatch.forDevice(appContext, peer.device) }.getOrNull()
+                    ?.let { stallAclWatch.getAndSet(it)?.release() }
+            }
+            runCatching { activeConnection.close() }
+        }
+        if (stallGuardMs > 0L && slowWatch == null) {
             thread(name = "PrivateCallSetupStall", isDaemon = true) {
                 val settledInTime = try {
                     settled.await(stallGuardMs, TimeUnit.MILLISECONDS)
@@ -1420,18 +1955,14 @@ class AndroidPrivateVideoCall(
                 if (running.get() && adaptivePhySetupStalled(stallGuardMs, settledInTime, sinceOpenMs) &&
                     setupState.claimStall()
                 ) {
-                    Log.i(
-                        "BluetoothVideo",
-                        "BENCHMARK adaptive_phy: link=call | node=$node | phy=${linkPhy.label} | reason=setup_stall | " +
-                            "sinceOpenMs=$sinceOpenMs | guardMs=$stallGuardMs | action=close",
-                    )
-                    // Armed before the close so the ACL_DISCONNECTED broadcast cannot be missed (test_setup_retry_acl_wait).
-                    if (connectConfig.setupRetryAclWait) {
-                        runCatching { AclDownWatch.forDevice(appContext, peer.device) }.getOrNull()
-                            ?.let { stallAclWatch.getAndSet(it)?.release() }
-                    }
-                    runCatching { activeConnection.close() }
+                    closeStalled(sinceOpenMs)
                 }
+            }
+        }
+        if (slowWatch != null && slowProgress != null) {
+            // Replaces the guard thread for this attempt: the same CAS closes it, never before the guard ([SlowTwoMInPlace.Watch]).
+            thread(name = "PrivateCallSlow2m", isDaemon = true) {
+                watchSlowTwoM(slowWatch, slowProgress, activeConnection, setupState, openedAtMs, node, hopAuthAtMs, setupDone, ::closeStalled)
             }
         }
         // Every other attempt (the 1M retry, a first attempt without the guard, Classic): an answerer that keeps the
@@ -1458,9 +1989,23 @@ class AndroidPrivateVideoCall(
         try {
             establish(activeConnection, initiator = true, peer.announcement, plan) {
                 val hopAuthMs = SystemClock.elapsedRealtime() - openedAtMs
+                hopAuthAtMs.set(hopAuthMs)
                 val kept = setupState.authenticated()
                 settled.countDown()
                 hopAuthenticatedThisLink = kept
+                // AP7 F2 (Experimental `test_stall_slow_auth_ms`, 0 = off): a hop authentication that finished late on 2M is
+                // the pair's stall signature even though it finished; take the existing 1M retry before any media can start.
+                if (kept && stallGuardMs > 0L && slowWatch?.moved != true &&
+                    slowAuthStall(DebugTunables.stallSlowAuthMs, hopAuthMs, linkPhy == BlePhyPreference.TWO_M)
+                ) {
+                    Log.i(
+                        "BluetoothVideo",
+                        (if (BuildConfig.DEBUG) "BENCHMARK " else "") +
+                            "adaptive_phy: link=call | node=$node | phy=${linkPhy.label} | reason=slow_auth_2m | " +
+                            "hopAuthMs=$hopAuthMs | armMs=${DebugTunables.stallSlowAuthMs} | action=retry_1m",
+                    )
+                    throw CallSetupStalledException("LE call setup authenticated after ${hopAuthMs} ms on 2M")
+                }
                 if (kept) armCallerAnswerDeadline(activeConnection, relayed = pendingRelayRoute != null)
                 // Measured hop-authentication time after the link opened, every LE call attempt: the evidence
                 // for the setup-stall deadline (AdaptivePhyMemory.SETUP_STALL_MS).
@@ -1490,12 +2035,92 @@ class AndroidPrivateVideoCall(
         } finally {
             setupState.ended()
             settled.countDown()
+            setupDone.set(true)
         }
         if (setupState.stalled) throw CallSetupStalledException("LE call setup stalled")
+        // Requested vs effective PHY of a link moved in place (test_slow_2m_in_place), explicit for the scorer.
+        if (slowWatch?.confirmed == true) {
+            Log.i(
+                "BluetoothVideo",
+                "BENCHMARK link_phy requested=2M effective=1M reason=slow_2m_in_place source=adaptive link=call node=$node",
+            )
+        }
+    }
+
+    /**
+     * Experimental test_slow_2m_in_place: the watcher of one guarded 2M attempt, every [SlowTwoMInPlace.POLL_MS] until the setup
+     * ended or the watch is done. It asks the link for 1M on a stall or crawl, polls the PHY, and closes the link through the
+     * stall guard's own CAS ([closeStalled]) only when [SlowTwoMInPlace.Watch] says so (never before the guard).
+     */
+    private fun watchSlowTwoM(
+        watch: SlowTwoMInPlace.Watch,
+        progress: SlowTwoMInPlace.Progress,
+        activeConnection: CallConnection,
+        setupState: CallSetupStallState,
+        openedAtMs: Long,
+        node: String,
+        hopAuthAtMs: AtomicLong,
+        setupDone: AtomicBoolean,
+        closeStalled: (Long) -> Unit,
+    ) {
+        val movePhy = activeConnection.movePhy
+        try {
+            while (running.get() && !watch.done) {
+                Thread.sleep(SlowTwoMInPlace.POLL_MS)
+                val sinceOpenMs = SystemClock.elapsedRealtime() - openedAtMs
+                val observation = SlowTwoMInPlace.Observation(
+                    sinceOpenMs = sinceOpenMs,
+                    hopAuthAtMs = hopAuthAtMs.get().takeIf { it >= 0L },
+                    lastProgressAtMs = progress.sinceOpen(openedAtMs),
+                    phy = SlowTwoMInPlace.LinkPhyView.of(activeConnection.phySummary()),
+                    finished = setupDone.get() || !running.get(),
+                )
+                var decision = watch.decide(observation)
+                if (decision.action == SlowTwoMInPlace.Action.REQUEST_1M) {
+                    val queued = movePhy != null && runCatching { movePhy(BlePhyPreference.ONE_M_ADAPTIVE) }.getOrDefault(false)
+                    if (queued) {
+                        requestedLinkPhy = BlePhyPreference.ONE_M_ADAPTIVE
+                        slowTwoMMovedThisLink = true
+                    }
+                    Log.i(
+                        "BluetoothVideo",
+                        SlowTwoMInPlace.line(
+                            node, watch.trigger, if (queued) "moved" else "not_queued", sinceOpenMs,
+                            "phyBefore=${observation.phy.name.lowercase()} | hopAuthenticated=${observation.hopAuthAtMs != null}",
+                        ),
+                    )
+                    decision = watch.onRequest(queued, observation)
+                }
+                when (decision.action) {
+                    SlowTwoMInPlace.Action.READ_PHY -> runCatching { activeConnection.readPhy?.invoke() }
+                    SlowTwoMInPlace.Action.CONFIRMED, SlowTwoMInPlace.Action.NOT_TWO_M, SlowTwoMInPlace.Action.UNRESOLVED -> Log.i(
+                        "BluetoothVideo",
+                        SlowTwoMInPlace.line(
+                            node, watch.trigger, decision.action.name.lowercase(), sinceOpenMs,
+                            if (decision.cause.isEmpty()) "" else "cause=${decision.cause}",
+                        ),
+                    )
+                    SlowTwoMInPlace.Action.FALLBACK_CLOSE -> if (running.get() && setupState.claimStall()) {
+                        slowTwoMCloseSinceOpenMs = sinceOpenMs
+                        Log.i("BluetoothVideo", SlowTwoMInPlace.line(node, watch.trigger, "fallback_close", sinceOpenMs, "cause=${decision.cause}"))
+                        closeStalled(sinceOpenMs)
+                    }
+                    SlowTwoMInPlace.Action.NONE, SlowTwoMInPlace.Action.REQUEST_1M -> Unit
+                }
+            }
+        } catch (_: InterruptedException) {
+            // The attempt ended.
+        }
     }
 
     /** Review A6: the current outgoing link finished its hop handshake (reset per attempt). */
     @Volatile private var hopAuthenticatedThisLink = false
+
+    /** Experimental test_slow_2m_in_place: the current outgoing link was asked for 1M in place (reset per attempt). */
+    @Volatile private var slowTwoMMovedThisLink = false
+
+    /** Experimental test_slow_2m_in_place: ms after the link opened when its fallback closed it, -1 when it did not. */
+    @Volatile private var slowTwoMCloseSinceOpenMs = -1L
 
     /** Review A3: the call whose answer deadline closed its link, so the failure explains itself. */
     @Volatile private var answerDeadlineCallId: UUID? = null
@@ -1545,11 +2170,29 @@ class AndroidPrivateVideoCall(
         stalled: Boolean = false,
         /** An on-demand relayed route: scan for the selected helper's own offer and keep [peer]'s route (RelayHopPolicy). */
         helperRoute: RelayRoute? = null,
+        /** Experimental test_slow_2m_in_place: its fallback close came this long after the link opened (null: no such close). */
+        inPlaceCloseSinceOpenMs: Long? = null,
     ): BleL2capPeer {
         // Experimental test_stall_rediscover_ms (default 8000 = the clamp below): after a setup stall the scan is not
         // bound by the early-loss window, so a callee that re-advertises 8.6-12.6 s after the close is still found.
         val armMs = DebugTunables.stallRediscoverMs
-        val budgetMs = StallRediscover.budgetMs(armMs, stalled, startedAtMs + AdaptivePhyMemory.EARLY_LOSS_MS - SystemClock.elapsedRealtime())
+        // test_rediscover_release_window (on by default since 2026-11-04): wait as long as the callee can take to release
+        // the link it never heard us close (StallRediscover.releaseWindowMs), so the retry is not sent to the stale address.
+        val releaseWindow = DebugTunables.rediscoverReleaseWindow
+        val calleeRestartMs = if (transport == BluetoothTransportOption.BLE_GATT) StallRediscover.CALLEE_GATT_RESTART_MS else 0L
+        val baseBudgetMs = StallRediscover.budgetMs(
+            armMs, stalled, startedAtMs + AdaptivePhyMemory.EARLY_LOSS_MS - SystemClock.elapsedRealtime(), releaseWindow, calleeRestartMs,
+        )
+        val budgetMs = SlowTwoMInPlace.rediscoverBudgetMs(baseBudgetMs, inPlaceCloseSinceOpenMs, calleeRestartMs)
+        if (inPlaceCloseSinceOpenMs != null) {
+            Log.i(
+                "BluetoothVideo",
+                SlowTwoMInPlace.line(
+                    offerLogLabel(peer.announcement), null, "rediscover_window", inPlaceCloseSinceOpenMs,
+                    "budgetMs=$budgetMs | baseMs=$baseBudgetMs | calleeRestartMs=$calleeRestartMs",
+                ),
+            )
+        }
         if (budgetMs <= 0L || !running.get()) return peer
         val prefix = peer.announcement.nodeIdPrefix
         val routeCost = peer.announcement.routeCost
@@ -1585,12 +2228,12 @@ class AndroidPrivateVideoCall(
                     "sameAddress=${fresh?.device?.address == peer.device.address} | " +
                     "waitedMs=${SystemClock.elapsedRealtime() - scanStartedMs} | budgetMs=$budgetMs",
             )
-            if (stalled || armMs > StallRediscover.DEFAULT_MS) {
+            if (stalled || armMs > StallRediscover.DEFAULT_MS || releaseWindow) {
                 Log.i(
                     "BluetoothVideo",
                     StallRediscover.line(
                         budgetMs, SystemClock.elapsedRealtime() - scanStartedMs, fresh != null,
-                        fresh?.device?.address == peer.device.address, stalled, armMs,
+                        fresh?.device?.address == peer.device.address, stalled, armMs, releaseWindow,
                     ),
                 )
             }
@@ -1620,6 +2263,7 @@ class AndroidPrivateVideoCall(
     /** Closes a failed outgoing attempt so the retry starts from a clean link. */
     private fun discardFailedOutgoingSetup() {
         linkTransportOverride = null
+        phyFirstGate = null
         connection?.close()
         connection = null
         bleControlConnection?.close()
@@ -1628,11 +2272,79 @@ class AndroidPrivateVideoCall(
         readerThread?.interrupt()
         secureSession?.close()
         secureSession = null
+        wifiHop?.onCallEnded()
+        wifiHop = null
+        wifiRecordHandler = null
+        markerCodec = CallMarkerCodec
+        carriers?.close()
+        carriers = null
+        contentSink = null
+        extraCarrierStates.clear()
         contentSession?.close()
         contentSession = null
         authenticatedAtNs = 0L
         activeAtNs = 0L
         callRunning.set(false)
+    }
+
+    /**
+     * Experimental `test_call_1m_first`: the first remote picture was shown (MainActivity, once per frame, cheap when nothing is
+     * pending). The call is running with media on its 1M link; it asks for 2M now when its planned load exceeds 1M or the sender
+     * already reported a link limit ([CallPhyUpgradeGate]).
+     */
+    fun noteRemotePictureShown() {
+        phyFirstGate?.onPictureShown()?.let(::requestCallTwoM)
+    }
+
+    /** One 2M request on the live, authenticated 1M link (off the caller's thread; the connection's LL gate lambda queues it). */
+    private fun requestCallTwoM(trigger: CallUpgradeTrigger) {
+        val gate = phyFirstGate ?: return
+        val live = connection ?: return
+        val request = live.requestPhy ?: return
+        val node = secureSession?.peerNodeId?.shortLabel()
+        val label = node ?: "unknown"
+        // A peer a rotating ID could not be matched to before connecting is known now: remembered bad stays on 1M.
+        if (node != null && AdaptivePhyMemory.isBad(transport, node)) {
+            gate.suppress()
+            Log.i(
+                "BluetoothVideo",
+                CallOneMFirst.linkPhyLine("1M", "1M", "remembered", label, "trigger=${trigger.label} | at=after_first_picture"),
+            )
+            return
+        }
+        val planned = activeSettings.let { CallOneMFirst.plannedKbps(it.bitRate, it.fps).toInt() }
+        thread(name = "CallPhyUpgrade", isDaemon = true) {
+            val accepted = runCatching { request(BlePhyPreference.TWO_M) }.getOrDefault(false)
+            gate.markRequested(SystemClock.elapsedRealtime())
+            if (accepted) requestedLinkPhy = BlePhyPreference.TWO_M
+            Log.i(
+                "BluetoothVideo",
+                CallOneMFirst.linkPhyLine(
+                    "2M", if (accepted) "pending" else "refused", trigger.label, label,
+                    "plannedKbps=$planned | budgetKbps=${CallOneMFirst.ONE_M_GATT_KBPS} | at=after_first_picture",
+                ),
+            )
+        }
+    }
+
+    /**
+     * Experimental `test_call_1m_first`: the peer went silent within [CallOneMFirst.EARLY_LOSS_AFTER_UPGRADE_MS] of the 2M
+     * upgrade. The central's PHY request still reaches the peer (the stalled 2M direction is the peripheral's), so ask for 1M on
+     * the same link, and remember the authenticated hop node as bad on 2M (existing [AdaptivePhyMemory]; not a relaying hop).
+     */
+    private fun fallBackCallToOneM(silentMs: Long) {
+        val request = connection?.requestPhy ?: return
+        val node = CallOneMFirst.nodeToRemember(secureSession?.peerNodeId?.shortLabel(), hopRelaysSkipsMemory())
+        val accepted = runCatching { request(BlePhyPreference.ONE_M_ADAPTIVE) }.getOrDefault(false)
+        if (accepted) requestedLinkPhy = BlePhyPreference.ONE_M_ADAPTIVE
+        node?.let { AdaptivePhyMemory.recordBad(transport, it, "call_upgrade_early_loss") }
+        Log.i(
+            "BluetoothVideo",
+            CallOneMFirst.linkPhyLine(
+                "1M", if (accepted) "pending" else "refused", "call_upgrade_early_loss", node ?: "unknown",
+                "silentMs=$silentMs | remembered=${node != null}",
+            ),
+        )
     }
 
     /**
@@ -1955,12 +2667,18 @@ class AndroidPrivateVideoCall(
         finish(storeForwardSyncMessage(result))
     }
 
+    /** A callee at critical heat answers without its camera (DECISIONS 2026-11-06); call before [accept]. */
+    fun answerWithoutVideo() {
+        negotiation?.takeIf { it.role == PrivateCallRole.CALLEE }?.answerWithoutVideo()
+    }
+
     fun accept() {
         synchronized(this) {
             val next = state?.acceptIfRinging() ?: return
             state = next
             notifyPhase(next)
         }
+        CallJoinStages.mark(CallJoinStage.ACCEPT, "by=local")
         // R1: the callee's name goes only with Accept (never on Ringing to a stranger).
         queueRevealOnAccept()
         pendingAcceptLabels?.let { controls.offerMust(OutboundControl.Labels(it)) }
@@ -2037,9 +2755,31 @@ class AndroidPrivateVideoCall(
                 noteEarlyLinkLoss(error)
                 fail(failMessage)
             }
-            CallLinkErrorAction.FINISH_LOCAL_END -> finish("Call ended")
+            CallLinkErrorAction.FINISH_LOCAL_END -> finish(CALL_ENDED_MESSAGE)
             CallLinkErrorAction.NONE -> Unit
         }
+    }
+
+    /**
+     * A carrier's reader, writer, supervisor or silence rule failed. Returns true when the call continues on another carrier.
+     * [id] 0 is the Bluetooth link. Quiet endings that belong to a renewal are decided first (they never end a carrier).
+     * The call itself ends only through [CarrierSet.Host.onEndSession] (no carrier left), which calls [onCallLinkError].
+     */
+    private fun carrierLost(id: Int, gen: Int, error: Exception?, failMessage: String, reason: String, fromReader: Boolean = false): Boolean {
+        if (CarrierLossPolicy.action(quietRenewal = id == 0 && renewalEndsOldLinkQuietly(gen), nothingLeft = false) == CarrierLossPolicy.Action.CONTINUE_QUIETLY) return true   // existing rule, unchanged (amendment 20 c)
+        val set = carriers
+        if (set == null) {
+            if (error != null) onCallLinkError(error, failMessage) else fail(failMessage)
+            return false
+        }
+        val kind = set.kindOf(id)                                              // read before the death: it is null afterwards
+        lastLossError = error
+        lastLossMessage = failMessage
+        val nothingLeft = set.carrierDied(id, reason, if (id == 0) gen else -1, fromReader)   // EndSession -> Host.onEndSession -> onCallLinkError; a stale generation does nothing (amendment 6)
+        val onOther = !nothingLeft && set.liveCount() > 0                      // the call goes on over another live carrier; false while a held end waits for a renewal (A6's Bluetooth-lost notice reads this) [GAP+]; A6 step 8 anchors on this line: do not reword it [dir A6]
+        if (onOther && kind == CarrierKind.BLUETOOTH) WifiCallNotices.afterCarrierLoss(kind, set.snapshot())?.let { onStatus(it) }   // D6 Bluetooth-lost notice, once [API]; decided from the live carriers, not the send carrier, which in fan-out moves later (review A6 P3-1)
+        if (!nothingLeft && kind != null) Log.i("BluetoothVideo", "BENCHMARK carrier_lost: carrier=${kind.name} | reason=$reason | live=${set.liveCount()}")   // once per death (amendment 20 f)
+        return CarrierLossPolicy.action(quietRenewal = false, nothingLeft = nothingLeft) != CarrierLossPolicy.Action.END_CALL
     }
 
     @Synchronized
@@ -2061,6 +2801,103 @@ class AndroidPrivateVideoCall(
     fun setCameraEnabled(enabled: Boolean) {
         if (!callRunning.get()) return
         enqueueSignal(if (enabled) PrivateCallSignal.CAMERA_ON else PrivateCallSignal.CAMERA_OFF)
+        wifiHop?.onVideo(local = enabled)
+    }
+
+    /** DEBUG `wifi_status`: one line with the attempt owner's state (no secret). */
+    fun wifiStatus() {
+        wifiHop?.logStatus()
+    }
+
+    /** The attempt owner's entry for one `BWF1` record: `payload` is the whole body (`Bwf.encode()`), queued on the control queue. */
+    fun offerWifiRecord(carrier: Int, payload: ByteArray): Boolean {
+        // R-1 where the record is written (review A3 P2-5): only to a peer proven to read BWF1, on a reader opened to it.
+        val link = secureSession
+        if (!callRunning.get() || link == null || !WifiHopGate.mayWriteBwf1(link, peerSentWifiRecord)) return false
+        controls.offerMust(OutboundControl.Wifi(carrier, payload))
+        return true
+    }
+
+    // ----- Attempt-owner API (A5) and the carrier view the UI/A6 read [API] -----
+
+    /** Adds a Wi-Fi carrier built by the attempt owner. Returns its id (1..62) or -1 when refused; also -1 while [markerCodec] is still the placeholder. Never blocks. */
+    fun addWifiCarrier(carrier: Carrier): Int = if (markerCodec === CallMarkerCodec) -1 else carriers?.addCarrier(carrier) ?: -1
+
+    fun wifiCarrierPending(id: Int) {
+        carriers?.carrierPending(id)
+    }
+
+    fun wifiCarrierUp(id: Int) {
+        carriers?.carrierUp(id)
+    }
+
+    fun wifiCarrierDied(id: Int, reason: String) {
+        carriers?.carrierDied(id, reason)
+    }
+
+    /** What this call's Wi-Fi hop knows about the other phone, for Link health's "Wi-Fi not used" line; null without a hop. Any thread. */
+    internal fun wifiPeerView(): WifiPeerView? = wifiHop?.peerView()
+
+    /** Set by the user's switch-off only, so a protocol violation that also ends Wi-Fi never shows the "you turned it off" notice. */
+    @Volatile private var userSwitchOffAsked = false
+
+    /** THE only public switch-off entry of the call [X4]. A5.8 replaces this body with the agent-first order. */
+    fun wifiSwitchOff() {
+        userSwitchOffAsked = true
+        val hop = wifiHop
+        if (hop != null) hop.onSwitchOff() else switchCarriersOff()
+    }
+
+    /**
+     * D6: the one place the carriers are switched off (directly, or from the hop agent's port on the wifi thread). The
+     * notice follows the cutover's own outcome: the call stays on Wi-Fi because the standby is dead or alive but stale
+     * (review A6 P2-1).
+     */
+    private fun switchCarriersOff() {
+        val keptOnWifi = carriers?.switchOff() == true
+        if (userSwitchOffAsked) WifiCallNotices.afterSwitchOff(keptOnWifi)?.let { onStatus(it) }
+    }
+
+    fun wifiQualityFallback() {
+        carriers?.qualityFallback()
+    }
+
+    /** A Wi-Fi protocol violation found by the attempt owner: an added carrier dies; on carrier 0 Wi-Fi ends, Bluetooth is never closed. */
+    fun wifiProtocolViolation(carrierId: Int, reason: String) {
+        if (carrierId != 0) {
+            carriers?.carrierDied(carrierId, "protocol")
+            return
+        }
+        Log.i("BluetoothVideo", "wifi_violation | carrier=0 | reason=$reason")
+        carriers?.switchOff()
+    }
+
+    internal fun carrierSnapshot(): CarrierSnapshot = carriers?.snapshot() ?: CarrierSnapshot.EMPTY
+
+    val effectiveCarrier: CarrierKind get() = carriers?.sendKind ?: CarrierKind.BLUETOOTH
+
+    val bluetoothCarrierAlive: Boolean get() = carriers?.snapshot()?.bluetoothAlive ?: true
+
+    internal fun addCarrierListener(listener: CarrierListener) {
+        carrierListeners.add(listener)
+    }
+
+    internal fun removeCarrierListener(listener: CarrierListener) {
+        carrierListeners.remove(listener)
+    }
+
+    /** The retained `UW` array itself: copy it (`copyOf()`), never wipe it; null only for a BMH2 call or a failed derivation. [R M-5] */
+    val sessionWifiKey: ByteArray? get() = contentSession?.wifiKey
+
+    /** The carrier label the Link health sheet shows (null = Bluetooth). */
+    @Volatile var activeCarrierLabel: String? = null
+        private set
+
+    private val carrierListeners = CarrierListeners()
+
+    private fun notifyCarrierListeners(event: CarrierEvent, carrierId: Int, kind: CarrierKind?, reason: String) {
+        val change = CarrierChange(event, carrierId, kind, reason, carrierSnapshot())
+        carrierListeners.notify(change) { name -> Log.w("BluetoothVideo", "carrier listener failed: $name") }
     }
 
     /**
@@ -2108,7 +2945,7 @@ class AndroidPrivateVideoCall(
 
     private fun sendMedia(flags: Int, presentationTimeUs: Long, bytes: ByteArray) {
         // Nothing of this phone's goes to a person revealed as blocked while the delayed hang-up is pending.
-        if (blockedAfterReveal) return
+        if (blockedCall.active) return
         if (flags and (StreamProtocol.FLAG_AUDIO or StreamProtocol.FLAG_CODEC_CONFIG) == 0) {
             debugStageTrace?.record("send_enqueue", presentationTimeUs, bytes.size)
         }
@@ -2244,6 +3081,15 @@ class AndroidPrivateVideoCall(
 
     @Synchronized
     private fun acceptIncoming(activeConnection: CallConnection) {
+        // A closed endpoint never answers (a late listener of an overtaken start, STREAM-INTEROP block 1).
+        if (!running.get()) {
+            activeConnection.close()
+            return
+        }
+        // Should never happen with the endpoint stopped at stream join; makes a regression one grep away.
+        if (CallListenerViewing.viewing()) {
+            Log.w("BluetoothVideo", (if (BuildConfig.DEBUG) "BENCHMARK " else "") + CallListenerViewing.logLine(endpointTransport.shortLabel))
+        }
         requestedLinkPhy = phyPreference
         offerViaPrefix = null
         // Experimental store-and-forward (N3): a connection arriving during an exchange is treated as
@@ -2282,6 +3128,18 @@ class AndroidPrivateVideoCall(
         if (CallSetupDeadlines.incomingDeadlineApplies(dualEndpoint, relayedCallsOn, DebugTunables.callHandshakeDeadlineAll)) {
             startIncomingDeadline(activeConnection, dualEndpoint)
         }
+        // Design PP package A (both switches default off): the hop-authentication timer starts at the accept and ends at the
+        // verified hop plus opening; the existing 20 s deadline above stays as it was.
+        incomingPhases?.cancelAll()
+        val phases = IncomingPhaseTimers(
+            incomingPhaseGeneration.incrementAndGet(), DebugTunables.callPreauthDeadlineShort, DebugTunables.callPreInviteDeadline,
+        )
+        incomingPhases = phases
+        phases.accepted(transport, activeConnection.carrierKind)?.let {
+            startIncomingPhaseTimer(phases, phases.hop, activeConnection, transport)
+        }
+        logIncomingMilestone(phases, IncomingMilestone.TRANSPORT_ACCEPT)
+        CallJoinStages.begin("callee")
         connectionThread = thread(name = "PrivateCallIncomingHandshake") {
             try {
                 establish(activeConnection, initiator = false, selected = null)
@@ -2316,6 +3174,9 @@ class AndroidPrivateVideoCall(
             return
         }
         connection = activeConnection
+        // Design PP package A: this accepted connection's phases (the answering side only; never an outgoing attempt).
+        val phases = if (initiator) null else incomingPhases
+        CallJoinStages.mark(CallJoinStage.LINK_UP, "link=${activeConnection.description}")
         presenceSession = null
         awaitedOpening = null
         openingToSend = null
@@ -2349,8 +3210,9 @@ class AndroidPrivateVideoCall(
                 relaySeek = relayHelper?.takeIf { RelaySeekFeature.active() }?.let { host -> { host.seekFeatures() } },
             )
         }
-        heldLabels = CallerLabelPlan(LabelSendMoment.NEVER, LabelSendMoment.NEVER)
-        pendingRevealLabels = null
+        callerNames.reset()
+        blockedCall.reset()
+        calleeNames.reset()
         awaitedReveal = null
         revealEntries = emptyList()
         endpointSigner = identity
@@ -2361,10 +3223,13 @@ class AndroidPrivateVideoCall(
                 SecureBluetoothHandshake.initiate(input, output, identity, linkCapabilities, bmh3 = bmh3Initiator)
             } else {
                 SecureBluetoothHandshake.respond(
-                    input, output, identity, linkCapabilities, bmh3 = bmh3Responder, beforeHello = ::strangerTarpit,
+                    input, output, identity, linkCapabilities, bmh3 = bmh3Responder,
+                    // Only a BMH2 first frame reaches here: a legacy hop keeps the conservative bound (Design PP package A).
+                    beforeHello = { peer -> phases?.legacyFirstFrame(); strangerTarpit(peer) },
                 )
             }
         }
+        activeConnection.onAuthenticated()   // [AM 12] F-3: the hop handshake on this connection succeeded
         // Review 2026-10-27 (finding 7): while the phone is call-ready only because the Meet screen is open, it accepts
         // nothing but the code, whatever handshake the peer spoke (the BMH3 responder refused other connections, but a
         // BMH2 hello, accepted when pseudonyms are off, went on as an ordinary call).
@@ -2384,6 +3249,11 @@ class AndroidPrivateVideoCall(
             }
         }
         val opening = exchangeLinkOpening(link, initiator, pinsAtAccept)
+        if (phases != null) {
+            // Hop milestone (verified hop plus the required opening): the hop timer ends here, never at `contentSession`.
+            if (!phases.hopVerified()) throw IOException("The hop deadline passed before the link was verified")
+            logIncomingMilestone(phases, IncomingMilestone.HOP_VERIFIED)
+        }
         // A pseudonymous callee cannot open the selected ID yet; its reveal binds it later (awaitedReveal).
         if (!link.peerPseudonymous) selected?.let { checkSelectedPeer(it, link, opening) }
         onHopAuthenticated()
@@ -2498,6 +3368,12 @@ class AndroidPrivateVideoCall(
             error("Verification session scope")
         }
         if (!initiator && endpoint.qrTagMatched) beginQrVerifySession(endpoint)
+        if (phases != null) {
+            phases.endpointAuthenticated()
+            logIncomingMilestone(phases, IncomingMilestone.ENDPOINT_AUTHENTICATED)
+        }
+        // DEBUG only: the throwaway this callee presented to its link peer, for the benchmark runner's relayed-call binding.
+        if (BuildConfig.DEBUG && !initiator) PseudonymOwnLog.line(link)?.let { Log.i("BluetoothVideo", it) }
         // Rotating IDs, Phase 1b: when both endpoint hellos carry bit 3 the callee's first end-to-end record,
         // sent right before its first answer to the Invite, is a BDX1 OPENING (its pinned role-0 entries). A
         // caller that selected a version 5 offer verifies it before anything else from the callee (RD6).
@@ -2521,7 +3397,7 @@ class AndroidPrivateVideoCall(
             presenceSession = if (qrScope != null || (initiator && qrScanPayload != null)) {
                 // Design QL: in a verification session eligibility is decided when this side starts (scanner: after the
                 // user's yes; displayer: when the scanner's OFFER arrives) and re-checked when each record is sent.
-                PresenceSession(localEligible = true)
+                PresenceSession(localEligible = true, verification = true)
             } else {
                 newPresenceSession(endpoint.peerNodeId, endpoint.peerFingerprint, "handshake", log = !endpoint.peerIsPseudonym)
             }
@@ -2547,6 +3423,10 @@ class AndroidPrivateVideoCall(
                         .copyOf(DiscoveryAnnouncement.NODE_PREFIX_BYTES)
                         .contentEquals(announcement.nodeIdPrefix),
                 ) { "Call peer identity changed between discovery and connection" }
+                // SEC-B3: a direct call (cost 0) must reach the callee itself, not a link-layer relay advertising its prefix.
+                DirectCallPeerBinding.requireBound(
+                    announcement, link.peerNodeId, endpoint.peerNodeId, "Call peer identity changed between discovery and connection",
+                )
             }
         }
         // Experimental relayed calls: the route proved itself only when the target's identity checked out; a reveal or an
@@ -2600,7 +3480,10 @@ class AndroidPrivateVideoCall(
         activePlaybackDelayProfile = currentCallPlaybackProfile()
         // One choice operation for this direction (Design HC F12); both masters off: privateCallCodecForPeer as before.
         val codecPower = codecPowerAtStart ?: CodecPowerAware.read(appContext).also { codecPowerAtStart = it }
-        val codecSwitches = VideoCodecSwitches.current(power = codecPower)
+        // AP5 test_sw_shortfall_avc: read once, when this call first chooses its codec (empty while the switch is off).
+        val slowSoftware = slowSoftwareAtStart
+            ?: SoftwareShortfallStore.slowEncoders(appContext, activeSettings).also { slowSoftwareAtStart = it }
+        val codecSwitches = VideoCodecSwitches.current(power = codecPower, slowSoftware = slowSoftware)
         val codecChoice = VideoCodecChoice.forCall(
             requested = codec,
             userChoice = AutomaticEncoderChoice.userChoice,
@@ -2632,6 +3515,30 @@ class AndroidPrivateVideoCall(
         )
         secureSession = link
         contentSession = endpoint
+        val set = CarrierSet(
+            cutover = CarrierCutover(),
+            markers = markerForwarder,          // forwards to the current markerCodec; the placeholder until A5 installs its codec [X3]
+            host = CarrierHost(endpoint, initiator),
+            threadPrefix = "PrivateCall",
+            hopLabel = "call",
+            queueCapacityRecords = { maxOf(64, activeSettings.bitRate / 8 * 2 / 1200) },
+            flushIntervalNs = { kind -> privateCallMediaFlushIntervalMs(transport, stackFingerprint, peerMaxBitrateKbps, kind) * 1_000_000L },
+        )
+        peerSentWifiRecord = false
+        carriers = set
+        set.attachPrimary(
+            SessionCarrier(
+                activeConnection.carrierKind,
+                activeConnection.description,
+                link,
+                CarrierLivenessPolicy.of(activeConnection.carrierKind),
+                closesLink = false,
+            ) { },
+            linkGeneration.get(),
+        )
+        contentSink = set.sink
+        // This phone reads type-16 records only where A2's handshake rule allows it.
+        link.reader.acceptWifi = link.wifiReadOptIn
         calleeMedia = if (initiator) {
             null
         } else {
@@ -2649,7 +3556,18 @@ class AndroidPrivateVideoCall(
         fragmentStats = CallFragmentStats()
         fragmentProbeKbps = if (fragmentAirtimeMs > 0) runCatching { LinkCapacity.measuredLinkKbps(transport) }.getOrNull() else null
         firstLinkGeneration = linkGeneration.get()
+        wifiHop = createWifiHop(link, endpoint, initiator)
         startWriter(link, endpoint)
+        if (phases != null) {
+            // Pre-INVITE timer (switch default off): armed only for an ordinary incoming call, just before the reader that
+            // consumes the INVITE starts; a verification-only (BVMID2) session never gets one.
+            val session = if (qrScope != null || endpoint.qrTagMatched) IncomingSessionKind.VERIFICATION_ONLY else IncomingSessionKind.CALL
+            val viaRelay = endpoint.peerNodeId != link.peerNodeId
+            phases.readerStarting(session, transport, activeConnection.carrierKind, viaRelay)?.let {
+                startIncomingPhaseTimer(phases, phases.preInvite, activeConnection, transport)
+            }
+            logIncomingMilestone(phases, IncomingMilestone.READER_STARTED)
+        }
         startReader(link, endpoint, initiator)
         if (renewalNegotiated) startRenewalSupervisor(endpoint)
         val scan = qrScanPayload
@@ -2676,35 +3594,46 @@ class AndroidPrivateVideoCall(
         }
         qrScope?.let { scope -> if (!initiator) armQrDisplayer(scope, endpoint, link.peerNodeId) }
         if (initiator) {
-            // Experimental peer labels: the caller's name and subject, bound to this call ID, queued
+            // Experimental peer labels: the caller's name, bound to this call ID, queued
             // before Invite only when the callee's endpoint hello has bit 5 (design 3.4).
             // A relayed version 5 callee is proven only by its OPENING, which it sends after the Invite: the
-            // name and subject then follow it (the callee takes labels before or after the Invite alike).
-            // Naming v2 (Design G, G1): one decision, [CallLabelPolicy.callerPlan]. The subject is always held until the
-            // callee's reveal is verified; the name goes now (stranger session, "Show my name before they answer"),
-            // after the reveal (the Design F control arm), after the OPENING (a relayed callee) or only to verified
-            // contacts, by the audience setting.
-            val plan = CallLabelPolicy.callerPlan(
-                CallerLabelContext(
-                    labelsNegotiated = peerAcceptsLabels,
-                    hasName = PeerLabelFeature.localName != null,
-                    hasSubject = outgoingSubject != null,
-                    audience = PeerLabelFeature.audience,
-                    nameBeforeAnswer = PeerLabelFeature.nameBeforeAnswer,
-                    calleeAwaitsReveal = awaitedReveal != null,
-                    relayedAwaitsOpening = awaitedOpening?.selected?.routeCost?.let { it > 0 } == true,
-                    calleeIsVerifiedContact = peerIsVerifiedContact(endpoint),
-                ),
+            // name then follows it (the callee takes labels before or after the Invite alike).
+            // Naming v2 (Design G, G1): one decision, [CallLabelPolicy.callerPlan], with the call site's inputs
+            // ([CallerNameRelease.plan]). Design decision 2026-11-06: a stranger (a throwaway callee, with or without a
+            // selected offer) gets the name only after its verified, unblocked REVEAL; a relayed real-key callee after its
+            // OPENING; a real-key callee now unless it is blocked; "Only my contacts" only verified contacts. The
+            // Experimental `names_before_answer` arm alone sends a stranger's name now. No call subject is sent.
+            val plan = CallerNameRelease.plan(
+                labelsNegotiated = peerAcceptsLabels,
+                hasName = PeerLabelFeature.localName != null,
+                audience = PeerLabelFeature.audience,
+                nameBeforeAnswer = PeerLabelFeature.nameBeforeAnswer,
+                awaitedReveal = awaitedReveal != null,
+                peerIsPseudonym = endpoint.peerIsPseudonym,
+                relayedAwaitsOpening = awaitedOpening?.selected?.routeCost?.let { it > 0 } == true,
+                calleeIsVerifiedContact = peerIsVerifiedContact(endpoint),
             )
-            heldLabels = plan
-            logLabelDecision("caller", plan.name, plan.subject)
-            val nameNow = plan.name == LabelSendMoment.NOW
-            val subjectNow = plan.subject == LabelSendMoment.NOW
-            if (nameNow || subjectNow) queueCallerLabels(includeName = nameNow, includeSubject = subjectNow)
+            logLabelDecision("caller", plan.name)
+            callerNames.start(plan, realPeer = endpoint.takeUnless { it.peerIsPseudonym }?.peerFingerprint)
+            // AB3 (Windows WP6N real-key screen; before, only the name was withheld): a callee whose handshake showed the
+            // real key of a person this phone blocked gets nothing more (no name, camera, microphone or presence) and its
+            // media is dropped. The INVITE still goes, so its phone rings as for any call and then sees the ordinary
+            // cancel (or the ordinary hang-up if it answered) after the human-like delay. Fails open (PersonPolicy).
+            val realKeyBlocked = CallBlockingPolicy.endsRealKeyCall(
+                caller = true,
+                peerPseudonymous = endpoint.peerIsPseudonym,
+                blocked = { PersonPolicy.blocked(endpoint.peerFingerprint) },
+            )
+            if (realKeyBlocked) {
+                callerNames.onPeerBlocked()
+                endBlockedAfterReveal(Bmh3Reveal.ROLE_CALLER, after = "handshake")
+            }
             // INVITE, then CAMERA_OFF for a voice call (experimental), in one ordered control queue.
             (negotiation?.inviteSignals() ?: listOf(PrivateCallSignal.INVITE)).forEach { enqueueSignal(it) }
         }
-        onStatus(
+        CallJoinStages.mark(CallJoinStage.AUTHENTICATED)
+        // AB3: a blocked person's identity is not shown (the call ends shortly with the existing blocked message).
+        if (!blockedCall.active) onStatus(
             "Encrypted private-call link to " +
                 (if (endpoint.peerIsPseudonym) "an unverified stranger" else endpoint.peerNodeId.shortLabel()) +
                 " over ${activeConnection.description}",
@@ -2738,6 +3667,12 @@ class AndroidPrivateVideoCall(
     /** A running renewal decides when the call ends; the normal liveness close waits for it. */
     private fun renewalOwnsLiveness(): Boolean = renewalOfferer.ownsLiveness() || renewalArmed.suspendsLiveness()
 
+    /**
+     * True while an in-call renewal runs (amendment 10 f): the attempt owner's precedence rule, and the set's 12 s end
+     * deferral. NOT `phase != IDLE`, which sticks on WAITING_OLD_LINK/FAILED and would hold every end and block attempts.
+     */
+    fun renewalBusy(): Boolean = renewalOfferer.ownsLiveness() || renewalArmed.suspendsLiveness()
+
     /** A thread of [gen] that failed belongs to a link the renewal replaces or owns: end only the thread. */
     private fun renewalEndsOldLinkQuietly(gen: Int): Boolean =
         callRunning.get() && (
@@ -2752,6 +3687,61 @@ class AndroidPrivateVideoCall(
         renewalLinkDead = true
     }
 
+    private fun createWifiHop(link: SecureBluetoothSession, endpoint: EndToEndVideoSession, initiator: Boolean): WifiHopAgent? {
+        // Not for BVMID2 verification scans, peers without BWF1 (the opt-in below) or a call whose carrier 0 is itself Wi-Fi (A8 native link, X14).
+        // Relayed calls ARE included (M-3, X8): their link peer is a relay and the key is the hop key.
+        if (qrScanPayload != null) return null
+        if (!link.reader.acceptWifi) {
+            // A forced Wi-Fi arm that cannot start must say so: without this line the case silently runs on Bluetooth.
+            val requested = DebugTunables.wifiForceCarrier
+            if (requested == "aware" || requested == "direct") {
+                WifiLog.emit(WifiLog.carrier(WifiHopKind.CALL.log, requested, "bluetooth", "no_opt_in"))
+            }
+            return null
+        }
+        if (carrierSnapshot().kinds[0]?.isWifi == true) return null
+        val relayEdge = linkPeerIsRelay(link.peerNodeId, endpoint.peerNodeId)   // [Am 12][R-13]: the same answer at both ends of the edge
+        val ticketRegistry = CarrierTickets()
+        markerCodec = WifiMarkerCodec(ticketRegistry)    // before the first addWifiCarrier: A3 refuses a carrier while the placeholder codec is installed [X3]
+        val ports = object : WifiHopPorts {
+            override val isLinkInitiator = initiator
+            override val tickets = ticketRegistry
+            override fun optedIn() = link.reader.acceptWifi
+            override fun callActive() = state?.phase == PrivateCallPhase.ACTIVE
+            override fun revealsDone(): Boolean = endpoint.reveal?.let { r ->
+                (!r.peerPseudonymous || r.revealed != null) && (!r.ownPseudonymous || r.ownRevealSent)
+            } ?: true
+            override fun renewalRunning() = renewalBusy()
+            override fun hasWifiCarrier() = carrierSnapshot().hasWifiCarrier
+            override fun fallbackCount() = carrierSnapshot().fallbackCount
+            override fun sendRecord(record: Bwf) = offerWifiRecord(0, record.encode())
+            // A copy the attempt wipes; a key zeroed by close() counts as no key. A BMH2 end-to-end call has no key:
+            // the agent then sends all-clear CAPS and declines every HOST.
+            override fun uwCopy(): ByteArray? = wifiKeyFor(relayEdge, endpoint.wifiKey, link.hopWifiKey)?.copyOf()?.takeIf { k -> k.any { it != 0.toByte() } }   // relayEdge, not relayHops [Am 12]
+            override fun offerCarrier(carrier: WifiSocketCarrier): Int {
+                val id = addWifiCarrier(carrier)
+                if (id >= 0) { ticketRegistry.register(id, carrier.ticket); wifiCarrierPending(id); wifiCarrierUp(id) }   // register BEFORE pending: a marker can be encoded at once
+                return id
+            }
+            // hopWifiKey = null: closing the carrier must not zero the primary's UW (A2: SecureBluetoothSession.close() calls dropWifiKey())
+            override fun carrierLink(reader: SecureRecordReader, writer: SecureRecordWriter) = (secureSession ?: link).copy(reader = reader, writer = writer, hopWifiKey = null)
+            override fun carrierDied(id: Int, reason: String) = wifiCarrierDied(id, reason)
+            override fun localReady() = Bwf.Ready(0xFFFF, 0, 0xFFFF)     // interim: no receive ceiling, family cap or transport budget known (R-12)
+            override fun protocolViolation(carrierId: Int, reason: String) { if (carrierId != 0) wifiProtocolViolation(carrierId, reason) }   // never carrier 0 [Am 6]
+            override fun carrierSwitchOff() { switchCarriersOff() }    // the machine is reached only through CarrierSet; NOT wifiSwitchOff(), which would recurse
+            override fun carrierSample(id: Int): CarrierSample? {
+                val s = carrierSnapshot(); val st = s.stats[id] ?: return null
+                return CarrierSample(isSendCarrier = s.sendCarrier == id, bytesWritten = st.bytesWritten, queuedContent = st.queuedContent, oldestQueuedAgeMs = st.oldestQueuedAgeMs)   // [Am 4] A3 CarrierStats field
+            }
+            override fun bluetoothBudgetKbps() = LinkCapacity.measuredLinkKbps(transport, CarrierKind.BLUETOOTH)
+            override fun requestedMediaKbps(): Int? = activeSettings.bitRate.takeIf { it > 0 }?.div(1_000)
+            // AP10: other Bluetooth media of this phone, from existing state only (never a radio query); this call's own link is not in any of it.
+            override fun otherBluetoothMedia(): Boolean = OtherBluetoothMedia.forCall(relayDuty = relayingNow)
+            override fun qualityFallback() = wifiQualityFallback()       // A3: carriers?.qualityFallback()
+        }
+        return WifiHopAgent(ports, RealWifiEnv).also { agent -> wifiRecordHandler = { id, payload -> agent.onRecord(id, payload) } }
+    }
+
     /**
      * Review item 1: liveness no longer lives only in the reader and writer threads. One tick per call (renewal negotiated)
      * ends a call whose link died while no renewal owns it, and a silence the writer did not end (a blocked writer).
@@ -2761,17 +3751,23 @@ class AndroidPrivateVideoCall(
             val ticker = RenewalLivenessTicker()
             while (callRunning.get() && contentSession === endpoint) {
                 val nowMs = SystemClock.elapsedRealtime()
-                val verdict = CallStallTolerance.verdict(stallTolerance || renewalPossible(), System.nanoTime(), lastHeartbeatNs, lastSendProgressNs)
+                val nowNs = System.nanoTime()
+                val verdict = CallStallTolerance.verdict(stallTolerance || renewalPossible(), nowNs, lastHeartbeatNs, lastSendProgressNs)
+                // In fan-out the producer judges no liveness: the set's monitor does. This tick keeps the renewal trigger
+                // and "Poor connection" (which follows the carrier that sends) on carrier 0's measurements.
+                val fanoutSet = carriers
+                if (fanoutSet != null && fanoutSet.fanout) {
+                    if (fanoutSet.sendCarrier == 0) noteStall(verdict, nowNs)
+                    maybeStartRenewal(verdict, nowNs)
+                }
                 when (ticker.tick(verdict == CallStallTolerance.Verdict.END, renewalLinkDead, renewalOwnsLiveness(), nowMs)) {
                     RenewalLiveness.Decision.END_DEAD_LINK -> {
                         CallRenewalAndroid.log("supervisor", "failed", "reason=link_dead")
-                        fail("Call link lost")
-                        return@thread
+                        if (!carrierLost(0, linkGeneration.get(), null, "Call link lost", "supervisor")) return@thread
                     }
                     RenewalLiveness.Decision.END_SILENCE -> {
                         CallRenewalAndroid.log("supervisor", "failed", "reason=silence")
-                        fail("Call link lost: Call peer stopped responding")
-                        return@thread
+                        if (!carrierLost(0, linkGeneration.get(), null, "Call link lost: Call peer stopped responding", "supervisor")) return@thread
                     }
                     RenewalLiveness.Decision.NONE -> Unit
                 }
@@ -2852,6 +3848,7 @@ class AndroidPrivateVideoCall(
         val offerer = renewalOfferer
         offerer.offer(ticket)
         renewalAttempts.record(SystemClock.elapsedRealtime())
+        wifiHop?.onRenewalStarting()
         enqueueRenew(CallRenewalWire.Offer(ticket, renewalRole))
         CallRenewalAndroid.log("offerer", "offer", "attempt=${renewalAttempts.count} | silentMs=$silentMs")
         thread(name = "CallRenewalOfferer") { runOfferer(offerer, endpoint, oldLink, key, callId, ticket) }
@@ -2881,7 +3878,12 @@ class AndroidPrivateVideoCall(
                         scanner.stop()
                         CallRenewalAndroid.log("offerer", "failed", "reason=bound | ms=${elapsedSinceOffer(offerer)}")
                         // The bound is reached only after the old link was broken (the scan ends at 6 s): no link to hang up on.
-                        fail("Call link lost: the link renewal did not complete")
+                        if (carriers?.fanout == true) {
+                            renewalOfferer = RenewalOfferer(SystemClock::elapsedRealtime)
+                            carrierLost(0, linkGeneration.get(), null, "Call link lost: the link renewal did not complete", "renewal_failed")
+                        } else {
+                            fail("Call link lost: the link renewal did not complete")
+                        }
                         return
                     }
                     RenewalOfferer.Tick.NONE -> Unit
@@ -2923,9 +3925,12 @@ class AndroidPrivateVideoCall(
         linkGeneration.incrementAndGet()
         val oldWriter = writerThread
         runCatching { connection?.close() }
-        oldWriter?.takeIf { it !== Thread.currentThread() }?.let { writer ->
-            writer.interrupt()
-            runCatching { writer.join(RENEWAL_JOIN_MS) }
+        // Amendment 10 c: in fan-out the producer keeps running across the renewal; the set ends carrier 0 itself.
+        if (carriers?.fanout != true) {
+            oldWriter?.takeIf { it !== Thread.currentThread() }?.let { writer ->
+                writer.interrupt()
+                runCatching { writer.join(RENEWAL_JOIN_MS) }
+            }
         }
         runCatching { secureSession?.close() }
     }
@@ -3022,7 +4027,12 @@ class AndroidPrivateVideoCall(
                 CallRenewalAndroid.log("offerer", "failed", "reason=bind_write_${error.javaClass.simpleName}")
                 newLink.close()
                 opened.close()
-                fail("Call link lost: the link renewal did not complete")
+                if (carriers?.fanout == true) {
+                    renewalOfferer = RenewalOfferer(SystemClock::elapsedRealtime)
+                    carrierLost(0, linkGeneration.get(), null, "Call link lost: the link renewal did not complete", "renewal_failed")
+                } else {
+                    fail("Call link lost: the link renewal did not complete")
+                }
                 return true
             }
             switchToRenewedLink(gattConnection(opened, address = runCatching { device.address }.getOrNull()), newLink, endpoint, "offerer")
@@ -3104,6 +4114,7 @@ class AndroidPrivateVideoCall(
             return
         }
         if (!yielded) renewalAttempts.record(nowMs)
+        wifiHop?.onRenewalStarting()
         CallRenewalAndroid.log("armed", "offer", "attempt=${renewalAttempts.count} | yielded=$yielded")
         val armed = renewalArmed
         thread(name = "CallRenewalArmed") { armRenewal(armed, offer.ticket) }
@@ -3184,7 +4195,12 @@ class AndroidPrivateVideoCall(
                     RenewalArmed.Tick.END_CALL -> {
                         servers.abandonAttempt()
                         CallRenewalAndroid.log("armed", "failed", "reason=no_bind")
-                        fail("Call link lost: the link renewal did not complete")
+                        if (carriers?.fanout == true) {
+                            renewalArmed = RenewalArmed(SystemClock::elapsedRealtime)
+                            carrierLost(0, linkGeneration.get(), null, "Call link lost: the link renewal did not complete", "renewal_failed")
+                        } else {
+                            fail("Call link lost: the link renewal did not complete")
+                        }
                         return
                     }
                     RenewalArmed.Tick.REFUSE_REGISTRATION, RenewalArmed.Tick.NONE -> Unit
@@ -3262,7 +4278,11 @@ class AndroidPrivateVideoCall(
             val record = newLink.reader.read()
             val accepted = synchronized(recordLock) {
                 val content = if (record.type == SecureRecordType.END_TO_END_CONTENT) {
-                    runCatching { endpoint.opener.open(record.payload) }.getOrNull()
+                    // Amendment 10 d: in fan-out the producer keeps sealing across the renewal, so records sealed after BIND
+                    // can reach the opener first; the renewal link's keys already make this BIND fresh and single.
+                    runCatching {
+                        if (carriers?.fanout == true) endpoint.opener.openOutOfBand(record.payload) else endpoint.opener.open(record.payload)
+                    }.getOrNull()
                 } else {
                     null
                 }
@@ -3309,14 +4329,20 @@ class AndroidPrivateVideoCall(
         renewalSilenceFromNs = silenceFromNs
         val oldConnection = connection
         val oldLink = secureSession
+        // A renewed link has no marker fields of its own (they are false by construction, A2 step 3): it inherits the
+        // old reader's opt-in. The flag is a volatile boolean that survives the old link's close.
+        newLink.reader.acceptWifi = oldLink?.reader?.acceptWifi == true
         val oldWriter = writerThread
         connection = newConnection
         secureSession = newLink
         if (oldConnection !== newConnection) runCatching { oldConnection?.close() }
         // Review item 7: the old writer (on the armed phone it may be blocked in the stalled link) is stopped and joined.
-        oldWriter?.takeIf { it !== Thread.currentThread() }?.let { writer ->
-            writer.interrupt()
-            runCatching { writer.join(RENEWAL_JOIN_MS) }
+        // Amendment 10 c: in fan-out the producer keeps sealing into the set; the set ends carrier 0 itself.
+        if (carriers?.fanout != true) {
+            oldWriter?.takeIf { it !== Thread.currentThread() }?.let { writer ->
+                writer.interrupt()
+                runCatching { writer.join(RENEWAL_JOIN_MS) }
+            }
         }
         if (oldLink !== newLink) runCatching { oldLink?.close() }
         if (role == "armed") renewalServers.bound()?.stopAdvertisingNow()
@@ -3328,9 +4354,20 @@ class AndroidPrivateVideoCall(
         receivedDelivery = LinkDeliveryCounter()
         peerDelivery = PeerDeliveryEstimate()
         noteStall(CallStallTolerance.Verdict.OK, now)
-        startWriter(newLink, endpoint, gen)
+        // Review A3 P1-1: exactly one re-assert per renewal (fan-out: the machine's, queued behind its marker; inline: here).
+        val machineReasserts = carriers?.replacePrimary(
+            SessionCarrier(
+                newConnection.carrierKind,
+                newConnection.description,
+                newLink,
+                CarrierLivenessPolicy.of(newConnection.carrierKind),
+                closesLink = false,
+            ) { },
+            gen,
+        ) == true
+        if (carriers?.fanout != true) startWriter(newLink, endpoint, gen)
         startReader(newLink, endpoint, renewalRole == 0, gen)
-        reassertAfterRenewal()
+        if (!machineReasserts) reassertAfterRenewal()
         onStatus("Call link renewed over ${newConnection.description}")
     }
 
@@ -3342,16 +4379,6 @@ class AndroidPrivateVideoCall(
         enqueueSignal(if (muted) PrivateCallSignal.MICROPHONE_MUTED else PrivateCallSignal.MICROPHONE_UNMUTED)
         lastCameraSignal?.let { enqueueSignal(it) }
         lastLabelsPayload?.let { controls.offerMust(OutboundControl.Labels(it)) }
-    }
-
-    private fun queueCallerLabels(includeName: Boolean = true, includeSubject: Boolean = true) {
-        val binding = LabelBinding.call(requireNotNull(state).callId)
-        val labels = listOfNotNull(
-            if (includeName) LocalLabels.signed(endpointSigner, LabelKind.PERSON_NAME, binding, PeerLabelFeature.localName) else null,
-            if (includeSubject) LocalLabels.signed(endpointSigner, LabelKind.CALL_SUBJECT, binding, outgoingSubject) else null,
-        )
-        if (labels.isNotEmpty()) controls.offerMust(OutboundControl.Labels(SignedLabelCodec.encodeContainer(labels)))
-        Log.i("BluetoothVideo", "BENCHMARK peer_labels call_tx: role=caller | count=${labels.size}")
     }
 
     private fun startWriter(
@@ -3370,10 +4397,13 @@ class AndroidPrivateVideoCall(
                 var sampleSentBytes = 0L
                 var sampleThinned = thinnedVideoFrames.get()
                 var sampleShed = boundedShedFrames.get()
+                // DEBUG controlled impairment test_call_inject_send_pause (CallSendPauseInject); null = unchanged writer.
+                val sendPause = CallSendPauseInject.newSchedule { line -> if (BuildConfig.DEBUG) Log.i("BluetoothVideo", line) }
                 val mediaFlushIntervalNs = privateCallMediaFlushIntervalMs(
                     transport,
                     stackFingerprint,
                     peerMaxBitrateKbps,
+                    carriers?.kindOf(0) ?: CarrierKind.BLUETOOTH,
                 ) * 1_000_000L
                 // Tell the peer this hop accepts version 3 (delivery) reports. Older endpoints take a
                 // version-1 heartbeat as plain liveness and keep sending version 2.
@@ -3387,9 +4417,9 @@ class AndroidPrivateVideoCall(
                         Log.i("BluetoothVideo", "Call link pacer seeded at $kbps kbps until the peer's first report (${transport.shortLabel})")
                     }
                 }
-                while (callRunning.get() && gen == linkGeneration.get()) {
+                while (callRunning.get() && (gen == linkGeneration.get() || carriers?.fanout == true)) {
                     // DEBUG test_call_tx_stall_after_s: this phone's first link stops sending, as a stalled stack does.
-                    if (debugTxStalled(gen)) {
+                    if (debugTxStalled(if (carriers?.fanout == true) linkGeneration.get() else gen)) {
                         Thread.sleep(DEBUG_TX_STALL_SLICE_MS)
                         continue
                     }
@@ -3397,12 +4427,17 @@ class AndroidPrivateVideoCall(
                     var closeAfter = false
                     when (control) {
                         is OutboundControl.Signal -> {
-                            unflushedSignals += control
-                            writeCallSignal(link, endpoint, control.message)
+                            val set = carriers
+                            if (set == null || !set.fanout) unflushedSignals += control
+                            if (set == null) {
+                                writeCallSignal(link, endpoint, control.message)
+                            } else {
+                                set.withCookie(control) { writeCallSignal(link, endpoint, control.message) }
+                            }
                             closeAfter = control.closeAfter
                         }
                         OutboundControl.Header -> EndToEndStreamProtocol.writeHeader(
-                            link.writer,
+                            sinkFor(link),
                             endpoint.sealer,
                             activeCodec.protocolId,
                             activeSettings,
@@ -3410,35 +4445,81 @@ class AndroidPrivateVideoCall(
                             includeAudio = true,
                         )
                         OutboundControl.KeyFrameRequest -> EndToEndStreamProtocol.writeKeyFrameRequest(
-                            link.writer,
+                            sinkFor(link),
                             endpoint.sealer,
                         )
                         is OutboundControl.Labels -> {
-                            link.writer.write(
-                                SecureRecordType.END_TO_END_CONTENT,
-                                endpoint.sealer.seal(EndToEndContentType.LABELS, 0, control.payload),
-                            )
+                            val set = carriers
+                            if (set == null) {
+                                sinkFor(link).write(
+                                    SecureRecordType.END_TO_END_CONTENT,
+                                    endpoint.sealer.seal(EndToEndContentType.LABELS, 0, control.payload),
+                                )
+                            } else {
+                                set.withCookie(control) {
+                                    sinkFor(link).write(
+                                        SecureRecordType.END_TO_END_CONTENT,
+                                        endpoint.sealer.seal(EndToEndContentType.LABELS, 0, control.payload),
+                                    )
+                                }
+                            }
                             lastLabelsPayload = control.payload
                         }
-                        is OutboundControl.Renew -> link.writer.write(
-                            SecureRecordType.END_TO_END_CONTENT,
-                            endpoint.sealer.seal(EndToEndContentType.RENEW, 0, control.payload),
-                        )
-                        is OutboundControl.Discovery -> link.writer.write(
-                            SecureRecordType.END_TO_END_CONTENT,
-                            endpoint.sealer.seal(EndToEndContentType.DISCOVERY, 0, control.payload),
-                        )
+                        is OutboundControl.Renew -> {
+                            val set = carriers
+                            if (set == null) {
+                                sinkFor(link).write(
+                                    SecureRecordType.END_TO_END_CONTENT,
+                                    endpoint.sealer.seal(EndToEndContentType.RENEW, 0, control.payload),
+                                )
+                            } else {
+                                set.withCookie(control) {
+                                    sinkFor(link).write(
+                                        SecureRecordType.END_TO_END_CONTENT,
+                                        endpoint.sealer.seal(EndToEndContentType.RENEW, 0, control.payload),
+                                    )
+                                }
+                            }
+                        }
+                        is OutboundControl.Discovery -> {
+                            val set = carriers
+                            if (set == null) {
+                                sinkFor(link).write(
+                                    SecureRecordType.END_TO_END_CONTENT,
+                                    endpoint.sealer.seal(EndToEndContentType.DISCOVERY, 0, control.payload),
+                                )
+                            } else {
+                                set.withCookie(control) {
+                                    sinkFor(link).write(
+                                        SecureRecordType.END_TO_END_CONTENT,
+                                        endpoint.sealer.seal(EndToEndContentType.DISCOVERY, 0, control.payload),
+                                    )
+                                }
+                            }
+                        }
                         is OutboundControl.Reveal -> {
                             val reveal = control.build()
+                            val set = carriers
                             // Survives a link renewal before it was flushed (as the same bytes: it is signed only once).
-                            unflushedSignals += OutboundControl.Discovery(reveal)
-                            link.writer.write(
-                                SecureRecordType.END_TO_END_CONTENT,
-                                endpoint.sealer.seal(EndToEndContentType.DISCOVERY, 0, reveal),
-                            )
+                            if (set == null || !set.fanout) unflushedSignals += OutboundControl.Discovery(reveal)
+                            val cookie = OutboundControl.Discovery(reveal)
+                            if (set == null) {
+                                sinkFor(link).write(
+                                    SecureRecordType.END_TO_END_CONTENT,
+                                    endpoint.sealer.seal(EndToEndContentType.DISCOVERY, 0, reveal),
+                                )
+                            } else {
+                                set.withCookie(cookie) {
+                                    sinkFor(link).write(
+                                        SecureRecordType.END_TO_END_CONTENT,
+                                        endpoint.sealer.seal(EndToEndContentType.DISCOVERY, 0, reveal),
+                                    )
+                                }
+                            }
                         }
+                        is OutboundControl.Wifi -> carriers?.sendHop(control.carrier, SecureRecordType.BWF1, control.payload)
                         is OutboundControl.DisplayRotation -> EndToEndStreamProtocol.writePacket(
-                            link.writer,
+                            sinkFor(link),
                             endpoint.sealer,
                             StreamProtocol.FLAG_DISPLAY_ROTATION,
                             0L,
@@ -3447,7 +4528,15 @@ class AndroidPrivateVideoCall(
                         null -> {
                             // Experimental call-link pacing: wait for link credit before video, in
                             // slices so controls and heartbeats keep flowing; audio is never held.
-                            val paceWaitNs = if (pacedWrites && media.none(OutboundMedia::isAudio)) pacer.waitNs() else 0L
+                            // DEBUG test_call_inject_send_pause: all media (audio too) waits in the same slices while it holds.
+                            val injectHoldNs = sendPause?.holdNs(System.nanoTime()) ?: 0L
+                            val paceWaitNs = if (injectHoldNs > 0L) {
+                                injectHoldNs
+                            } else if (pacedWrites && media.none(OutboundMedia::isAudio)) {
+                                pacer.waitNs()
+                            } else {
+                                0L
+                            }
                             val packet = if (paceWaitNs > 0L) {
                                 val sliceNs = minOf(paceWaitNs, CALL_PACING_SLICE_NS)
                                 Thread.sleep(sliceNs / 1_000_000L, (sliceNs % 1_000_000L).toInt())
@@ -3472,13 +4561,16 @@ class AndroidPrivateVideoCall(
                                         ?.recordNanos(writeStartedNs - packet.debugQueuedAtNs)
                                 }
                                 val pacedStartNs = System.nanoTime()
+                                sendPause?.onMediaWritten(pacedStartNs)
                                 val written = writeMediaRecord(link, endpoint, packet) {
-                                    val flushNs = System.nanoTime()
-                                    if (mediaFlushIntervalNs == 0L || flushNs - lastFlushNs >= mediaFlushIntervalNs) {
-                                        link.writer.flush()
-                                        unflushedSignals.clear()
-                                        lastSendProgressNs = System.nanoTime()
-                                        lastFlushNs = flushNs
+                                    if (carriers?.fanout != true) {
+                                        val flushNs = System.nanoTime()
+                                        if (mediaFlushIntervalNs == 0L || flushNs - lastFlushNs >= mediaFlushIntervalNs) {
+                                            link.writer.flush()
+                                            unflushedSignals.clear()
+                                            lastSendProgressNs = System.nanoTime()
+                                            lastFlushNs = flushNs
+                                        }
                                     }
                                 }
                                 // Charged in payload bytes; record headers add about 50 B, inside PACE_GAIN.
@@ -3507,6 +4599,9 @@ class AndroidPrivateVideoCall(
                     if (nowNs - sampleStartNs >= LINK_SAMPLE_NS) {
                         val thinnedNow = thinnedVideoFrames.get()
                         val shedNow = boundedShedFrames.get()
+                        // Both delivery values from the carrier that sends (review A3 P3); no carrier (-1) reads carrier 0.
+                        val sendState = stateOf((carriers?.sendCarrier ?: 0).coerceAtLeast(0))
+                        val backlogAgeForPhy = media.peek()?.let { ((nowNs - it.queuedAtNs) / 1_000_000L).toInt() } ?: 0
                         onLinkSample(
                             LinkRateSample(
                                 windowNs = nowNs - sampleStartNs,
@@ -3519,18 +4614,33 @@ class AndroidPrivateVideoCall(
                                 peer = link.peerNodeId.shortLabel(),
                                 thinnedFrames = thinnedNow - sampleThinned,
                                 shedFrames = shedNow - sampleShed,
-                                deliveredKbps = peerDelivery.deliveredKbps(),
-                                peerQueueMs = peerDelivery.queueMs(),
+                                deliveredKbps = sendState.peerDelivery.deliveredKbps(),
+                                peerQueueMs = sendState.peerDelivery.queueMs(),
                                 reverseLateMaxMs = mediaReceiver?.takeReverseLateMaxMs(),
                             ),
                         )
+                        phyFirstGate?.let { gate ->
+                            val congested = (backlogAgeForPhy >= LinkRateController.CONGESTED_BACKLOG_MS && nowNs >= largeFrameGraceUntilNs) ||
+                                nowNs < peerLateUntilNs
+                            gate.onLinkWindow(congested)?.let(::requestCallTwoM)
+                            // Default (test_call_1m_first_link_limit off): the link limit keeps a first-1M call on 1M; logged once.
+                            if (gate.takeLinkLimitHeld()) {
+                                Log.i(
+                                    "BluetoothVideo",
+                                    CallOneMFirst.linkPhyLine(
+                                        "1M", "1M", "link_limit_held", secureSession?.peerNodeId?.shortLabel() ?: "unknown",
+                                        "budgetKbps=${CallOneMFirst.ONE_M_GATT_KBPS}",
+                                    ),
+                                )
+                            }
+                        }
                         sampleThinned = thinnedNow
                         sampleShed = shedNow
                         sampleSentBytes = 0L
                         sampleStartNs = nowNs
                     }
                     var heartbeatWritten = false
-                    if (nowNs - lastHeartbeatWrittenNs >= REPORT_INTERVAL_NS) {
+                    if (carriers?.fanout != true && nowNs - lastHeartbeatWrittenNs >= REPORT_INTERVAL_NS) {
                         // The heartbeat carries this phone's view of the media it receives on this
                         // link, so the peer's sender can adapt (hop-local; a relay forwards liveness only).
                         val arrivalKbps = link.reader.arrivalCapacityKbps() ?: 0
@@ -3544,10 +4654,13 @@ class AndroidPrivateVideoCall(
                         heartbeatWritten = true
                     }
                     if (
-                        mediaFlushIntervalNs == 0L ||
-                        control != null ||
-                        heartbeatWritten ||
-                        nowNs - lastFlushNs >= mediaFlushIntervalNs
+                        carriers?.fanout != true &&
+                        (
+                            mediaFlushIntervalNs == 0L ||
+                                control != null ||
+                                heartbeatWritten ||
+                                nowNs - lastFlushNs >= mediaFlushIntervalNs
+                            )
                     ) {
                         val flushStartedNs = if (debugPipelineTiming) System.nanoTime() else 0L
                         link.writer.flush()
@@ -3557,7 +4670,9 @@ class AndroidPrivateVideoCall(
                         lastFlushNs = nowNs
                     }
                     if (closeAfter) {
-                        val closeWait = privateCallCloseWait(transport, DebugTunables.callCloseWaitsForPeer)
+                        val closeSet = carriers
+                        if (closeSet != null && closeSet.fanout) closeSet.awaitDrained(closeSet.sendCarrier, 1_000)
+                        val closeWait = privateCallCloseWait(transport, DebugTunables.callCloseWaitsForPeer, carriers?.sendKind ?: CarrierKind.BLUETOOTH)
                         val outcome = awaitPrivateCallClose(readerThread, closeWait)
                         if (closeWait.maxMs > 0L) {
                             Log.i(
@@ -3571,19 +4686,31 @@ class AndroidPrivateVideoCall(
                         return@thread
                     }
                     // Experimental link renewal implies Stage A on a call that may renew; while a renewal runs, its own
-                    // bound replaces the liveness close (Design SR revision 2, rules 5 and 7).
-                    val stall = CallStallTolerance.verdict(stallTolerance || renewalPossible(), nowNs, lastHeartbeatNs, lastSendProgressNs)
-                    noteStall(stall, nowNs)
-                    maybeStartRenewal(stall, nowNs)
-                    if (stall == CallStallTolerance.Verdict.END && !renewalOwnsLiveness()) {
-                        hangUpBeforeLivenessClose(link, endpoint)
-                        throw IOException("Call peer stopped responding")
+                    // bound replaces the liveness close (Design SR revision 2, rules 5 and 7). In fan-out the producer
+                    // serves no carrier: the set's monitor judges liveness (step 9).
+                    if (carriers?.fanout != true) {
+                        val stall = CallStallTolerance.verdict(stallTolerance || renewalPossible(), nowNs, lastHeartbeatNs, lastSendProgressNs)
+                        noteStall(stall, nowNs)
+                        phyFirstGate?.let { gate ->
+                            val silentMs = (nowNs - lastHeartbeatNs).coerceAtLeast(0L) / 1_000_000L
+                            if (gate.onSilence(SystemClock.elapsedRealtime(), silentMs)) fallBackCallToOneM(silentMs)
+                        }
+                        maybeStartRenewal(stall, nowNs)
+                        if (stall == CallStallTolerance.Verdict.END && !renewalOwnsLiveness()) {
+                            hangUpBeforeLivenessClose(link, endpoint)
+                            throw IOException("Call peer stopped responding")
+                        }
                     }
                 }
             } catch (interrupted: InterruptedException) {
                 if (gen != linkGeneration.get()) requeueSignals(unflushedSignals)
                 Thread.currentThread().interrupt()
             } catch (error: Exception) {
+                // Amendment 11: in fan-out the producer serves no carrier; its exception is a local failure that ends the call.
+                if (carriers?.fanout == true) {
+                    if (callRunning.get()) onCallLinkError(error, "Call send failed: ${error.message ?: error.javaClass.simpleName}")
+                    return@thread
+                }
                 // Experimental link renewal: a write failing on a link that is being replaced ends only this thread.
                 if (renewalEndsOldLinkQuietly(gen)) {
                     requeueSignals(unflushedSignals)
@@ -3593,9 +4720,47 @@ class AndroidPrivateVideoCall(
                 // A send failing on a link the peer is already tearing down after its HANG_UP (phase ENDED,
                 // finish still pending on the reader) is that hang-up, not a call failure (mvp-smoke 0006). When this
                 // phone ended the call itself, the failed HANG_UP/CANCEL/DECLINE finishes it (review A1).
-                onCallLinkError(error, "Call send failed: ${error.message ?: error.javaClass.simpleName}")
+                carrierLost(0, gen, error, "Call send failed: ${error.message ?: error.javaClass.simpleName}", "write failed")
             }
         }
+    }
+
+    /**
+     * The reader's per-record work for carrier [carrierId] (today only carrier 0), under recordLock.
+     * Returns false when the record belongs to a replaced link generation (the reader ends).
+     */
+    @Suppress("UNUSED_PARAMETER")
+    private fun dispatchRecord(
+        record: SecureRecord,
+        endpoint: EndToEndVideoSession,
+        initiator: Boolean,
+        gen: Int,
+        carrierId: Int,
+    ): Boolean {
+        // Opened under the record lock with the generation check: a record that arrives on a replaced link
+        // is dropped unopened, and none is opened after an accepted BIND moved the generation.
+        synchronized(recordLock) {
+            if (gen != linkGeneration.get()) return false
+            if (videoReassembler.enterLinkGeneration(gen)) {
+                Log.i("BluetoothVideo", "BENCHMARK call_video_fragments: renewal_dropped_partial_frame | gen=$gen")
+            }
+            lastHeartbeatNs = System.nanoTime()
+            noteRenewedLinkHeard()
+            when (record.type) {
+                SecureRecordType.LINK_HEARTBEAT -> {
+                    noteRenewalPeerHeard()
+                    val report = SecureLinkControlProtocol.requireHeartbeat(record)
+                    if (report == null) notePeerHeartbeat(0, null) else onPeerReport(0, report)
+                }
+                SecureRecordType.END_TO_END_CONTENT -> {
+                    val content = endpoint.opener.open(record.payload)
+                    if (content.type != EndToEndContentType.RENEW) noteRenewalPeerHeard()
+                    handleContent(content, initiator)
+                }
+                else -> error("Unexpected private-call record ${record.type}")
+            }
+        }
+        return true
     }
 
     private fun startReader(
@@ -3608,28 +4773,11 @@ class AndroidPrivateVideoCall(
             try {
                 while (callRunning.get() && gen == linkGeneration.get()) {
                     val record = link.reader.read()
-                    // Opened under the record lock with the generation check: a record that arrives on a replaced link
-                    // is dropped unopened, and none is opened after an accepted BIND moved the generation.
-                    synchronized(recordLock) {
-                        if (gen != linkGeneration.get()) return@thread
-                        if (videoReassembler.enterLinkGeneration(gen)) {
-                            Log.i("BluetoothVideo", "BENCHMARK call_video_fragments: renewal_dropped_partial_frame | gen=$gen")
-                        }
-                        lastHeartbeatNs = System.nanoTime()
-                        noteRenewedLinkHeard()
-                        when (record.type) {
-                            SecureRecordType.LINK_HEARTBEAT -> {
-                                noteRenewalPeerHeard()
-                                val report = SecureLinkControlProtocol.requireHeartbeat(record)
-                                if (report == null) notePeerHeartbeat(null) else onPeerReport(report)
-                            }
-                            SecureRecordType.END_TO_END_CONTENT -> {
-                                val content = endpoint.opener.open(record.payload)
-                                if (content.type != EndToEndContentType.RENEW) noteRenewalPeerHeard()
-                                handleContent(content, initiator)
-                            }
-                            else -> error("Unexpected private-call record ${record.type}")
-                        }
+                    val set = carriers
+                    if (set == null) {
+                        if (!dispatchRecord(record, endpoint, initiator, gen, 0)) return@thread
+                    } else {
+                        set.onInbound(0, gen, record)
                     }
                 }
             } catch (error: LocalMediaPipelineException) {
@@ -3640,7 +4788,7 @@ class AndroidPrivateVideoCall(
                     noteLinkEndedQuietly(gen, "reader")
                     return@thread
                 }
-                onCallLinkError(error, "Call link lost: ${error.message ?: error.javaClass.simpleName}")
+                carrierLost(0, gen, error, "Call link lost: ${error.message ?: error.javaClass.simpleName}", "read failed", fromReader = true)
             }
         }
     }
@@ -3690,7 +4838,7 @@ class AndroidPrivateVideoCall(
         // Review R1/R4/R9: the scanner offers first; the displayer answers only a scanner its own user confirmed in this
         // visit, on a direct link (link peer = endpoint peer) with its real identity. Nothing is sent at the commit.
         val mayAnswer = qrCommitted && presenceSession != null && !endpoint.peerIsPseudonym &&
-            linkPeer == endpoint.peerNodeId && QrMeet.visit.displayerMayLease(endpoint.peerFingerprint)
+            linkPeer == endpoint.peerNodeId && QrMeet.visit.mayLease(endpoint.peerFingerprint)
         qrDisplayerMayAnswer = mayAnswer
         Bmh3Android.log("bmh3: event=qr_lease | role=displayer | mayAnswer=$mayAnswer")
         if (mayAnswer) armQrConfirmWait(scope) else qrCloseAfterGrace(scope)
@@ -3711,13 +4859,9 @@ class AndroidPrivateVideoCall(
         startPresenceSessionAsync()
     }
 
-    /** Displayer: the per-visit rule is re-checked at send time; any side withholds after a reuse alert in this visit. */
-    private fun qrLeaseAllowed(peer: IdentityFingerprint): Boolean = when {
-        qrScope == null -> true
-        QrMeet.visit.reuseAlerted() -> false
-        qrScanner -> true
-        else -> QrMeet.visit.displayerMayLease(peer)
-    }
+    /** Both roles: the per-visit consent is re-checked at send time; nothing leaves after a reuse alert or leaving the screen. */
+    private fun qrLeaseAllowed(session: PresenceSession, peer: IdentityFingerprint): Boolean =
+        QrLeaseRule.allowed(verificationSession = session.verification, visit = QrMeet.visit, peer = peer)
 
     /**
      * Design QL, scanner: the user answered "Is this X's screen you scanned?" for [peer]. Yes (the shield is stored): start
@@ -3781,23 +4925,15 @@ class AndroidPrivateVideoCall(
             awaitedOpening = null
             verifyAwaitedOpening(wait, content)
             markRelayRouteVerified()
-            val held = heldLabels
-            val nameNow = held.name == LabelSendMoment.AFTER_OPENING
-            val subjectNow = held.subject == LabelSendMoment.AFTER_OPENING
-            if (nameNow || subjectNow) {
-                heldLabels = CallerLabelPlan(
-                    if (nameNow) LabelSendMoment.NEVER else held.name,
-                    if (subjectNow) LabelSendMoment.NEVER else held.subject,
-                )
-                queueCallerLabels(includeName = nameNow, includeSubject = subjectNow)
-            }
+            // A relayed real-key callee's name moment: checked again against the block list and the newest audience.
+            callerNames.onOpeningVerified(PeerLabelFeature.audience, contentSession?.let { peerIsVerifiedContact(it) } == true)
             return
         }
         // Review 2026-10-19 (P1): nothing from the peer reaches the speaker or the screen before the call is answered.
         // Review 2026-10-27 (finding 1): nor from a pseudonymous peer before its reveal verified (CallerRevealGate).
         if (content.type in CallMediaGate.MEDIA_TYPES) {
             // A revealed blocked person's media never plays while the hang-up goes out (finding 2).
-            if (blockedAfterReveal) return
+            if (blockedCall.active) return
             when (CallMediaGate.decide(state?.phase, contentSession?.reveal?.peerRevealRequired() == true)) {
                 CallMediaGate.Decision.ALLOW -> Unit
                 CallMediaGate.Decision.DROP -> return
@@ -3870,7 +5006,7 @@ class AndroidPrivateVideoCall(
                 val receiver = requireNotNull(mediaReceiver) { "Peer sent media before its call header" }
                 val packet = EndToEndStreamProtocol.decodePacket(content)
                 // The same bytes the peer counts as written (it writes rotation outside its media queue).
-                if (packet.flags and StreamProtocol.FLAG_DISPLAY_ROTATION == 0) receivedDelivery.add(packet.payload.size)
+                if (packet.flags and StreamProtocol.FLAG_DISPLAY_ROTATION == 0) stateOf(arrivalCarrier).receivedDelivery.add(packet.payload.size)
                 if (!packet.isAudio) videoReassembler.requireIdleFor("A whole call video packet")
                 deliverMedia(receiver, packet)
             }
@@ -3879,7 +5015,7 @@ class AndroidPrivateVideoCall(
                 require(videoFragmentsOn) { "Peer sent call video fragments this endpoint did not advertise" }
                 val receiver = requireNotNull(mediaReceiver) { "Peer sent media before its call header" }
                 // Counted per fragment on arrival (not at reassembly), exactly as the peer wrote it.
-                receivedDelivery.add(content.payload.size - CallVideoFragments.HEADER_BYTES)
+                stateOf(arrivalCarrier).receivedDelivery.add(content.payload.size - CallVideoFragments.HEADER_BYTES)
                 val complete = videoReassembler.accept(content.flags, content.payload) ?: return
                 deliverMedia(receiver, EndToEndStreamProtocol.decodeReassembledPacket(content.flags, complete))
             }
@@ -3900,6 +5036,12 @@ class AndroidPrivateVideoCall(
         if (current == null) {
             require(!initiator && message.signal == PrivateCallSignal.INVITE) {
                 "Expected a private-call invitation"
+            }
+            // Design PP package A: a valid INVITE ends the pre-INVITE timer; false means the deadline closed this link at the
+            // same instant, so exactly one of the two happens and a closed link never rings.
+            incomingPhases?.let { phases ->
+                if (!phases.inviteArrived()) return
+                logIncomingMilestone(phases, IncomingMilestone.FIRST_INVITE)
             }
             val incoming = PrivateCallState.incoming(message.callId)
             negotiation = VoiceCallNegotiation.incoming(voiceCallsEnabled)
@@ -3951,6 +5093,8 @@ class AndroidPrivateVideoCall(
             // F14: the user is dialling someone else: this call is declined as busy, the dial goes on (DialCollision).
             declineBusyIfDialling()?.let { return }
             onPhase(incoming)
+            CallJoinStages.current.callId(if (BuildConfig.DEBUG) message.callId.toString() else null)
+            CallJoinStages.mark(CallJoinStage.RINGING)
             bufferedLabels?.let { applyCallLabels(it, message.callId) }
             bufferedLabels = null
             if (peerAcceptsLabels) prepareCalleeLabels(message.callId)
@@ -3969,13 +5113,14 @@ class AndroidPrivateVideoCall(
         when (message.signal) {
             PrivateCallSignal.RINGING -> {
                 transition(PrivateCallEvent.REMOTE_RINGING)
+                CallJoinStages.mark(CallJoinStage.RINGING)
                 ringingSinceMs = SystemClock.elapsedRealtime()
                 scheduleRingTimeout(current.callId, outgoing = true)
             }
             PrivateCallSignal.ACCEPT -> {
                 // A callee revealed as someone this phone blocked: the call ends shortly with an ordinary hang-up and
                 // nothing of this phone's (no camera, no microphone) goes to them meanwhile.
-                if (blockedAfterReveal) {
+                if (blockedCall.active) {
                     transition(PrivateCallEvent.REMOTE_ACCEPT)
                     return
                 }
@@ -3983,6 +5128,7 @@ class AndroidPrivateVideoCall(
                 // a verified reveal is a callee that could not prove it owns the offer.
                 require(awaitedReveal == null) { "Call peer identity changed between discovery and connection" }
                 transition(PrivateCallEvent.REMOTE_ACCEPT)
+                CallJoinStages.mark(CallJoinStage.ACCEPT, "by=peer")
                 startLocalMedia()
                 startPresenceSessionAsync()
             }
@@ -4008,10 +5154,12 @@ class AndroidPrivateVideoCall(
                 )
             }
             PrivateCallSignal.CAMERA_OFF -> {
+                wifiHop?.onVideo(remote = false)
                 noteRemoteCameraSignal(current.phase, enabled = false)
                 mediaReceiver?.setRemoteCameraEnabled(false) ?: onRemoteCameraEnabled(false)
             }
             PrivateCallSignal.CAMERA_ON -> {
+                wifiHop?.onVideo(remote = true)
                 noteRemoteCameraSignal(current.phase, enabled = true)
                 mediaReceiver?.setRemoteCameraEnabled(true) ?: onRemoteCameraEnabled(true)
             }
@@ -4023,7 +5171,8 @@ class AndroidPrivateVideoCall(
 
     /**
      * Experimental peer labels: verifies one container against this call's ID and the authenticated
-     * endpoint peer, then publishes the peer's self-chosen name and subject for this call only.
+     * endpoint peer, then publishes the peer's self-chosen name for this call only. A call subject (kind 3, retired
+     * 2026-11-05) from an older build is dropped by [LabelInbox] and never shown.
      */
     private fun applyCallLabels(payload: ByteArray, callId: java.util.UUID) {
         val endpoint = contentSession ?: return
@@ -4032,8 +5181,7 @@ class AndroidPrivateVideoCall(
         // Keyed by the identity the screens use (after a reveal the real one), never by a throwaway that is gone at the reveal.
         val prefix = endpoint.effectivePeerNodeId.shortLabel()
         val name = inbox.text(LabelKind.PERSON_NAME)
-        val subject = inbox.text(LabelKind.CALL_SUBJECT)
-        SessionPeerLabels.update(prefix) { it.copy(selfName = name, callSubject = subject) }
+        SessionPeerLabels.update(prefix) { it.copy(selfName = name) }
         // Naming v2: a verified contact's last claimed name is kept (sealed, local) for its detail and the one change note.
         if (name != null && peerIsVerifiedContact(endpoint)) {
             val fingerprint = endpoint.effectivePeerFingerprint
@@ -4041,7 +5189,7 @@ class AndroidPrivateVideoCall(
                 runCatching { ContactClaims.store(appContext).recordClaim(fingerprint, name, System.currentTimeMillis()) }
             }
         }
-        Log.i("BluetoothVideo", "BENCHMARK peer_labels call_rx: name=${name != null} | subject=${subject != null}")
+        Log.i("BluetoothVideo", "BENCHMARK peer_labels call_rx: name=${name != null}")
         onPeerLabels(prefix)
     }
 
@@ -4053,7 +5201,7 @@ class AndroidPrivateVideoCall(
         val endpoint = contentSession ?: return
         val label = LocalLabels.signed(endpointSigner, LabelKind.PERSON_NAME, LabelBinding.call(callId), PeerLabelFeature.localName)
         if (label == null) {
-            logLabelDecision("callee", LabelSendMoment.NEVER, null)
+            logLabelDecision("callee", LabelSendMoment.NEVER)
             return
         }
         val container = SignedLabelCodec.encodeContainer(listOf(label))
@@ -4065,28 +5213,26 @@ class AndroidPrivateVideoCall(
                 audience = PeerLabelFeature.audience,
                 ownPseudonymous = endpoint.reveal?.ownPseudonymous == true,
                 callerIsVerifiedContact = peerIsVerifiedContact(endpoint),
+                callerPseudonymous = endpoint.reveal?.peerPseudonymous == true,
+                holdUntilReveal = DebugTunables.calleeNameAfterReveal,
             ),
         )
-        logLabelDecision("callee", moment, null)
+        logLabelDecision("callee", moment)
         when (moment) {
             LabelSendMoment.AT_RINGING -> controls.offerMust(OutboundControl.Labels(container))
             LabelSendMoment.AT_ACCEPT -> pendingAcceptLabels = container
-            LabelSendMoment.AFTER_REVEAL_IF_VERIFIED -> pendingRevealLabels = container
+            LabelSendMoment.AFTER_REVEAL, LabelSendMoment.AFTER_REVEAL_IF_VERIFIED -> calleeNames.hold(moment, container)
             else -> Unit
         }
     }
 
     /**
      * DEBUG only: the [CallLabelPolicy] decision this side applied, so the name-before-answer rule can be checked on phones.
-     * The callee sends no subject (`subject=none`). No behaviour change.
+     * No behaviour change.
      */
-    private fun logLabelDecision(role: String, name: LabelSendMoment, subject: LabelSendMoment?) {
+    private fun logLabelDecision(role: String, name: LabelSendMoment) {
         if (!BuildConfig.DEBUG) return
-        Log.i(
-            "BluetoothVideo",
-            "BENCHMARK call_label_decision: role=$role | name=${name.name.lowercase()} | " +
-                "subject=${subject?.name?.lowercase() ?: "none"}",
-        )
+        Log.i("BluetoothVideo", "BENCHMARK call_label_decision: role=$role | name=${name.name.lowercase()}")
     }
 
     /** Experimental voice calls: Camera off while ringing is the caller's voice offer. */
@@ -4101,6 +5247,19 @@ class AndroidPrivateVideoCall(
         onIncomingCallType(if (active.peerOfferedVoice) CallType.VOICE else CallType.VIDEO)
     }
 
+    /**
+     * Experimental call pre-warm ([CallPrewarm]): the video profile [startLocalMedia] would give the camera now (its
+     * supported-mode and encoder-fit steps, without their logs or any state change); null for a voice call. Media start
+     * still computes its own profile; a pre-warmed encoder is used only when the two match exactly.
+     */
+    fun prewarmVideoProfile(): Pair<VideoSettings, VideoCodec>? {
+        if (localCallType != CallType.VIDEO) return null
+        val codec = activeCodec
+        var settings = activeSettings
+        if (codec.usesSurfaceInput) settings = privateCallCameraVideoSettings(settings, supportedVideoModes(codec, settings))
+        return fitCallVideo(settings, codec) to codec
+    }
+
     private fun startLocalMedia() {
         if (BuildConfig.DEBUG) Log.i("BluetoothVideo", "BENCHMARK call identity: callId=${state?.callId}")
         if (BuildConfig.DEBUG) Log.i(
@@ -4109,6 +5268,7 @@ class AndroidPrivateVideoCall(
                 "requested=${negotiation?.requested?.label ?: "video"} | local=${localCallType.label} | " +
                 "peerOfferedVoice=${negotiation?.peerOfferedVoice == true} | voiceCallsEnabled=$voiceCallsEnabled",
         )
+        if (localCallType == CallType.VIDEO) wifiHop?.onVideo(local = true)
         if (activeCodec.usesSurfaceInput) {
             val compatible = privateCallCameraVideoSettings(
                 activeSettings,
@@ -4138,6 +5298,9 @@ class AndroidPrivateVideoCall(
         }
         controls.offerMust(OutboundControl.Header)
         activePlaybackDelayProfile = currentCallPlaybackProfile()
+        phyFirstGate?.onMediaPlanned(
+            if (localCallType == CallType.VIDEO) CallOneMFirst.plannedKbps(activeSettings.bitRate, activeSettings.fps) else 0.0,
+        )
         onStartLocalMedia(
             activeSettings,
             privateCallAudioBitRate(transport, stackFingerprint, peerMaxBitrateKbps),
@@ -4150,7 +5313,15 @@ class AndroidPrivateVideoCall(
     private fun transition(event: PrivateCallEvent) {
         val next = requireNotNull(state).transition(event)
         state = next
-        if (next.phase == PrivateCallPhase.ACTIVE && activeAtNs == 0L) activeAtNs = System.nanoTime()
+        if (next.phase == PrivateCallPhase.ACTIVE && activeAtNs == 0L) {
+            activeAtNs = System.nanoTime()
+            CallJoinStages.mark(CallJoinStage.ACTIVE)
+            carriers?.onCallActive()
+        }
+        if (next.phase == PrivateCallPhase.ACTIVE) {
+            wifiHop?.onCallActive()
+            wifiHop?.onVideo(remote = negotiation?.let { !it.peerOfferedVoice } ?: (localCallType == CallType.VIDEO))
+        }
         notifyPhase(next)
     }
 
@@ -4215,7 +5386,8 @@ class AndroidPrivateVideoCall(
         val helper = thread(name = "PrivateCallLivenessHangUp") {
             runCatching {
                 writeCallSignal(link, endpoint, message)
-                link.writer.flush()
+                val set = carriers
+                if (set != null && set.fanout) set.awaitDrained(set.sendCarrier, LivenessHangUp.WAIT_MS) else link.writer.flush()
                 written.set(true)
             }
         }
@@ -4232,7 +5404,7 @@ class AndroidPrivateVideoCall(
         endpoint: EndToEndVideoSession,
         message: PrivateCallSignalMessage,
     ) {
-        link.writer.write(
+        sinkFor(link).write(
             SecureRecordType.END_TO_END_CONTENT,
             endpoint.sealer.seal(
                 EndToEndContentType.PRIVATE_CALL_SIGNAL,
@@ -4283,41 +5455,64 @@ class AndroidPrivateVideoCall(
                 fragmentRate(),
             )
         if (!fragmenting) {
-            EndToEndStreamProtocol.writePacket(
-                link.writer,
-                endpoint.sealer,
-                packet.flags,
-                packet.presentationTimeUs,
-                packet.payload,
-            )
-            // Delivery accounting (link report version 3): per record, as the peer counts it.
-            peerDelivery.onSent(packet.payload.size, System.nanoTime())
+            withSentAccounting(packet.payload.size) {
+                EndToEndStreamProtocol.writePacket(
+                    sinkFor(link),
+                    endpoint.sealer,
+                    packet.flags,
+                    packet.presentationTimeUs,
+                    packet.payload,
+                )
+            }
             return packet.payload.size.toLong()
         }
-        val fragmentWriter = CallFragmentWriter<OutboundMedia>(
-            targetMs = fragmentAirtimeMs,
-            rate = { fragmentRate() },
-            stats = fragmentStats,
-            nanoTime = System::nanoTime,
-            running = callRunning::get,
-            writeFragment = { flags, fragment ->
-                EndToEndStreamProtocol.writeVideoFragment(link.writer, endpoint.sealer, flags, fragment)
-                // Each fragment's chunk counts when written and when it arrives, so audio written between
-                // fragments keeps the same byte order on both sides.
-                peerDelivery.onSent(fragment.size - CallVideoFragments.HEADER_BYTES, System.nanoTime())
-            },
-            takeAudio = { takeQueuedAudio() },
-            audioQueuedAtNs = OutboundMedia::queuedAtNs,
-            writeAudio = { audio -> writeInterleavedAudio(link, endpoint, audio) },
-            flushBetween = flushBetween,
-            afterFragment = { reportFragmentStatsIfDue() },
-        )
-        val audioBytes = fragmentWriter.writeFrame(
-            EndToEndStreamProtocol.encodePacket(packet.flags, packet.presentationTimeUs, packet.payload),
-            packet.flags,
-        )
-        fragmentedVideoFrames.incrementAndGet()
-        return packet.payload.size.toLong() + audioBytes
+        // The cutover may drop the unsent fragments of this frame (ResetSendFragments); the next frame starts at 0.
+        abandonFrame = false
+        midVideoFrame = true
+        try {
+            val fragmentWriter = CallFragmentWriter<OutboundMedia>(
+                targetMs = fragmentAirtimeMs,
+                rate = { fragmentRate() },
+                stats = fragmentStats,
+                nanoTime = System::nanoTime,
+                running = callRunning::get,
+                writeFragment = { flags, fragment ->
+                    // Each fragment's chunk counts when written and when it arrives, so audio written between
+                    // fragments keeps the same byte order on both sides.
+                    withSentAccounting(fragment.size - CallVideoFragments.HEADER_BYTES) {
+                        EndToEndStreamProtocol.writeVideoFragment(sinkFor(link), endpoint.sealer, flags, fragment)
+                    }
+                },
+                takeAudio = { takeQueuedAudio() },
+                audioQueuedAtNs = OutboundMedia::queuedAtNs,
+                writeAudio = { audio -> writeInterleavedAudio(link, endpoint, audio) },
+                flushBetween = flushBetween,
+                afterFragment = { reportFragmentStatsIfDue() },
+                abandon = { abandonFrame },
+            )
+            val audioBytes = fragmentWriter.writeFrame(
+                EndToEndStreamProtocol.encodePacket(packet.flags, packet.presentationTimeUs, packet.payload),
+                packet.flags,
+            )
+            fragmentedVideoFrames.incrementAndGet()
+            return packet.payload.size.toLong() + audioBytes
+        } finally {
+            midVideoFrame = false
+        }
+    }
+
+    /**
+     * Delivery accounting (link report version 3) for [payloadBytes] of one record: counted on the carrier that actually
+     * carried it (the carrier writer in fan-out), as the peer counts it.
+     */
+    private inline fun withSentAccounting(payloadBytes: Int, crossinline write: () -> Unit) {
+        val set = carriers
+        if (set == null) {
+            write()
+            peerDelivery.onSent(payloadBytes, System.nanoTime())
+        } else {
+            set.withCookie(null, { id, ns -> stateOf(id).peerDelivery.onSent(payloadBytes, ns) }) { write() }
+        }
     }
 
     /** Experimental call video fragments: one queued call audio packet written between two fragments. */
@@ -4327,14 +5522,15 @@ class AndroidPrivateVideoCall(
         audio: OutboundMedia,
     ): Long {
         audioQueueWaitMax.record((System.nanoTime() - audio.queuedAtNs).coerceAtLeast(0L) / 1_000_000L)
-        EndToEndStreamProtocol.writePacket(
-            link.writer,
-            endpoint.sealer,
-            audio.flags,
-            audio.presentationTimeUs,
-            audio.payload,
-        )
-        peerDelivery.onSent(audio.payload.size, System.nanoTime())
+        withSentAccounting(audio.payload.size) {
+            EndToEndStreamProtocol.writePacket(
+                sinkFor(link),
+                endpoint.sealer,
+                audio.flags,
+                audio.presentationTimeUs,
+                audio.payload,
+            )
+        }
         debugTxCounters?.audioWrites?.incrementAndGet()
         interleavedAudioPackets.incrementAndGet()
         return audio.payload.size.toLong()
@@ -4385,22 +5581,31 @@ class AndroidPrivateVideoCall(
     }
 
     /** Sealing happens after this selection, so live audio can safely pass queued video. */
-    private fun onPeerReport(report: LinkCapacityReport) {
-        if (report.arrivalKbps > 0) peerMeasuredKbps = report.arrivalKbps
-        if (pacedWrites && report.arrivalKbps > 0) {
-            // The peer measured arrival trains of this phone's media: the same single-link evidence
-            // a stream child reports (experimental for calls).
-            pacer.setMeasuredLinkKbps(report.arrivalKbps)
-            LinkCapacity.recordProbe(transport, report.arrivalKbps)
+    private fun onPeerReport(id: Int, report: LinkCapacityReport) {
+        val carrier = carriers?.kindOf(id) ?: CarrierKind.BLUETOOTH
+        // Only the carrier this phone sends media on may move its send limit (a standby's numbers would corrupt it).
+        if (report.arrivalKbps > 0 && id == (carriers?.sendCarrier ?: 0)) peerMeasuredKbps = report.arrivalKbps
+        if (report.arrivalKbps > 0) {
+            when (probeTarget(carrier, pacedWrites)) {
+                ProbeTarget.BLUETOOTH -> {
+                    // The peer measured arrival trains of this phone's media: the same single-link evidence
+                    // a stream child reports (experimental for calls).
+                    pacer.setMeasuredLinkKbps(report.arrivalKbps)
+                    LinkCapacity.recordProbe(transport, report.arrivalKbps)
+                }
+                // Bluetooth learned capacity is never written from a Wi-Fi carrier (master 4.4).
+                ProbeTarget.CARRIER -> LinkCapacity.recordProbe(transport, report.arrivalKbps, carrier)
+                ProbeTarget.NONE -> Unit
+            }
         }
         peerAddedDelayMs = report.addedDelayMs
         if (peerLateness.onReport(report)) peerLateUntilNs = System.nanoTime() + PeerLatenessTrend.LATE_HOLD_NS
-        notePeerHeartbeat(report)
-        deliveryReports.accepted(report)?.let { delivery ->
-            if (!peerDelivery.onReport(delivery)) {
+        notePeerHeartbeat(id, report)
+        stateOf(id).deliveryReports.accepted(report)?.let { delivery ->
+            if (!stateOf(id).peerDelivery.onReport(delivery)) {
                 Log.w("BluetoothVideo", "Call link: the peer's delivery counters went backwards; queue measurement off for this link")
             } else if (fragmentAirtimeMs > 0) {
-                fragmentRates.onDelivered(peerDelivery.deliveredKbps())
+                fragmentRates.onDelivered(stateOf(id).peerDelivery.deliveredKbps())
             }
         }
     }
@@ -4462,8 +5667,8 @@ class AndroidPrivateVideoCall(
         get() = secureSession?.peerNodeId?.shortLabel() ?: ""
 
     /** A version-1 heartbeat ([report] null) or a version 3 report says the adjacent hop accepts version 3. */
-    private fun notePeerHeartbeat(report: LinkCapacityReport?) {
-        if (deliveryReports.onPeerHeartbeat(report)) {
+    private fun notePeerHeartbeat(id: Int, report: LinkCapacityReport?) {
+        if (stateOf(id).deliveryReports.onPeerHeartbeat(report)) {
             Log.i("BluetoothVideo", "Call link: the adjacent hop accepts delivery reports (link report version 3)")
         }
     }
@@ -4764,9 +5969,10 @@ class AndroidPrivateVideoCall(
         linkPhy: BlePhyPreference,
         plan: Bmh3AttemptPlan,
         deadline: SetupDeadline? = null,
+        deferPhy: Boolean = false,
     ): CallConnection {
         requestedLinkPhy = linkPhy
-        return openOutgoingLink(peer, linkPhy, plan, deadline)
+        return openOutgoingLink(peer, linkPhy, plan, deadline, deferPhy)
     }
 
     /** The BMH3 plan of one outgoing attempt toward [selected] ([Bmh3AttemptPlan]). */
@@ -4790,6 +5996,8 @@ class AndroidPrivateVideoCall(
         return Bmh3Wiring.plan(
             appContext, selected, rotatingIds, qrScan = qrScanPayload,
             relayEdges = relayRoute != null, relayHop = relayHop, contactHelper = contactHelper,
+            // A2's build marker: sent by every build that implements BWF1 (a verification scan never carries it). [R M-3]
+            wifiMarker = WifiHopPlumbing.BUILD_HANDLES_BWF1 && qrScanPayload == null,
         )
     }
 
@@ -4798,7 +6006,10 @@ class AndroidPrivateVideoCall(
         linkPhy: BlePhyPreference,
         plan: Bmh3AttemptPlan,
         deadline: SetupDeadline?,
-    ): CallConnection = when (transport) {
+        deferPhy: Boolean = false,
+    ): CallConnection {
+        if (peer.wifiOnly) return openWifiNativeLink(peer, deadline)
+        return when (transport) {
         BluetoothTransportOption.CLASSIC_RFCOMM -> {
             // Same candidate order, deadlines and identity check as the stream sender; a relayed
             // call's immediate peer is the relay, which advertises the callee's prefix.
@@ -4856,7 +6067,8 @@ class AndroidPrivateVideoCall(
             } finally {
                 pendingCocSocket = null
             }
-            socketConnection(socket)
+            // Experimental test_call_1m_first_coc: linkPhy is 1M here; the call asks the control link for 2M after its first picture.
+            socketConnection(socket, phyDeferred = deferPhy)
         }
         BluetoothTransportOption.BLE_GATT -> gattConnection(
             GattVideoClient.open(
@@ -4868,14 +6080,46 @@ class AndroidPrivateVideoCall(
                 acknowledgedWrites = false,
                 deferConnectionPriority = debugGattDeferConnectionPriority,
                 deadline = deadline,
+                phySplit = dialPhySplit?.takeIf { it.first == peer.device.address }?.second,
+                // Experimental test_call_1m_first: no PHY request at subscribe; the call asks after its first picture.
+                deferPhy = deferPhy,
             ),
             address = runCatching { peer.device.address }.getOrNull(),
+            phyDeferred = deferPhy,
+        )
+        }
+    }
+
+    /** Wider reach: dial a person heard only over Wi-Fi. The BMH3/BMH2 link handshake runs on the returned streams in establish(). */
+    private fun openWifiNativeLink(peer: BleL2capPeer, deadline: SetupDeadline?): CallConnection {
+        val link = WifiDiscovery.nativeLink() ?: throw IOException("native_fail:not_started")
+        val key = WifiSighting.keyOf(peer.announcement)
+        val connection = try {
+            // The call's setup deadline and its Cancel bound the Wi-Fi dial too (A8 review P3-7).
+            link.dial(
+                key,
+                "call",
+                deadlineMs = deadline?.remainingMs()?.coerceIn(1L, WifiLimits.ATTEMPT_MAX_MS) ?: WifiLimits.ATTEMPT_MAX_MS,
+                cancelled = { !running.get() || privateCallAlreadyEnded(state?.phase) },
+            )
+        } catch (error: IOException) {
+            onStatus(WifiCallNotices.WIFI_CONNECT_FAILED)
+            throw error
+        }
+        return CallConnection(
+            connection.input, connection.output, WifiCallNotices.LABEL, connection.close,
+            socket = null, link = null, address = null, phySummary = { "" },
+            carrierKind = CarrierKind.WIFI_AWARE,   // A3: CallConnection.carrierKind [API]
+            onAuthenticated = connection.admitted,  // [AM 12]
         )
     }
 
     @SuppressLint("MissingPermission")
-    private fun socketConnection(socket: BluetoothSocket): CallConnection {
+    private fun socketConnection(socket: BluetoothSocket, phyDeferred: Boolean = false): CallConnection {
         val mps = runCatching { socket.maxTransmitPacketSize }.getOrDefault(0)
+        val oneMFirstRequest: (BlePhyPreference) -> Boolean = { preference ->
+            bleControlConnection?.requestPhyInPlace(preference, "call_1m_first") == true
+        }
         return CallConnection(
             socket.inputStream,
             socket.mediaOutputStream(),
@@ -4884,6 +6128,9 @@ class AndroidPrivateVideoCall(
             socket = socket,
             address = runCatching { socket.remoteDevice?.address }.getOrNull(),
             phySummary = { bleControlConnection?.phySummary ?: cocControlServer?.phySummary ?: "" },
+            requestPhy = oneMFirstRequest.takeIf { phyDeferred },
+            movePhy = { preference -> bleControlConnection?.requestPhyInPlace(preference) == true },
+            readPhy = { bleControlConnection?.readPhyNow() == true },
         )
     }
 
@@ -4891,6 +6138,7 @@ class AndroidPrivateVideoCall(
         active: GattVideoConnection,
         address: String? = null,
         arrivedOn: BluetoothTransportOption? = null,
+        phyDeferred: Boolean = false,
     ) = CallConnection(
         active.inputStream,
         active.outputStream,
@@ -4899,6 +6147,9 @@ class AndroidPrivateVideoCall(
         address = address,
         phySummary = active.phySummary,
         arrivedOn = arrivedOn,
+        requestPhy = active.requestPhy.takeIf { phyDeferred },
+        movePhy = active.requestPhy,
+        readPhy = active.readPhy,
     )
 
     /**
@@ -5049,7 +6300,7 @@ class AndroidPrivateVideoCall(
         val session = presenceSession ?: return
         val endpoint = contentSession ?: return
         presenceDispatch.dispatch({ session.start() }, runIfEmpty = true) { actions ->
-            runCatching { runPresenceActions(actions, endpoint) }
+            runCatching { runPresenceActions(actions, endpoint, session) }
         }
     }
 
@@ -5135,45 +6386,53 @@ class AndroidPrivateVideoCall(
         )
     }
 
-    private fun runPresenceActions(actions: List<PresenceSession.Action>, endpoint: EndToEndVideoSession) {
+    private fun runPresenceActions(
+        actions: List<PresenceSession.Action>,
+        endpoint: EndToEndVideoSession,
+        session: PresenceSession,
+    ) {
         val vault = RotatingDiscovery.presenceVault()
         // The real identity: after a pseudonym call's reveal the revealed contact, otherwise the authenticated peer.
         val peer = endpoint.effectivePeerNodeId
         val peerFingerprint = endpoint.effectivePeerFingerprint
-        actions.forEach { action ->
+        // A task queued before the call ended (or a reveal replaced the session) must not send on whatever link is current
+        // now: the controls queue belongs to the endpoint, not to this call.
+        fun current() = presenceSession === session && contentSession === endpoint
+        val runner = PresenceActionRunner(session, object : PresenceActionRunner.Effects {
+            override fun ineligibleReason(): String? =
+                if (current()) presenceIneligibleReason(peer, peerFingerprint) else "session_ended"
+
+            override fun visitAllows(): Boolean = qrLeaseAllowed(session, peerFingerprint)
+
+            override fun sendOffer() {
+                controls.offerMust(OutboundControl.Discovery(DiscoveryExchange.encode(DiscoveryExchange.RecognitionOffer)))
+            }
+
+            override fun deliverLease(): PresenceActionRunner.LeaseDelivery {
+                // RD1: eligibility is re-checked at send time (a Forget, a switch or a reset since the
+                // OFFER), and the delivery is recorded durably BEFORE the lease is queued: if it cannot be
+                // stored, nothing is sent, so a revocation can never miss a lease that left the phone.
+                // One locked step in the vault (check, durable record, key and generation from one state).
+                val epoch = runCatching { RotatingDiscovery.currentEpoch() }.getOrNull()
+                if (vault == null || epoch == null) return PresenceActionRunner.LeaseDelivery(null, "no_vault_or_epoch")
+                return PresenceActionRunner.LeaseDelivery(
+                    vault.deliverLease(peer, epoch) {
+                        // AB3 R6: a contact not yet asked ("Can see when I'm nearby") gets no lease, as no OFFER.
+                        current() && PeerIdentityGate.store?.state(peer, peerFingerprint) == VerificationState.VERIFIED &&
+                            qrLeaseAllowed(session, peerFingerprint) && !PersonPolicy.blocked(peerFingerprint) &&
+                            vault.visibleToThem(peer)
+                    },
+                )
+            }
+
+            override fun sendLease(lease: DiscoveryExchange.PresenceLease) {
+                controls.offerMust(OutboundControl.Discovery(DiscoveryExchange.encode(lease)))
+            }
+
+            override fun log(event: String, detail: String) = logPresence(event, detail)
+        })
+        runner.run(actions).forEach { action ->
             when (action) {
-                PresenceSession.Action.SendOffer -> {
-                    val reason = presenceIneligibleReason(peer, peerFingerprint)
-                        ?: if (qrLeaseAllowed(peerFingerprint)) null else "verification_visit"
-                    if (vault != null && reason == null) {
-                        controls.offerMust(OutboundControl.Discovery(DiscoveryExchange.encode(DiscoveryExchange.RecognitionOffer)))
-                        logPresence("offer_sent")
-                    } else {
-                        presenceSession?.offerWithheld()
-                        logPresence("offer_withheld", "reason=${reason ?: "no_vault"}")
-                    }
-                }
-                PresenceSession.Action.SendLease -> {
-                    // RD1: eligibility is re-checked at send time (a Forget, a switch or a reset since the
-                    // OFFER), and the delivery is recorded durably BEFORE the lease is queued: if it cannot be
-                    // stored, nothing is sent, so a revocation can never miss a lease that left the phone.
-                    // One locked step in the vault (check, durable record, key and generation from one state).
-                    val epoch = runCatching { RotatingDiscovery.currentEpoch() }.getOrNull()
-                    val lease = if (vault != null && epoch != null) {
-                        vault.deliverLease(peer, epoch) {
-                            PeerIdentityGate.store?.state(peer, peerFingerprint) == VerificationState.VERIFIED &&
-                                qrLeaseAllowed(peerFingerprint) && !PersonPolicy.blocked(peerFingerprint)
-                        }
-                    } else {
-                        null
-                    }
-                    if (lease != null) {
-                        controls.offerMust(OutboundControl.Discovery(DiscoveryExchange.encode(lease)))
-                        logPresence("lease_sent", "generation=${lease.generation}")
-                    } else {
-                        logPresence("lease_withheld", "reason=${if (vault == null || epoch == null) "no_vault_or_epoch" else "not_deliverable"}")
-                    }
-                }
                 is PresenceSession.Action.StoreLease -> {
                     val epoch = runCatching { RotatingDiscovery.currentEpoch() }.getOrNull()
                     val stored = vault != null && epoch != null &&
@@ -5186,6 +6445,7 @@ class AndroidPrivateVideoCall(
                     Log.w("BluetoothVideo", "SECURITY DISCOVERY RECORD REJECTED reason=${action.reason}")
                     logPresence("lease_rejected", "reason=${action.reason}")
                 }
+                else -> Unit
             }
         }
         if (qrScope != null) qrCheckSettled()
@@ -5261,6 +6521,8 @@ class AndroidPrivateVideoCall(
             // Checked before anything else goes to the person: no label, no presence session, and (caller) no reveal.
             if (PersonPolicy.blocked(revealedFingerprint)) {
                 Bmh3Android.log("bmh3: event=reveal | role=$role | result=blocked")
+                callerNames.onPeerBlocked()
+                calleeNames.onPeerBlocked()
                 endBlockedAfterReveal(session.localRole)
                 return
             }
@@ -5268,10 +6530,10 @@ class AndroidPrivateVideoCall(
             val revealedVerifiedContact = runCatching {
                 PeerIdentityGate.store?.state(verified.nodeId, revealedFingerprint) == VerificationState.VERIFIED
             }.getOrDefault(false)
-            // Callee, audience "Only people I verified": the name goes only now, and only to a verified contact.
-            pendingRevealLabels?.let { container ->
-                pendingRevealLabels = null
-                if (revealedVerifiedContact) controls.offerMust(OutboundControl.Labels(container))
+            // Callee, a stranger caller: the held name goes only now, after the block check above ("Only people I verified":
+            // only to a verified contact; audit CALL-06: "Everyone" with the Experimental hold, to any unblocked person).
+            if (session.localRole == Bmh3Reveal.ROLE_CALLEE) {
+                calleeNames.onRevealVerified(revealedFingerprint, revealedVerifiedContact, PeerLabelFeature.audience)
             }
             awaitedReveal?.let { wait ->
                 val result = CallEndpointOpening.check(
@@ -5281,19 +6543,12 @@ class AndroidPrivateVideoCall(
                 require(result == DiscoverySelectionCheck.Result.PASS) { "Call peer identity changed between discovery and connection" }
                 awaitedReveal = null
                 markRelayRouteVerified()
-                val held = heldLabels
-                val nameNow = held.name == LabelSendMoment.AFTER_REVEAL ||
-                    (held.name == LabelSendMoment.AFTER_REVEAL_IF_VERIFIED && revealedVerifiedContact)
-                val subjectNow = held.subject == LabelSendMoment.AFTER_REVEAL
-                heldLabels = CallerLabelPlan(
-                    if (held.name == LabelSendMoment.AFTER_REVEAL || held.name == LabelSendMoment.AFTER_REVEAL_IF_VERIFIED) {
-                        LabelSendMoment.NEVER
-                    } else {
-                        held.name
-                    },
-                    if (subjectNow) LabelSendMoment.NEVER else held.subject,
-                )
-                if (nameNow || subjectNow) queueCallerLabels(includeName = nameNow, includeSubject = subjectNow)
+            }
+            // Design decision 2026-11-06: the caller's held name goes only now, after the selected-offer binding above
+            // passed (when there was one), only if the revealed person is not blocked (checked again inside, against the
+            // newest list) and only as the newest "Who sees my name" allows. A callee never started a caller name.
+            if (session.localRole == Bmh3Reveal.ROLE_CALLER) {
+                callerNames.onRevealVerified(revealedFingerprint, revealedVerifiedContact, PeerLabelFeature.audience)
             }
             Bmh3Android.log("bmh3: event=reveal | role=$role | result=verified")
         } catch (error: Exception) {
@@ -5301,7 +6556,7 @@ class AndroidPrivateVideoCall(
             throw error
         }
         // The call is now with a person: presence leases may be offered to a verified contact, and the call screen,
-        // the history and the verification flow see the real identity (so do the name and subject already received).
+        // the history and the verification flow see the real identity (so does the name already received).
         SessionPeerLabels.move(endpoint.peerNodeId.shortLabel(), endpoint.effectivePeerNodeId.shortLabel())
         presenceSession = newPresenceSession(endpoint.effectivePeerNodeId, endpoint.effectivePeerFingerprint, "reveal")
         if (session.localRole == Bmh3Reveal.ROLE_CALLEE) {
@@ -5313,8 +6568,10 @@ class AndroidPrivateVideoCall(
         } else if (session.callerMayReveal()) {
             // The caller reveals only now: the callee proved it owns the offer this phone selected.
             controls.offerMust(OutboundControl.Reveal { session.sendOwn(identity, emptyList()) })
+            wifiHop?.onRevealProgress()
             Bmh3Android.log("bmh3: event=reveal | role=caller | result=sent")
         }
+        wifiHop?.onRevealProgress()
         onStatus("The other phone's identity is confirmed: ${endpoint.effectivePeerNodeId.shortLabel()}")
     }
 
@@ -5323,17 +6580,21 @@ class AndroidPrivateVideoCall(
      * or stops, theirs is dropped), no label, no presence session and, for a caller, no reveal of its own. After the same
      * human-like delay as a blocked call's decline ([CallBlocking.declineDelayMs]) this phone ends the call with the
      * ordinary hang-up (a caller: the ordinary cancel), so the end does not say "blocked" (review 2026-10-27, finding 9).
-     * The callee remembers a blocked call that names nobody. A name label the caller sent before the ring (names before
-     * answer) has already reached the blocked person; its real identity has not.
+     * The callee remembers a blocked call that names nobody. A caller's name is still held at this point and never goes
+     * ([CallerNameRelease]); only the Experimental `names_before_answer` arm sends it before the ring. A callee answers
+     * first (callee-first REVEAL), so the caller it answered already holds the callee's identity (a protocol property).
+     * AB3: the same path ends a call whose callee showed a blocked person's real key in the endpoint handshake
+     * ([after] = "handshake"; the caller found it before its INVITE, so no reveal is involved).
      */
-    private fun endBlockedAfterReveal(localRole: Int) {
+    private fun endBlockedAfterReveal(localRole: Int, after: String = "reveal") {
         Log.i(
             "BluetoothVideo",
-            (if (BuildConfig.DEBUG) "BENCHMARK " else "") + "call_blocking: event=ended | reason=blocked_person | after=reveal | role=" +
+            (if (BuildConfig.DEBUG) "BENCHMARK " else "") + "call_blocking: event=ended | reason=blocked_person | after=$after | role=" +
                 if (localRole == Bmh3Reveal.ROLE_CALLER) "caller" else "callee",
         )
         calleeMedia?.onBlocked()
-        blockedAfterReveal = true
+        blockedCall.block()
+        onBlockedEndScheduled()
         localFailureMessage = BLOCKED_AFTER_REVEAL_MESSAGE
         val delayMs = CallBlocking.declineDelayMs()
         thread(name = "BlockedAfterRevealEnd", isDaemon = true) {
@@ -5355,6 +6616,8 @@ class AndroidPrivateVideoCall(
             handleReveal(record)
             return
         }
+        // AB3: nothing from a person this call ended for (a blocked reveal or a blocked real key) is examined.
+        if (blockedCall.active) return
         val session = presenceSession ?: return
         val endpoint = contentSession ?: return
         val record = try {
@@ -5369,7 +6632,7 @@ class AndroidPrivateVideoCall(
         // The vault and the verified-contact store touch the Keystore and the disk: not on the reader thread, and in the
         // order the session produced the actions (a LEASE never overtakes this side's own OFFER).
         presenceDispatch.dispatch({ session.onRecord(record, verifiedNow) }, runIfEmpty = false) { actions ->
-            runCatching { runPresenceActions(actions, endpoint) }
+            runCatching { runPresenceActions(actions, endpoint, session) }
         }
         // Design QL: the displayer answers the scanner's OFFER (it never offers first).
         if (record == DiscoveryExchange.RecognitionOffer && qrScope != null) qrDisplayerAnswer()
@@ -5463,7 +6726,7 @@ class AndroidPrivateVideoCall(
             val stranger = recentStrangerName()
             val identity = when {
                 // A stranger who revealed a blocked person: a blocked call, naming nobody (finding 2).
-                blockedAfterReveal && direction == CallDirection.INCOMING ->
+                blockedCall.active && direction == CallDirection.INCOMING ->
                     RecentCall("", false, 0, blocked = true, result = CallResult.DECLINED)
                 stranger != null -> RecentCall("", localCallType == CallType.VIDEO, 0, strangerName = stranger)
                 !peerStillPseudonym && endToEndPeerNodeId != null -> RecentCall(
@@ -5489,6 +6752,7 @@ class AndroidPrivateVideoCall(
     }
 
     private fun finish(message: String) {
+        incomingPhases?.cancelAll()
         captureEndedRecentCall(message)
         qrGate?.fail()
         qrGate = null
@@ -5498,7 +6762,7 @@ class AndroidPrivateVideoCall(
         contentSession?.effectivePeerNodeId?.shortLabel()?.let(SessionPeerLabels::clear)
         bufferedLabels = null
         pendingAcceptLabels = null
-        pendingRevealLabels = null
+        calleeNames.reset()
         callLabels = null
         reportDebugTx(final = true)
         reportFragmentStatsIfDue(force = true)
@@ -5516,6 +6780,15 @@ class AndroidPrivateVideoCall(
         renewalScanner?.stop()
         renewalScanner = null
         renewalServers.closeAll()
+        wifiHop?.onCallEnded()
+        wifiHop = null
+        wifiRecordHandler = null
+        markerCodec = CallMarkerCodec
+        // The set first: its threads see `closed` before the Bluetooth link is torn down (step 10).
+        carriers?.close()
+        carriers = null
+        contentSink = null
+        extraCarrierStates.clear()
         pendingCocSocket?.let { runCatching { it.close() } }
         connection?.close()
         connection = null
@@ -5649,6 +6922,36 @@ class AndroidPrivateVideoCall(
                 runCatching { activeConnection.close() }
             }
         }
+    }
+
+    /**
+     * Design PP package A: one thread per armed phase timer. At the deadline it settles the timer; only a timer that was still
+     * armed closes the one connection it was armed for (silently, as the 20 s deadline does), and the endpoint's normal end
+     * handling restores availability. A milestone that arrived first has disarmed the timer, so nothing happens.
+     */
+    private fun startIncomingPhaseTimer(
+        phases: IncomingPhaseTimers,
+        timer: PhaseTimer,
+        activeConnection: CallConnection,
+        armedTransport: BluetoothTransportOption,
+    ) {
+        thread(name = "IncomingPhase_${timer.name}", isDaemon = true) {
+            try {
+                timer.awaitDue()
+            } catch (_: InterruptedException) {
+                return@thread
+            }
+            if (!timer.expireIfDue()) return@thread
+            Log.i(
+                "BluetoothVideo",
+                (if (BuildConfig.DEBUG) "BENCHMARK " else "") + phases.deadlineLine(timer, armedTransport, activeConnection.carrierKind),
+            )
+            runCatching { activeConnection.close() }
+        }
+    }
+
+    private fun logIncomingMilestone(phases: IncomingPhaseTimers, milestone: IncomingMilestone) {
+        if (BuildConfig.DEBUG) Log.i("BluetoothVideo", "BENCHMARK " + phases.milestoneLine(milestone))
     }
 
     /** A helper closes an accepted link that has not finished the handshake and delivered its first record. */
@@ -6007,11 +7310,13 @@ class AndroidPrivateVideoCall(
     }
 
     private fun stopAvailability(forActiveConnection: Boolean) {
+        wifiOnlyListening = false
         // A Visible-by-name window shows nothing while this phone is in a connection or not listening.
         closeWindowAdvertiser()
         if (!forActiveConnection) fullAvailabilityStops++
         // Rotating IDs: the call-offer ID leaves the air; it stays openable for 60 s (OpeningPins).
         if (rotatingAdvert) RotatingDiscovery.offAir(RotatingDiscoveryIds.ROLE_CALL_OFFER)
+        WifiDiscovery.offers.clear(WifiOfferRole.CALL_OFFER)
         serverSocket?.let { active ->
             serverSocket = null
             runCatching { active.close() }
@@ -6047,12 +7352,14 @@ class AndroidPrivateVideoCall(
         debugStageTrace?.close()
         debugStageTrace = null
         if (!running.getAndSet(false)) return
-        BluetoothEpoch.unregister(listenerEpochName)
+        listenerStartFence.stop {
+            BluetoothEpoch.unregister(listenerEpochName)
+            if (rotatingAdvert) RotatingDiscovery.removeBoundaryListener(boundaryListener)
+            NameWindowRuntime.removeListener(windowListener)
+        }
         // Experimental relayed calls: closing the endpoint (screen change, switch off) ends a relay duty too.
         relayDuty?.close()
         preSetupWatchdog?.interrupt()
-        if (rotatingAdvert) RotatingDiscovery.removeBoundaryListener(boundaryListener)
-        NameWindowRuntime.removeListener(windowListener)
         pendingCallConnection?.close()
         pendingCallConnection = null
         pendingClassicSocket?.let { runCatching { it.close() } }
@@ -6063,11 +7370,19 @@ class AndroidPrivateVideoCall(
         renewalScanner?.stop()
         renewalScanner = null
         renewalServers.closeAll()
+        wifiHop?.onCallEnded()
+        wifiHop = null
+        wifiRecordHandler = null
+        markerCodec = CallMarkerCodec
+        carriers?.close()
+        carriers = null
+        contentSink = null
+        extraCarrierStates.clear()
         callRunning.set(false)
         reportDebugTx(final = true)
         reportFragmentStatsIfDue(force = true)
         pendingAudioPackets.clear()
-        stopAvailability(forActiveConnection = false)
+        listenerStartFence.stop { stopAvailability(forActiveConnection = false) }
         bleControlConnection?.close()
         bleControlConnection = null
         connectionThread?.interrupt()
@@ -6168,6 +7483,13 @@ internal fun privateCallConnectionFailureMessage(
 internal fun privateCallEndedUiEvidence(message: String): String =
     "BENCHMARK call ended_ui: message=$message"
 
+/**
+ * The first record of a call's end. DEBUG builds append ` | callId=<id>` (the same call ID as the `BENCHMARK call tx/rx`
+ * lines), so a run with several calls binds each end to its call; the message itself stays the line's first field.
+ */
+internal fun privateCallEndedLine(message: String, callId: String?): String =
+    "Private call ended: $message" + (callId?.let { " | callId=$it" } ?: "")
+
 /** True once the call state reached ENDED (e.g. the peer's HANG_UP), before finish() has run. */
 internal fun privateCallAlreadyEnded(phase: PrivateCallPhase?): Boolean = phase == PrivateCallPhase.ENDED
 
@@ -6179,7 +7501,9 @@ internal fun callLinkPaced(
     transport: BluetoothTransportOption,
     callLinkPacing: Boolean,
     linkPacing: Boolean,
-): Boolean = callLinkPacing && linkPacing && transport != BluetoothTransportOption.BLE_GATT
+    /** A Wi-Fi carrier is not paced: it has no Bluetooth airtime to conserve. */
+    carrier: CarrierKind = CarrierKind.BLUETOOTH,
+): Boolean = callLinkPacing && linkPacing && !carrier.isWifi && transport != BluetoothTransportOption.BLE_GATT
 
 /**
  * How the hang-up/decline/cancel writer waits before closing its link. A socket write only reaches
@@ -6194,8 +7518,14 @@ internal data class PrivateCallCloseWait(val waitForPeer: Boolean, val maxMs: Lo
 internal const val PRIVATE_CALL_PEER_CLOSE_WAIT_MS = 3_000L
 internal const val PRIVATE_CALL_FIXED_CLOSE_DRAIN_MS = 400L
 
-internal fun privateCallCloseWait(transport: BluetoothTransportOption, waitForPeer: Boolean): PrivateCallCloseWait =
+internal fun privateCallCloseWait(
+    transport: BluetoothTransportOption,
+    waitForPeer: Boolean,
+    /** A Wi-Fi socket write does not wait for the peer's close: the fixed drain. */
+    carrier: CarrierKind = CarrierKind.BLUETOOTH,
+): PrivateCallCloseWait =
     when {
+        carrier.isWifi -> PrivateCallCloseWait(waitForPeer = false, maxMs = PRIVATE_CALL_FIXED_CLOSE_DRAIN_MS)
         transport == BluetoothTransportOption.BLE_GATT -> PrivateCallCloseWait(waitForPeer = false, maxMs = 0L)
         waitForPeer -> PrivateCallCloseWait(waitForPeer = true, maxMs = PRIVATE_CALL_PEER_CLOSE_WAIT_MS)
         else -> PrivateCallCloseWait(waitForPeer = false, maxMs = PRIVATE_CALL_FIXED_CLOSE_DRAIN_MS)
@@ -6235,7 +7565,9 @@ internal fun canStartOutgoingPrivateCall(
  * 4.2 s; 104 such recoveries in the 46 no-loss calls of calls-noloss-*-51cc8028). Dropping video
  * cannot shorten the write the audio waits for.
  */
-internal fun privateCallAudioHeadroomPackets(): Int = 150
+internal fun privateCallAudioHeadroomPackets(
+    @Suppress("UNUSED_PARAMETER") carrier: CarrierKind = CarrierKind.BLUETOOTH,
+): Int = 150
 
 /** True when queued non-audio records already fill [videoCapacity] (audio is not counted). */
 internal fun <T> privateCallVideoBudgetFull(queue: Collection<T>, videoCapacity: Int, isAudio: (T) -> Boolean): Boolean =
@@ -6279,6 +7611,14 @@ internal fun adaptivePhySetupRetryEligible(
  */
 internal fun adaptivePhySetupStalled(stallGuardMs: Long, authenticated: Boolean, sinceOpenMs: Long): Boolean =
     stallGuardMs > 0L && !authenticated && sinceOpenMs >= stallGuardMs
+
+/**
+ * AP7 F2 (`test_stall_slow_auth_ms`, Experimental, 0 = off): a hop authentication that finished on 2M no sooner than
+ * [thresholdMs] after the link opened is a setup stall even though it succeeded. Only the guarded first 2M attempt passes
+ * a non-zero threshold; the 1M retry and the no-guard control arm never take it.
+ */
+internal fun slowAuthStall(thresholdMs: Long, hopAuthMs: Long, onTwoM: Boolean): Boolean =
+    thresholdMs > 0L && onTwoM && hopAuthMs >= thresholdMs
 
 /** A fresh advertisement is the same call peer (same node prefix and route cost) for the 1M retry. */
 internal fun matchesRediscoveredPeer(prefix: ByteArray, routeCost: Int, announcement: DiscoveryAnnouncement): Boolean =

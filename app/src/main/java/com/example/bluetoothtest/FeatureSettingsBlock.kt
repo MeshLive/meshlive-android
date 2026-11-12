@@ -23,6 +23,8 @@ internal class FeatureSettingsBlock(
     private val specs: List<FeatureSpec>,
     private val prefs: SharedPreferences,
     private val host: Host,
+    /** UI-W7: a row that depends on another is drawn indented under it (the Wi-Fi card: two options under "Use Wi-Fi when it helps"). */
+    private val indentDependents: Boolean = false,
 ) {
     interface Host {
         /** True in a DEBUG benchmark launch: the switches show the extras and cannot be changed. */
@@ -38,11 +40,19 @@ internal class FeatureSettingsBlock(
          */
         fun confirmEnable(spec: FeatureSpec, proceed: () -> Unit): Boolean = false
 
+        /** The explanation text for [spec] when it is not the fixed string resource. Calls [deliver] exactly once, on the main thread, possibly after an asynchronous platform read; null = use the resource. */
+        fun describe(spec: FeatureSpec, deliver: (CharSequence?) -> Unit) { deliver(null) }
+
+        /** A short "not active" note shown in place of the row's description while the switch is [on] but cannot work; null = the normal description. [snapshot] is the block's own resolution (other rows' values). */
+        fun rowNote(spec: FeatureSpec, on: Boolean, snapshot: FeatureSnapshot): CharSequence? = null
+
         /** A choice was stored: apply it to the running app. */
         fun onChanged(spec: FeatureSpec, enabled: Boolean)
     }
 
-    private class Row(val spec: FeatureSpec, val switch: MaterialSwitch)
+    private class Row(val spec: FeatureSpec, val switch: MaterialSwitch, val description: TextView) {
+        var noted = false
+    }
 
     private val rows = ArrayList<Row>()
     private var binding = false
@@ -67,14 +77,23 @@ internal class FeatureSettingsBlock(
                 }
                 view.findViewById<TextView>(R.id.featureRowDescription).setText(spec.descriptionRes)
                 view.findViewById<View>(R.id.featureRowInfo).setOnClickListener {
-                    SettingsInfo.show(view.context, spec.titleRes, spec.descriptionRes)
+                    val context = view.context
+                    host.describe(spec) { text ->
+                        val activity = context as? android.app.Activity
+                        if (activity?.isFinishing != true && activity?.isDestroyed != true) {
+                            SettingsInfo.show(context, context.getString(spec.titleRes), text ?: context.getString(spec.descriptionRes))
+                        }
+                    }
+                }
+                if (indentDependents && spec.dependsOn.isNotEmpty()) {
+                    view.setPaddingRelative(view.resources.getDimensionPixelSize(R.dimen.settings_dependent_indent), 0, 0, 0)
                 }
                 if (index == 0) {
                     (switch.layoutParams as? ViewGroup.MarginLayoutParams)?.topMargin = 0
                 }
                 switch.setOnCheckedChangeListener { _, checked -> if (!binding) onUserToggle(spec, switch, checked) }
                 container.addView(view)
-                rows += Row(spec, switch)
+                rows += Row(spec, switch, view.findViewById(R.id.featureRowDescription))
             }
         }
         refresh()
@@ -87,6 +106,9 @@ internal class FeatureSettingsBlock(
         rows.forEach { row ->
             val parentOn = row.spec.dependsOn.all(snapshot::isOn)
             row.switch.isChecked = snapshot.isOn(row.spec)
+            val note = host.rowNote(row.spec, snapshot.isOn(row.spec), snapshot)
+            if (note != null) { row.description.text = note; row.noted = true }
+            else if (row.noted) { row.description.setText(row.spec.descriptionRes); row.noted = false }
             row.switch.isEnabled = !host.benchmarkLaunch && parentOn
         }
         binding = false

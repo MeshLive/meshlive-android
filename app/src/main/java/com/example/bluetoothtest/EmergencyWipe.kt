@@ -44,10 +44,14 @@ import kotlin.concurrent.thread
  *   4. end every call, stream and relay through the registered terminators on the main thread,
  *      waiting at most 2.5 s (the wipe itself runs on a worker thread, so a stuck terminator
  *      cannot hold it);
- *   5. clear and delete every SharedPreferences file and the app data, external files and caches;
- *   6. drop in-memory caches, then sweep the Keystore, preferences and files a second time for
+ *   5. wait for the background writers of sealed memories (SealedRecordsWorker and every
+ *      SealedTextFile write) with what is left of WRITER_BUDGET_MS, so nothing they seal or write
+ *      lands after the deletion below; a writer still running then leaves the wipe incomplete
+ *      (PRIV1 review finding 3; the key deletion of step 3 is not delayed by it, re-review S1);
+ *   6. clear and delete every SharedPreferences file and the app data, external files and caches;
+ *   7. drop in-memory caches, then sweep the Keystore, preferences and files a second time for
  *      late writers; the report is complete only if that final sweep removed everything;
- *   7. cancel every notification of the app (call alerts with caller labels, session status),
+ *   8. cancel every notification of the app (call alerts with caller labels, session status),
  *      remove the marker only when complete, log one line and end the process.
  *
  * A wipe that still cannot complete at launch opens WipeIncompleteActivity (retry, App info)
@@ -89,8 +93,33 @@ object WipeGuard {
     @Volatile var active: Boolean = false
         private set
 
+    /** Held (shared) by every sealed write from its guard check to its file write; the wipe waits for it (PRIV1 S4). */
+    private val writers = java.util.concurrent.locks.ReentrantReadWriteLock()
+
     fun check(what: String) {
         if (active) throw IllegalStateException("Emergency wipe: $what refused")
+    }
+
+    /**
+     * Runs [write] (a seal and a file write) after [check], so that a wipe that has begun waits for it to finish
+     * ([awaitWriters]) instead of deleting the files while it is half done.
+     */
+    fun <T> guardedWrite(what: String, write: () -> T): T {
+        writers.readLock().lock()
+        try {
+            check(what)
+            return write()
+        } finally {
+            writers.readLock().unlock()
+        }
+    }
+
+    /** After [begin]: true once no guarded write is running (new ones refuse), false at [timeoutMs]. */
+    internal fun awaitWriters(timeoutMs: Long): Boolean {
+        val lock = writers.writeLock()
+        if (!runCatching { lock.tryLock(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS) }.getOrDefault(false)) return false
+        lock.unlock()
+        return true
     }
 
     internal fun begin() {
@@ -99,6 +128,8 @@ object WipeGuard {
 
     internal fun reopenAfterCompletedResume() {
         active = false
+        // The resumed wipe drained the sealed-memory worker; this process goes on with an empty phone.
+        SealedRecordsWorker.reopenAfterWipe()
     }
 
     internal fun resetForTest() {
@@ -123,12 +154,24 @@ interface WipeEnvironment {
     fun resetInMemoryState()
     /** Cancels every notification the app posted (call alerts carry the caller's label). */
     fun cancelNotifications()
+    /**
+     * Stops the background writers of sealed memories and waits for a write already running (PRIV1 review finding 3), so
+     * nothing they seal or write lands after the deletion steps. False when one is still running at [timeoutMs].
+     */
+    fun drainBackgroundWriters(timeoutMs: Long): Boolean = true
     fun nowMs(): Long = System.nanoTime() / 1_000_000L
 }
 
 object EmergencyWipe {
     const val CONFIRMATION_TEXT = "DELETE"
     const val TERMINATOR_WAIT_MS = 2_500L
+    /**
+     * The time from the start of a wipe by which the sealed-memory writers must have stopped (step 5); the terminators'
+     * time counts against it, and at least [WRITER_DRAIN_MIN_MS] is always given. One running write is a Keystore seal and
+     * a small file write.
+     */
+    const val WRITER_BUDGET_MS = 3_500L
+    const val WRITER_DRAIN_MIN_MS = 250L
 
     /** In noBackupFilesDir; present from the start of a wipe until it completes. */
     const val PENDING_MARKER = "emergency-wipe-pending"
@@ -161,6 +204,8 @@ object EmergencyWipe {
         "broadcast_group_security",
         "call_encoder_fit",
         "encoder_burst_profiles",
+        // Experimental test_sw_shortfall_avc (SoftwareShortfallStore): encoder names and sizes only.
+        "sw_encoder_shortfall",
         "link_capacity",
         "native_encoder_speed",
         NotificationPrivacy.PREFS, // Lock-screen caller-name opt-in returns to off.
@@ -170,10 +215,12 @@ object EmergencyWipe {
         "rotating_discovery_name",
         // Crash reports: the "Don't ask again" choice (the reports themselves live in filesDir and go with it).
         "crash_reports",
-        // Missed-call notification: the one-time Call back tokens (no call content).
+        // Missed-call notification: earlier builds' plain Call back tokens (now sealed in no_backup, SEC-05).
         "missed_call",
-        // Chats: the local mute list (thread IDs only).
+        // Chats: earlier builds' plain mute list (now sealed in no_backup, SEC-05).
         "chat_mute",
+        // Experimental persisted Android 10 CoC budget (CocBudget): last listen PSM, count, boot count.
+        "coc_budget",
     )
 
     /** dataDir children that are not app data: native library link and ART's code cache. */
@@ -287,6 +334,11 @@ object EmergencyWipe {
             val sessions = runCatching { environment.runTerminators(terminators.toList(), terminatorTimeoutMs) }
                 .getOrElse { TerminatorOutcome(0, 1, false) }
             runCatching { environment.cancelNotifications() }
+            // Before any file is deleted: a write that passed the guard before begin() finishes first, and every later one
+            // does nothing; a key it made after step 3 goes in the final sweep. Not drained in time: the wipe stays
+            // incomplete and resumes at the next launch.
+            val drainMs = (WRITER_BUDGET_MS - (environment.nowMs() - started)).coerceAtLeast(WRITER_DRAIN_MIN_MS)
+            val drained = runCatching { environment.drainBackgroundWriters(drainMs) }.getOrDefault(false)
             val firstData = deletePreferencesAndFiles(environment)
             runCatching { environment.resetInMemoryState() }
             // Late writers (threads ending in step 4) may have recreated keys or files: sweep again.
@@ -295,7 +347,7 @@ object EmergencyWipe {
             // A session that ended late may have posted again; nothing identifying stays on screen.
             runCatching { environment.cancelNotifications() }
             val swept = finalKeys.second == 0 && finalData.third == 0
-            val complete = swept && runCatching { environment.clearPendingMarker() }.isSuccess
+            val complete = swept && drained && runCatching { environment.clearPendingMarker() }.isSuccess
             return WipeReport(
                 reason = reason,
                 alreadyRunning = false,
@@ -452,6 +504,12 @@ object EmergencyWipe {
             context.getSystemService(android.app.NotificationManager::class.java)?.cancelAll()
         }
 
+        override fun drainBackgroundWriters(timeoutMs: Long): Boolean {
+            val deadline = System.nanoTime() / 1_000_000L + timeoutMs
+            val worker = SealedRecordsWorker.drainForWipe(timeoutMs)
+            return WipeGuard.awaitWriters((deadline - System.nanoTime() / 1_000_000L).coerceAtLeast(0L)) && worker
+        }
+
         override fun resetInMemoryState() {
             IdentityVerification.clearForWipe()
             BlockedPeople.clearForWipe()
@@ -460,6 +518,8 @@ object EmergencyWipe {
             ContactClaims.clearForWipe()
             StoreForwardRuntime.clearForWipe()
             RotatingDiscovery.clearForWipe()
+            // Audit 2026-11-10 SEC-05: the sealed peer memories held in memory (their files go with no_backup).
+            SealedRecordsRegistry.clearForWipe()
         }
     }
 }

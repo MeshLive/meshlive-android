@@ -71,6 +71,13 @@ object LinkBuildTags {
     @Volatile
     var local: BuildTag? = null
 
+    /**
+     * This build's real tag regardless of the "Tell me about newer versions nearby" switch (null for a debug or non-split
+     * build); never sent by itself, read only by [WifiHopGate.effectiveOwnTag].
+     */
+    @Volatile
+    var build: BuildTag? = null
+
     @Volatile
     var sink: ((BuildTag) -> Unit)? = null
 

@@ -308,4 +308,19 @@ class RelayHopPolicyTest {
         }
         assertEquals(0, connects)
     }
+
+    @Test
+    fun aStaticRelayChildOn2mRetriesOnceOnlyBehindItsSwitch() {
+        // AP7 F3: the DEBUG static relay (test_private_call_relay) gets the on-demand hop's one 1M retry.
+        assertTrue(RelayHopPolicy.startHopRetry(enabled = true, firstOnTwoM = true, retried = false))
+        assertFalse(RelayHopPolicy.startHopRetry(enabled = false, firstOnTwoM = true, retried = false))
+        assertFalse(RelayHopPolicy.startHopRetry(enabled = true, firstOnTwoM = false, retried = false))
+        assertFalse(RelayHopPolicy.startHopRetry(enabled = true, firstOnTwoM = true, retried = true))
+    }
+
+    @Test
+    fun theStaticRelayRetryKeepsTheOnDemandHopGuardTiming() {
+        assertEquals(AdaptivePhyMemory.SETUP_STALL_MS, RelayHopPolicy.HOP_SETUP_STALL_MS)
+        assertTrue(RelayHopPolicy.HOP_SETUP_STALL_MS > 0L)
+    }
 }

@@ -287,12 +287,13 @@ class Bmh3PseudonymTest {
 
     private class Both<T>(val initiator: Result<T>, val responder: Result<T>)
 
-    private fun <T> both(initiator: () -> T, responder: () -> T, onResponderFailure: () -> Unit = {}): Both<T> {
+    private fun <T> both(initiator: () -> T, responder: () -> T, onResponderFailure: () -> Unit = {}, onInitiatorFailure: () -> Unit = {}): Both<T> {
         val responderResult = AtomicReference<Result<T>>()
         val worker = thread(name = "responder", isDaemon = true) {
             responderResult.set(runCatching(responder).onFailure { onResponderFailure() })
         }
-        val initiatorResult = runCatching(initiator)
+        // A failed initiator closes its outgoing pipe, so the responder fails at once instead of waiting out the read deadline.
+        val initiatorResult = runCatching(initiator).onFailure { onInitiatorFailure() }
         worker.join(120_000)
         return Both(initiatorResult, responderResult.get() ?: Result.failure(IllegalStateException("responder timed out")))
     }
@@ -390,6 +391,7 @@ class Bmh3PseudonymTest {
             // The answerer holds no matching lease: it presents a throwaway.
             { SecureBluetoothHandshake.respond(linkPipes.aToB.input, linkPipes.bToA.output, realR, responderCaps, bmh3 = Bmh3ResponderOptions(strangerIdentity = newIdentity(), acceptBmh2 = false)) },
             onResponderFailure = { linkPipes.bToA.close() },
+            onInitiatorFailure = { linkPipes.aToB.close() },
         )
         assertTrue(out.initiator.isFailure)
         assertEquals(0, realI.signed.get())
@@ -408,6 +410,7 @@ class Bmh3PseudonymTest {
                 )
             },
             onResponderFailure = { pipes.bToA.close() },
+            onInitiatorFailure = { pipes.aToB.close() },
         )
         assertTrue(out.responder.isFailure)
         assertTrue(out.initiator.isFailure)
@@ -875,6 +878,7 @@ class Bmh3PseudonymTest {
             { SecureBluetoothHandshake.initiate(pipes.bToA.input, pipes.aToB.output, realI, caps, bmh3 = mismatch) },
             { SecureBluetoothHandshake.respond(pipes.aToB.input, pipes.bToA.output, realR, responderCaps, bmh3 = Bmh3ResponderOptions()) },
             onResponderFailure = { pipes.bToA.close() },
+            onInitiatorFailure = { pipes.aToB.close() },
         )
         assertTrue(generateSequence(out.initiator.exceptionOrNull()) { it.cause }.any { it is IdentityMismatchException })
         assertEquals("the caller's real key signed nothing", 0, realI.signed.get())
@@ -904,6 +908,7 @@ class Bmh3PseudonymTest {
                 { SecureBluetoothHandshake.initiate(pipes.bToA.input, pipes.aToB.output, newIdentity(), caps, bmh3 = Bmh3InitiatorOptions()) },
                 { SecureBluetoothHandshake.respond(pipes.aToB.input, pipes.bToA.output, realR, responderCaps, bmh3 = options) },
                 onResponderFailure = { pipes.bToA.close() },
+                onInitiatorFailure = { pipes.aToB.close() },
             )
             assertTrue(out.responder.isFailure)
             assertEquals("pseudonyms=$pseudonyms: nothing signed", 0, realR.signed.get())
@@ -965,6 +970,7 @@ class Bmh3PseudonymTest {
         assertEquals("test_bmh3_pseudonyms", spec.benchmarkExtra)
         assertTrue(spec in ConnectivityFeatures.all)
         assertTrue(ConnectivityFeatureDefaults.BMH3_PSEUDONYMS)
-        assertNotEquals(ConnectivityFeatures.bmh3.prefKey, spec.prefKey)
+        // No Settings switch since 2026-11-04: a stored choice no longer turns it off.
+        assertTrue(spec.constant)
     }
 }

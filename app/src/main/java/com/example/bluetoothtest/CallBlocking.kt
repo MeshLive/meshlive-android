@@ -6,7 +6,6 @@ import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.File
-import java.io.IOException
 
 /*
  * Call blocking (USER_GUIDE "Block unknown callers" and "Blocked people"). Local only: no wire byte changes.
@@ -77,6 +76,35 @@ internal object CallBlockingPolicy {
     /** The existing decline goes out after a human-looking delay so the caller cannot tell it was automatic. */
     fun declineDelayMs(random: java.util.Random): Long =
         DECLINE_DELAY_MIN_MS + (random.nextDouble() * DECLINE_DELAY_SPREAD_MS).toLong()
+
+    /**
+     * AB3 (Windows WP6N real-key screen; owner rule "risk on the attacker"): a caller whose callee presented its real key in
+     * the endpoint handshake ends the call the ordinary way when [blocked] says that key is on the block list, exactly as
+     * after a blocked reveal. A throwaway callee is judged at its reveal and a callee judges its caller at the Invite (the
+     * call gate), so [blocked] is asked only here. The production [blocked] is [PersonPolicy.blocked], which fails open.
+     */
+    fun endsRealKeyCall(caller: Boolean, peerPseudonymous: Boolean, blocked: () -> Boolean): Boolean =
+        caller && !peerPseudonymous && blocked()
+}
+
+/**
+ * AB3/AP3 step 2b: the one per-call "a blocked person ended this call" latch. The call keeps one instance and clears it
+ * at every new connection ([reset]), so a blocked call can never carry into the next call made with the same endpoint
+ * object. Media, the caller's name and presence use the existing blocked-path decisions; this class only makes the
+ * lifetime of that latch testable.
+ */
+internal class BlockedCallLatch {
+    @Volatile
+    var active: Boolean = false
+        private set
+
+    fun block() {
+        active = true
+    }
+
+    fun reset() {
+        active = false
+    }
 }
 
 /** One blocked person: the full fingerprint and when the block was made. Nothing else is stored. */
@@ -94,9 +122,25 @@ internal enum class BlockResult { BLOCKED, ALREADY_BLOCKED, FULL, STORE_UNREADAB
 internal class BlockedPeopleStore(
     private val file: File,
     private val cipher: AtRestCipher,
+    /**
+     * Design decision 2026-11-06: an unreadable list stays fail-open (CF-CALL-24) but is logged, once each time it becomes
+     * unreadable (not on every check of every call). The argument is the failure's class name, never file content.
+     * Placed before [clock] so the existing `BlockedPeopleStore(file, cipher) { clock }` calls keep their meaning.
+     */
+    private val onUnreadable: (String) -> Unit = { cause ->
+        runCatching {
+            Log.w(
+                "BluetoothVideo",
+                (if (BuildConfig.DEBUG) "BENCHMARK " else "") + "call_blocking: event=list_unreadable | fail_open=true | cause=$cause",
+            )
+        }
+    },
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
     private var cache: List<BlockedPerson>? = null
+
+    /** True from the first failed read until a read succeeds or the list is reset. */
+    private var unreadableLogged = false
 
     /** Readable entries; empty when the store cannot be read (see [isUnreadable]). */
     @Synchronized
@@ -136,6 +180,7 @@ internal class BlockedPeopleStore(
     fun reset(): Boolean {
         val removed = !file.exists() || file.delete()
         cache = null
+        unreadableLogged = false
         return removed
     }
 
@@ -148,10 +193,14 @@ internal class BlockedPeopleStore(
         cache?.let { return it }
         if (!file.exists()) return emptyList<BlockedPerson>().also { cache = it }
         return try {
-            parse(cipher.open(file.readBytes())).also { cache = it }
+            parse(cipher.open(file.readBytes())).also {
+                cache = it
+                unreadableLogged = false
+            }
         } catch (error: Exception) {
-            if (error !is IOException) {
-                runCatching { Log.w("BluetoothVideo", "call_blocking: block list unreadable (${error.javaClass.simpleName})") }
+            if (!unreadableLogged) {
+                unreadableLogged = true
+                onUnreadable(error.javaClass.simpleName)
             }
             null
         }
@@ -182,7 +231,7 @@ internal class BlockedPeopleStore(
                 output.writeLong(it.blockedAtMs)
             }
         }
-        atomicWrite(file, cipher.seal(bytes.toByteArray()))
+        WipeGuard.guardedWrite("block list") { atomicWrite(file, cipher.seal(bytes.toByteArray())) }
         cache = people
     }
 
@@ -238,8 +287,13 @@ internal object BlockedPeople {
     fun unblock(context: Context, fingerprint: IdentityFingerprint): Boolean =
         runCatching { store(context).remove(fingerprint) }.getOrDefault(false).also { prefixSnapshot = null }
 
-    /** Forgets every blocked person (the recovery for an unreadable list). */
-    fun reset(context: Context): Boolean = runCatching { store(context).reset() }.getOrDefault(false).also { prefixSnapshot = null }
+    /** Forgets every blocked person (the recovery for an unreadable list). Logged, like the unreadable list itself. */
+    fun reset(context: Context): Boolean = runCatching { store(context).reset() }.getOrDefault(false).also { ok ->
+        prefixSnapshot = null
+        runCatching {
+            Log.i("BluetoothVideo", (if (BuildConfig.DEBUG) "BENCHMARK " else "") + "call_blocking: event=list_reset | ok=$ok")
+        }
+    }
 
     /**
      * The 12-hex prefixes of the blocked people, never blocking the caller: before the first load completes it
@@ -267,6 +321,40 @@ internal object BlockedPeople {
             store?.dropCache()
             store = null
             prefixSnapshot = null
+        }
+    }
+}
+
+/**
+ * What a screen that shows blocking says about the saved list (design decision 2026-11-06): while it cannot be read, the
+ * note "Block list can't be read" with Reset, and never "No one is blocked" (calls are not blocked, but people may be on
+ * it). Pure; [BlockedPeopleActivity] and the Settings row use it.
+ */
+internal data class BlockListView(val showUnreadableNote: Boolean, val showEmptyState: Boolean) {
+    companion object {
+        fun of(people: List<BlockedPerson>, unreadable: Boolean): BlockListView =
+            BlockListView(showUnreadableNote = unreadable, showEmptyState = people.isEmpty() && !unreadable)
+    }
+}
+
+/** What a person is told after a Block (Recent, a contact, "Decline and block"). Pure; [CallBlockingUi] uses it. */
+internal enum class BlockOutcome {
+    DONE,
+    ALREADY,
+    FULL,
+
+    /** Not saved because the list cannot be read: offer Reset ([CallBlockingUi.showBlockListUnreadable]). */
+    LIST_UNREADABLE,
+    FAILED,
+    ;
+
+    companion object {
+        fun of(result: BlockResult): BlockOutcome = when (result) {
+            BlockResult.BLOCKED -> DONE
+            BlockResult.ALREADY_BLOCKED -> ALREADY
+            BlockResult.FULL -> FULL
+            BlockResult.STORE_UNREADABLE -> LIST_UNREADABLE
+            BlockResult.UNAVAILABLE -> FAILED
         }
     }
 }
@@ -310,12 +398,16 @@ internal object CallBlocking {
     }
 
     /**
-     * Watch list: hides the broadcasts whose source (the route at cost 0 of a logical stream) is a blocked person,
-     * judged by the source's fixed announcement prefix, or for a rotating ID by the one contact it is recognised as.
-     * A broadcast heard only through relays, with no cost-0 route in range, cannot be attributed and stays listed.
-     * Review 2026-10-27 (finding 4): a stream whose source authenticated as a blocked person when someone watched or
-     * listened ([hiddenRoute], [PersonPolicy.hideStream]) keeps that route hidden, also under a rotating ID nobody
-     * recognises; another broadcaster that advertises the same token is not affected (review finding 1).
+     * Watch list: hides the route at cost 0 (a broadcaster heard directly) that is attributed to a blocked person, judged
+     * by its fixed announcement prefix, or for a rotating ID by the one contact it is recognised as, plus every route
+     * whose source authenticated as a blocked person when someone watched or listened ([hiddenRoute],
+     * [PersonPolicy.hideStream]; review 2026-10-27 finding 4, also under a rotating ID nobody recognises).
+     * Review 2026-11-06 (finding 2, the rule Windows adopted): the logical stream token and the advertised prefix are
+     * chosen by the advertiser and are not authenticated (a rotating ID can be replayed), so an attributed route hides
+     * only itself. Relayed routes and other direct routes of the same token stay listed, so a spoofer who copies a
+     * genuine broadcast's token cannot hide it. A relayed copy of a blocked person's stream stays listed until someone
+     * opens it; playback then leaves as soon as its source authenticates as the blocked person, and that route stays
+     * hidden ([hiddenRoute]).
      */
     fun <T> hideBlockedStreams(
         peers: List<T>,
@@ -330,23 +422,20 @@ internal object CallBlocking {
         return hideByPrefix(authenticatedHidden, announcement, blockedPrefixes, recognised)
     }
 
+    /** Hides only the cost-0 routes attributed to a blocked person; never another route of the same token. */
     private fun <T> hideByPrefix(
         peers: List<T>,
         announcement: (T) -> DiscoveryAnnouncement,
         blockedPrefixes: Set<String>,
         recognised: (DiscoveryAnnouncement) -> String?,
-    ): List<T> {
-        val hiddenTokens = peers.map(announcement)
-            .filter { it.routeCost == 0 }
-            .filter { source ->
-                val prefix = if (source.rotating) recognised(source) else source.nodeIdPrefix.joinToString("") { "%02x".format(it) }
-                prefix != null && prefix in blockedPrefixes
-            }
-            .map { it.logicalStreamToken() }
-            .toSet()
-        if (hiddenTokens.isEmpty()) return peers
-        return peers.filterNot { announcement(it).logicalStreamToken() in hiddenTokens }
+    ): List<T> = peers.filterNot { peer ->
+        val route = announcement(peer)
+        route.routeCost == 0 && attributedPrefix(route, recognised)?.let { it in blockedPrefixes } == true
     }
+
+    /** Who a direct route is attributed to: its fixed prefix, or the one contact a rotating ID is recognised as. */
+    private fun attributedPrefix(route: DiscoveryAnnouncement, recognised: (DiscoveryAnnouncement) -> String?): String? =
+        if (route.rotating) recognised(route) else route.nodeIdPrefix.joinToString("") { "%02x".format(it) }
 
     fun hideBlockedStreams(context: Context, peers: List<BleL2capPeer>): List<BleL2capPeer> =
         hideBlockedStreams(

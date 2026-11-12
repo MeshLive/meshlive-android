@@ -2,6 +2,7 @@
 
 import argparse
 import ast
+import importlib.util
 import csv
 import hashlib
 import json
@@ -44,6 +45,13 @@ def consumer_functions(path):
             raise ValueError("Consumer read-only path resolver changed; review its contract")
         layout_namespace = {"Path":Path,"os":os,"json":json,"ROOT":path.resolve().parents[1],
                             "GROUPS":{"inputs","builds","catalog","runs"},"_CACHE":{}}
+        # Since 6c712a6 the resolver maps declared evidence junctions through evidence_relocation.logical (pure, stdlib only).
+        relocation_path = path.parent/"evidence_relocation.py"
+        if relocation_path.exists():
+            spec = importlib.util.spec_from_file_location("evidence_relocation",relocation_path)
+            relocation = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(relocation)
+            layout_namespace["logical"] = relocation.logical
         exec(compile(ast.Module(body=helpers,type_ignores=[]),str(layout_path),"exec"),layout_namespace)
         namespace["locate"] = layout_namespace["resolve"]
     exec(compile(ast.Module(body=nodes,type_ignores=[]),str(path),"exec"),namespace)

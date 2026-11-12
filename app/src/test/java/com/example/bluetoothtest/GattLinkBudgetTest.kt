@@ -82,7 +82,8 @@ class GattLinkBudgetTest {
         assertTrue(full.admitChild(true).allowed) // default: logged, not enforced
         assertTrue(log.single(), "fits=false enforced=false" in log.single())
         GattSwitches.applyExtras({ key, default -> if (key == "test_link_budget_admission") true else default }, { _, d -> d }, { null })
-        assertFalse(full.admitChild(true).allowed)
+        // A release build ignores the launch extra: the refusal is never enforced.
+        assertEquals(!BuildConfig.DEBUG, full.admitChild(true).allowed)
     }
 
     @Test

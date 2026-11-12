@@ -955,8 +955,10 @@ class MessageArchive(private val dir: File, private val cipher: AtRestCipher) {
         )
         val existing = loadedIndex()[entry.bundleIdHex]
         require(bytes() - (existing?.storedBytes ?: 0) + summary.storedBytes <= quotaBytes) { "Message storage is full" }
-        atomicWrite(bodyFile(entry.bundleIdHex), cipher.seal(entry.message.encode()))
-        atomicWrite(metaFile(entry.bundleIdHex), cipher.seal(encodeSummary(summary)))
+        WipeGuard.guardedWrite("message archive") {
+            atomicWrite(bodyFile(entry.bundleIdHex), cipher.seal(entry.message.encode()))
+            atomicWrite(metaFile(entry.bundleIdHex), cipher.seal(encodeSummary(summary)))
+        }
         loadedIndex()[entry.bundleIdHex] = summary
     }
 
@@ -1094,9 +1096,10 @@ internal fun readSealedProperties(file: File, cipher: AtRestCipher): Properties 
     return Properties().apply { load(ByteArrayInputStream(plain)) }
 }
 
+/** Every sealed properties store (Messaging v2, store-and-forward) writes here; the wipe waits for a running write. */
 internal fun writeSealedProperties(file: File, cipher: AtRestCipher, properties: Properties) {
     val bytes = ByteArrayOutputStream().also { properties.store(it, null) }.toByteArray()
-    atomicWrite(file, cipher.seal(bytes))
+    WipeGuard.guardedWrite("sealed ${file.name}") { atomicWrite(file, cipher.seal(bytes)) }
 }
 
 internal fun readProperties(file: File): Properties = Properties().apply {

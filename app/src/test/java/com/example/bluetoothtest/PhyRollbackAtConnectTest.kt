@@ -3,6 +3,7 @@ package com.example.bluetoothtest
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Test
 
@@ -39,6 +40,8 @@ class PhyRollbackAtConnectTest {
 
     @Test
     fun aRememberedPhyChangeLossMovesTheNextConnectionTo1MWhileTheGateSwitchIsOn() {
+        // The rollback switches are Experimental DEBUG arms; a release build keeps the default PHY (theSameMarkDoesNothing...).
+        assumeTrue("DEBUG arm", BuildConfig.DEBUG)
         PhySwitches.applyFlags { it == "test_ll_gate" }
         LinkChangeRollbacks.onLinkLost(node, listOf(RecordedChange(LinkChangeKind.PHY, 0)), 3_000, 0x2A, System.currentTimeMillis())
         assertEquals(BlePhyPreference.ONE_M_ADAPTIVE, phy())
@@ -54,6 +57,8 @@ class PhyRollbackAtConnectTest {
 
     @Test
     fun anMtuMarkDoesNotMoveThePhy() {
+        // The rollback switches are Experimental DEBUG arms; a release build keeps the default PHY (theSameMarkDoesNothing...).
+        assumeTrue("DEBUG arm", BuildConfig.DEBUG)
         PhySwitches.applyFlags { it == "test_link_change_rollback" }
         LinkChangeRollbacks.onLinkLost(node, listOf(RecordedChange(LinkChangeKind.MTU, 0)), 3_000, 8, System.currentTimeMillis())
         assertEquals(BlePhyPreference.TWO_M, phy())
@@ -62,6 +67,8 @@ class PhyRollbackAtConnectTest {
 
     @Test
     fun aBluetoothRestartForgetsTheMark() {
+        // The rollback switches are Experimental DEBUG arms; a release build keeps the default PHY (theSameMarkDoesNothing...).
+        assumeTrue("DEBUG arm", BuildConfig.DEBUG)
         PhySwitches.applyFlags { it == "test_link_change_rollback" }
         LinkChangeRollbacks.onLinkLost(node, listOf(RecordedChange(LinkChangeKind.PHY, 0)), 3_000, 8, System.currentTimeMillis())
         assertEquals(BlePhyPreference.ONE_M_ADAPTIVE, phy())

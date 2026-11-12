@@ -471,6 +471,98 @@ class Bmh3Test {
         ).also { assertEquals(Bmh3Order.I_FIRST, it.responder.result().order) }
     }
 
+    @Test
+    fun theWifiMarkerRoundTripsAndFitsWithEverythingElse() {
+        val marked = Bmh3Extensions(wifi = true).encodeArea()
+        assertEquals(Bmh3Wire.EXTENSION_BYTES, marked.size)
+        assertTrue(Bmh3Extensions.parse(marked).wifi)
+        assertArrayEquals(Bmh3Extensions.NONE.encodeArea(), Bmh3Extensions().encodeArea())
+        assertArrayEquals(Bmh3Extensions.NONE.encodeArea(), Bmh3Extensions(wifi = false).encodeArea())
+        // The fullest initiator area: intent, build tag, pseudonym marker and the Wi-Fi marker (16 bytes of TLVs).
+        val initiator = Bmh3Extensions(intent = 1, buildTag = BuildTag(7, true), pseudonym = true, wifi = true)
+        val initiatorArea = initiator.encodeArea()
+        assertEquals(Bmh3Wire.EXTENSION_BYTES, initiatorArea.size)
+        val initiatorBack = Bmh3Extensions.parse(initiatorArea)
+        assertEquals(1, initiatorBack.intent)
+        assertEquals(BuildTag(7, true), initiatorBack.buildTag)
+        assertTrue(initiatorBack.pseudonym)
+        assertTrue(initiatorBack.wifi)
+        // The fullest responder area: two opening entries, a build tag and relay seek (99 bytes of TLVs).
+        val responder = Bmh3Extensions(opening = openingValue(2), buildTag = BuildTag(7, true), relaySeek = 1)
+        val responderArea = responder.encodeArea()
+        assertEquals(Bmh3Wire.EXTENSION_BYTES, responderArea.size)
+        val responderBack = Bmh3Extensions.parse(responderArea)
+        assertArrayEquals(openingValue(2), responderBack.opening)
+        assertEquals(BuildTag(7, true), responderBack.buildTag)
+        assertEquals(1, responderBack.relaySeek)
+        assertFalse(responderBack.wifi)
+        // Every extension at once needs 110 bytes, leaving 2: below the 3-byte PAD header, so it cannot be carried.
+        val everything = Bmh3Extensions(
+            opening = openingValue(2), intent = 1, buildTag = BuildTag(7, true), pseudonym = true,
+            relaySeek = 1, wifi = true,
+        )
+        val failure = assertThrows(IllegalArgumentException::class.java) { everything.encodeArea() }
+        assertEquals("Extensions do not fit the 112-byte area", failure.message)
+    }
+
+    @Test
+    fun theWifiMarkerIsStrict() {
+        fun area(vararg tail: Int): ByteArray {
+            val pad = Bmh3Wire.EXTENSION_BYTES - 3 - tail.size
+            return byteArrayOf(0, (pad ushr 8).toByte(), pad.toByte()) + ByteArray(pad) + ByteArray(tail.size) { tail[it].toByte() }
+        }
+        assertEquals("wifi marker malformed", assertThrows(Bmh3Failure::class.java) {
+            Bmh3Extensions.parse(area(Bmh3Extensions.TYPE_WIFI, 0, 0))
+        }.reason)
+        assertThrows(Bmh3Failure::class.java) {
+            Bmh3Extensions.parse(area(Bmh3Extensions.TYPE_WIFI, 0, 2, 1, 1))
+        }
+        // Another version is a peer without the marker, not a failure; it is still seen by the placement rule.
+        val otherVersion = Bmh3Extensions.parse(area(Bmh3Extensions.TYPE_WIFI, 0, 1, 2))
+        assertFalse(otherVersion.wifi)
+        assertTrue(otherVersion.wifiSeen)
+        // Types must ascend: the marker (8) before RELAY_SEEK (5) is rejected.
+        assertEquals("extensions not ascending", assertThrows(Bmh3Failure::class.java) {
+            Bmh3Extensions.parse(
+                area(
+                    Bmh3Extensions.TYPE_WIFI, 0, 1, Bmh3Extensions.WIFI_VERSION,
+                    Bmh3Extensions.TYPE_RELAY_SEEK, 0, 1, 1,
+                ),
+            )
+        }.reason)
+    }
+
+    @Test
+    fun theWifiMarkerIsAcceptedOnlyInAnInitiatorLinkBlock() {
+        val i = newIdentity()
+        val r = newIdentity()
+        // An initiator signs it; the responder reads it and never sends one back.
+        val marked = run(
+            Bmh3Initiator(Bmh3Config(Bmh3Purpose.LINK, i, caps, wifiMarker = true)),
+            Bmh3Responder(config(Bmh3Purpose.LINK, r, responderCaps)),
+        )
+        assertTrue(marked.responder.result().peer.wifiMarker)
+        assertFalse(marked.initiator.result().peer.wifiMarker)
+        val plain = run(Bmh3Initiator(config(Bmh3Purpose.LINK, i)), Bmh3Responder(config(Bmh3Purpose.LINK, r, responderCaps)))
+        assertFalse(plain.responder.result().peer.wifiMarker)
+        assertFalse(plain.initiator.result().peer.wifiMarker)
+        // A responder block never carries it.
+        val responder = Bmh3Responder(config(Bmh3Purpose.LINK, r))
+        responder.testWifiMarkerOverride = true
+        val responderFailure = assertThrows(Bmh3Failure::class.java) {
+            run(Bmh3Initiator(config(Bmh3Purpose.LINK, i)), responder)
+        }
+        assertEquals("wifi marker outside an initiator link block", responderFailure.reason)
+        // The end-to-end purpose never carries it, even when asked for.
+        assertFalse(Bmh3Config(Bmh3Purpose.END_TO_END, i, caps, wifiMarker = true).wifiMarker)
+        val endToEndInitiator = Bmh3Initiator(config(Bmh3Purpose.END_TO_END, i))
+        endToEndInitiator.testWifiMarkerOverride = true
+        val endToEndFailure = assertThrows(Bmh3Failure::class.java) {
+            run(endToEndInitiator, Bmh3Responder(config(Bmh3Purpose.END_TO_END, r)))
+        }
+        assertEquals("wifi marker outside an initiator link block", endToEndFailure.reason)
+    }
+
     // ----------------------------------------------------------------------- signature encoding and the curve
 
     @Test
@@ -606,12 +698,13 @@ class Bmh3Test {
 
     private class Pair<T>(val initiator: T, val responder: T)
 
-    private fun <T> both(initiator: () -> T, responder: () -> T, onResponderFailure: () -> Unit = {}): Pair<Result<T>> {
+    private fun <T> both(initiator: () -> T, responder: () -> T, onResponderFailure: () -> Unit = {}, onInitiatorFailure: () -> Unit = {}): Pair<Result<T>> {
         val responderResult = AtomicReference<Result<T>>()
         val worker = thread(name = "responder", isDaemon = true) {
             responderResult.set(runCatching(responder).onFailure { onResponderFailure() })
         }
-        val initiatorResult = runCatching(initiator)
+        // A failed initiator closes its outgoing pipe, so the responder fails at once instead of waiting out the read deadline.
+        val initiatorResult = runCatching(initiator).onFailure { onInitiatorFailure() }
         worker.join(120_000)
         return Pair(initiatorResult, responderResult.get() ?: Result.failure(IllegalStateException("responder timed out")))
     }
@@ -672,6 +765,74 @@ class Bmh3Test {
     }
 
     @Test
+    fun aMarkedInitiatorTellsItsResponderAndOnlyThatOneAndTheSessionsSayWhoMayReadBwf1() {
+        val pipes = Duplex()
+        val out = both(
+            { SecureBluetoothHandshake.initiate(pipes.bToA.input, pipes.aToB.output, newIdentity(), caps, bmh3 = Bmh3InitiatorOptions(wifiMarker = true)) },
+            { SecureBluetoothHandshake.respond(pipes.aToB.input, pipes.bToA.output, newIdentity(), responderCaps, bmh3 = Bmh3ResponderOptions()) },
+        )
+        val ini = out.initiator.getOrThrow()
+        val res = out.responder.getOrThrow()
+        assertTrue(ini.ownWifiMarker)
+        assertFalse(ini.peerWifiMarker)
+        assertTrue(ini.wifiReadOptIn)
+        assertFalse(res.ownWifiMarker)
+        assertTrue(res.peerWifiMarker)
+        assertTrue(res.wifiReadOptIn)
+        // Default options: no marker, no opt-in on either side.
+        val quiet = Duplex()
+        val quietOut = both(
+            { SecureBluetoothHandshake.initiate(quiet.bToA.input, quiet.aToB.output, newIdentity(), caps, bmh3 = Bmh3InitiatorOptions()) },
+            { SecureBluetoothHandshake.respond(quiet.aToB.input, quiet.bToA.output, newIdentity(), responderCaps, bmh3 = Bmh3ResponderOptions()) },
+        )
+        for (session in listOf(quietOut.initiator.getOrThrow(), quietOut.responder.getOrThrow())) {
+            assertFalse(session.ownWifiMarker)
+            assertFalse(session.peerWifiMarker)
+            assertFalse(session.wifiReadOptIn)
+        }
+        // The owner's opt-in makes the real records flow in both directions.
+        ini.reader.acceptWifi = ini.wifiReadOptIn
+        res.reader.acceptWifi = res.wifiReadOptIn
+        res.writer.write(SecureRecordType.BWF1, byteArrayOf(9, 8))
+        res.writer.flush()
+        val record = ini.reader.read()
+        assertEquals(SecureRecordType.BWF1, record.type)
+        assertArrayEquals(byteArrayOf(9, 8), record.payload)
+    }
+
+    @Test
+    fun anOldStyleResponderIgnoresTheMarker() {
+        val pipes = Duplex()
+        val out = both(
+            { SecureBluetoothHandshake.initiate(pipes.bToA.input, pipes.aToB.output, newIdentity(), caps, bmh3 = Bmh3InitiatorOptions(wifiMarker = true)) },
+            { SecureBluetoothHandshake.respond(pipes.aToB.input, pipes.bToA.output, newIdentity(), responderCaps, bmh3 = Bmh3ResponderOptions()) },
+        )
+        val ini = out.initiator.getOrThrow()
+        val old = out.responder.getOrThrow()
+        // The old build never opts in: the non-critical extension is skipped and the handshake completes.
+        old.reader.acceptWifi = false
+        ini.writer.write(SecureRecordType.BWF1, byteArrayOf(1))
+        ini.writer.flush()
+        val failure = assertThrows(IllegalStateException::class.java) { old.reader.read() }
+        assertEquals("Unknown secure record type 16", failure.message)
+    }
+
+    @Test
+    fun theMarkerChangesNoOtherHandshakeByte() {
+        // No fixed-entropy helper exists in this class: the sizes (equal for every identity) are the available proof
+        // that the marker changes no other handshake byte than its own encrypted extension.
+        val sizes = listOf(false, true).map { marker ->
+            run(
+                Bmh3Initiator(Bmh3Config(Bmh3Purpose.LINK, newIdentity(), caps, wifiMarker = marker)),
+                Bmh3Responder(Bmh3Config(Bmh3Purpose.LINK, newIdentity(), responderCaps)),
+            ).messages.map { it.size }
+        }
+        assertEquals(sizes[0], sizes[1])
+        assertEquals(listOf(Bmh3Wire.MSG1_BYTES, Bmh3Wire.MSG2_R_FIRST_BYTES, Bmh3Wire.MSG3_BYTES), sizes[0])
+        assertEquals(Bmh3Wire.MSG3_BYTES, sizes[1][2])
+    }
+
+    @Test
     fun aBmh3InitiatorFailsClosedAgainstAnOldResponderAndNeverFallsBack() {
         val pipes = Duplex()
         val written = ByteArrayOutputStream()
@@ -685,6 +846,7 @@ class Bmh3Test {
             { SecureBluetoothHandshake.initiate(pipes.bToA.input, tee, newIdentity(), caps, bmh3 = Bmh3InitiatorOptions()) },
             { SecureBluetoothHandshake.respond(pipes.aToB.input, pipes.bToA.output, newIdentity(), responderCaps) },
             onResponderFailure = { pipes.bToA.close() },
+            onInitiatorFailure = { pipes.aToB.close() },
         )
         assertTrue(out.responder.isFailure)
         assertEquals("Invalid handshake message", out.responder.exceptionOrNull()?.message)
@@ -708,6 +870,7 @@ class Bmh3Test {
                     )
                 },
                 onResponderFailure = { pipes.bToA.close() },
+                onInitiatorFailure = { pipes.aToB.close() },
             )
             if (accept) {
                 assertEquals(r.nodeId, out.initiator.getOrThrow().peerNodeId)
@@ -762,6 +925,7 @@ class Bmh3Test {
             { EndToEndVideoHandshake.initiate(linkI, i, caps, bmh3 = Bmh3InitiatorOptions()) },
             { EndToEndVideoHandshake.respond(linkR, r, responderCaps) },
             onResponderFailure = { linkPipes.bToA.close() },
+            onInitiatorFailure = { linkPipes.aToB.close() },
         )
         assertEquals("Invalid handshake message", ends.responder.exceptionOrNull()?.message)
         assertTrue(ends.initiator.isFailure)
@@ -1019,6 +1183,7 @@ class Bmh3Test {
                 )
             },
             onResponderFailure = { pipes.bToA.close() },
+            onInitiatorFailure = { pipes.aToB.close() },
         )
         assertEquals("not the expected contact", (out.initiator.exceptionOrNull() as Bmh3Failure).reason)
         assertEquals("the caller never revealed itself", 0, i.signed.get())
@@ -1118,7 +1283,7 @@ class Bmh3Test {
         assertEquals("bmh3", spec.id)
         assertEquals("test_bmh3", spec.benchmarkExtra)
         assertEquals(Bmh3Feature.EXTRA, spec.benchmarkExtra)
-        assertEquals("experimental_bmh3", spec.prefKey)
+        assertTrue("no Settings switch since 2026-11-04", spec.constant)
         assertEquals("T14", spec.phoneTest)
         assertTrue(spec.defaultEnabled)
         assertEquals(ConnectivityFeatures.GROUP, spec.group)
@@ -1221,5 +1386,36 @@ class Bmh3Test {
         val line = Bmh3Log.handshake("link", "initiator", Bmh3Order.R_FIRST, "ok", 123, hint = true, pinned = false)
         assertEquals("bmh3: event=link | role=initiator | order=R_FIRST | result=ok | ms=123 | hint=true | pinned=false", line)
         assertEquals("bmh3: event=choice | version=3 | reason=HINT", Bmh3Log.choice(3, "HINT"))
+    }
+
+    @Test
+    fun theCalleesLoggedPseudonymIsTheChildIdTheRelayLogs() {
+        // relay <-> callee hop: the callee answers behind a throwaway; the relay names it "child" in its relaying line.
+        val relay = newIdentity()
+        val callee = newIdentity()
+        val throwaway = newIdentity()
+        val relayThrowaway = newIdentity()
+        val hop = Duplex()
+        val out = both(
+            { Bmh3LinkHandshake.initiate(hop.bToA.input, hop.aToB.output, relay, caps, Bmh3InitiatorOptions(strangerIdentity = relayThrowaway)) },
+            {
+                Bmh3LinkHandshake.respond(
+                    hop.aToB.input, hop.bToA.output, readFirst(hop.aToB.input), callee, responderCaps,
+                    Bmh3ResponderOptions(strangerIdentity = throwaway),
+                )
+            },
+        )
+        val relayDown = out.initiator.getOrThrow()
+        val calleeLink = out.responder.getOrThrow()
+        assertTrue(calleeLink.ownPseudonymous)
+        val childAsTheRelayLogsIt = relayDown.peerNodeId.shortLabel()
+        assertEquals(throwaway.nodeId.shortLabel(), childAsTheRelayLogsIt)
+        assertEquals(
+            "BENCHMARK pseudonym_own: role=call | link=${relayThrowaway.nodeId.shortLabel()} | id=$childAsTheRelayLogsIt",
+            PseudonymOwnLog.line(calleeLink),
+        )
+        // Symmetric: the callee would log the relay's throwaway the same way.
+        assertEquals(calleeLink.peerNodeId.shortLabel(), relayThrowaway.nodeId.shortLabel())
+        assertTrue(PseudonymOwnLog.line(relayDown)!!.endsWith("| id=${relayThrowaway.nodeId.shortLabel()}"))
     }
 }

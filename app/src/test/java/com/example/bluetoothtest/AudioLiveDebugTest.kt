@@ -9,6 +9,7 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Test
 
@@ -112,6 +113,8 @@ class AudioLiveDebugTest {
 
     @Test
     fun txAndRxDigestLinesJoinOnSeqAndCarryTheSameUnitHashes() {
+        // Digest lines are a DEBUG measurement switch; a release build never writes them (see the test above).
+        assumeTrue("DEBUG arm", BuildConfig.DEBUG)
         AudioLiveTunables.unitDigests = true
         val g = guard()
         assertTrue("the guard follows the switch", g.digests)
@@ -143,7 +146,8 @@ class AudioLiveDebugTest {
         assertTrue(lines.none { it.startsWith("BENCHMARK audio_live_units") })
         try {
             AudioLiveTunables.applyExtras({ name, d -> if (name == "test_audio_live_digests") true else d }, { _, d -> d }, { null })
-            assertTrue(AudioLiveTunables.unitDigests)
+            // A release build ignores the extra: no digest lines.
+            assertEquals(BuildConfig.DEBUG, AudioLiveTunables.unitDigests)
         } finally {
             AudioLiveTunables.applyExtras({ _, d -> d }, { _, d -> d }, { null })
         }

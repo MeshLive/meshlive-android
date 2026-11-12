@@ -112,13 +112,12 @@
         <item quantity="one">%d person nearby</item>
         <item quantity="other">%d people nearby</item>
     </plurals>
-    <string name="people_details">ID: %1$s\nBluetooth name (not checked): %2$s\nBluetooth address: %3$s\nConnection: %4$s\nShort ID: %5$s\n\nThe call checks this phone\'s full encrypted identity when it connects.</string>
+    <string name="people_details">ID: %1$s\nBluetooth address: %2$s\nConnection: %3$s\nShort ID: %4$s\n\nThe call checks this phone\'s full encrypted identity when it connects.</string>
     <string name="people_section_contacts">Contacts</string>
     <string name="people_section_nearby">Nearby</string>
     <string name="people_reach_nearby">Nearby</string>
     <string name="people_rotating_phone">Nearby phone</string>
     <string name="people_rotating_handle">Name hidden until you connect</string>
-    <string name="experimental_rotating_ids">Private Bluetooth ID</string>
     <string name="rotating_ids_visible_button">Let older app versions find me (10 to 25 minutes)</string>
     <string name="rotating_ids_reset_key">Reset private ID</string>
     <string name="rotating_ids_reset_confirm">Reset nearby recognition? Contacts will need to reconnect with you to recognise your phone nearby again. Your saved contacts and call verification stay the same.</string>
@@ -132,7 +131,6 @@
     <string name="verify_visible_nearby_description">Their phone can tell when you\'re nearby (shown as unconfirmed, never as verified). Turning this off later gives your phone a new private ID.</string>
     <string name="rotating_ids_visible_until">Older app versions can find you until %1$s. During this time, your usual ID is visible, so nearby devices may recognise your phone across sessions.</string>
     <string name="rotating_ids_visible_off">Turn on Private Bluetooth ID first. Without it, older app versions can always find this phone.</string>
-    <string name="experimental_rotating_ids_description">Changes your nearby Bluetooth ID every 15 minutes to make your phone harder to recognise. This doesn\'t make you anonymous. Contacts you allow can still recognise you, and older app versions may not connect. Changes apply when you next become available for calls or go live.</string>
     <string name="rotating_ids_legacy_note">This phone\'s Bluetooth chip may keep its address when the ID changes, so a scanner nearby could still link your IDs. Rotating IDs protect less on this phone.</string>
     <string name="neutral_bluetooth_name">Hide phone name</string>
     <string name="neutral_bluetooth_name_description">Renames your phone to \"Phone\" across Bluetooth connections, including headphones, cars and computers. Turn this off to restore its name. If you uninstall MeshLive first, you\'ll need to rename it in Android settings.</string>
@@ -330,7 +328,7 @@
     <string name="wipe_panic_countdown">Deleting everything in 3 seconds</string>
     <string name="wipe_panic_undo">Undo</string>
     <string name="panic_gesture">Triple-tap to delete everything</string>
-    <string name="panic_gesture_description">Off by default. Tap the app name on the home screen three times quickly to delete everything, with 3 seconds to undo.</string>
+    <string name="panic_gesture_description">Off by default. Tap the word MeshLive at the top of the Live tab three times quickly to delete everything, with 3 seconds to undo.</string>
     <string name="about_title">About this app</string>
     <string name="advanced_title">Advanced</string>
     <string name="advanced_subtitle">Connection type, video quality and experiments</string>
@@ -350,7 +348,7 @@
     <string name="advanced_playback_description">Helps absorb uneven Bluetooth delivery. It does not change picture quality.</string>
     <string name="advanced_decoders">Decoders on this phone</string>
     <string name="advanced_section_experimental">Experimental</string>
-    <string name="advanced_experiments_hint">Tests that may not work well yet. To change them, first turn on Manual video settings.</string>
+    <string name="advanced_experiments_hint">Tests that may not work well yet.</string>
 
     <!-- Onboarding -->
     <string name="onboarding_title">Call and go live with people nearby</string>
@@ -437,6 +435,7 @@
     <string name="help_share_app">Share this app</string>
     <string name="link_health_title">Link health</string>
     <string name="link_health_connection">Connection: Bluetooth %1$s</string>
+    <string name="link_health_connection_carrier">Connection: %1$s</string>
     <string name="link_health_video">Your video: %1$d×%2$d, %3$d fps, %4$d kbps requested</string>
     <string name="link_health_limit">Link currently allows about %1$d kbps</string>
     <string name="link_health_audio">Sound: %1$d kbps</string>
@@ -445,19 +444,16 @@
     <string name="help_no_browser">No app can open the bug report page. Open the project page on a phone with internet.</string>
     <!-- Experimental peer labels (naming design phase 1) -->
     <string name="experimental_peer_labels">Experimental: names and titles</string>
-    <string name="experimental_peer_labels_description">Off by default. Adds an optional name (Settings, Your ID), a subject when you place a call and a title when you go live. Names and subjects travel only inside the encrypted call, signed by your identity key; a stream title is also advertised publicly so people nearby see it before joining (shown as unconfirmed until they join). Phones without this see only your handle.</string>
+    <string name="experimental_peer_labels_description">Off by default. Adds an optional name (Settings, Your name) and a title when you go live. Names travel only inside the encrypted call, signed by your identity key; a stream title is also advertised publicly so people nearby see it before joining (shown as unconfirmed until they join). Phones without this see only your handle.</string>
     <string name="identity_name_none">Add your name (optional)</string>
     <string name="identity_name_set">Your name: %1$s</string>
-    <string name="identity_name_note">Shown to people you call, marked as their own choice. Your ID never changes.</string>
+    <string name="identity_name_note">Your name is never broadcast. It is sent, encrypted, only to the people you choose under Who sees my name, and your QR code shows it. Without a name, others see a made-up name.</string>
     <string name="identity_name_title">Your name</string>
-    <string name="identity_name_hint">Optional. Only people you call see it</string>
+    <string name="identity_name_hint">Optional. You choose who sees it</string>
     <string name="identity_name_invalid">This name can\'t be used (%1$s). Use a short name in one alphabet, without check marks or IDs.</string>
-    <string name="call_subject_title">Call subject (optional)</string>
-    <string name="call_subject_hint">What is the call about?</string>
     <string name="stream_title_prompt">Stream title (optional)</string>
     <string name="stream_title_hint">Public: anyone nearby can read it</string>
     <string name="label_invalid">Not used: %1$s</string>
-    <string name="call_subject_line">Subject: %1$s</string>
     <string name="action_save">Save</string>
     <string name="action_skip">Skip</string>
     <!-- "Share app nearby" (OfflineAppShareActivity; Settings > Features switch, DEBUG test_offline_app_share). -->
@@ -494,17 +490,12 @@ Signing certificate SHA-256:
     <string name="share_nearby_timeout">Sharing stopped after 10 minutes. Open this screen again to share again.</string>
     <string name="share_nearby_close">Close</string>
     <!-- Naming v2 (Design G): switch texts. Keep this block together; the UI redesign may restyle but should not rename the ids. -->
-    <string name="feature_generated_names">Friendly names for nearby phones</string>
-    <string name="feature_generated_names_description">Shows phones you have not verified under a made-up two-word name such as Blue Otter, made from the temporary ID they are using. It is not a proof of who they are. Off: the plain ID is shown.</string>
     <string name="feature_title_pages">Show my stream title to everyone nearby</string>
     <string name="feature_title_pages_description">When you go live with a title, anyone nearby can read it in their list before they join. A title is public. Off: viewers see the title only after they join.</string>
     <string name="names_audience_title">Who sees my name</string>
-    <string name="names_audience_everyone">Everyone I call or answer</string>
-    <string name="names_audience_verified">Only people I verified</string>
+    <string name="names_audience_everyone">People I call or who call me</string>
+    <string name="names_audience_verified">Only my contacts</string>
     <string name="names_audience_nobody">Nobody</string>
-    <string name="names_audience_note">Your name is never broadcast. It is sent, encrypted, only to the people chosen here when you call or answer. Without a name they see a generated name instead.</string>
-    <string name="feature_names_before_answer">Show my name before they answer</string>
-    <string name="feature_names_before_answer_description">Your name goes to whoever you call, before the app has checked who they are. Only the name goes early, never the call subject. Turn this off to send it only after they answer and are checked.</string>
     <string name="status_row_nameplate">Nearby you appear as</string>
     <string name="status_nameplate_value">%1$s until %2$s</string>
     <string name="call_incoming_claims">%1$s, not checked</string>
@@ -537,7 +528,7 @@ Signing certificate SHA-256:
     <string name="visible_name_value_off">Off</string>
     <string name="visible_name_value_on">Until %1$s</string>
     <string name="visible_name_title">Show a name to everyone nearby</string>
-    <string name="visible_name_message">For ten minutes anyone nearby can read this name next to a temporary ID, with the app or without it. Use a nickname, not your real name. It stops by itself, and the temporary ID you use for calls never carries it.</string>
+    <string name="visible_name_message">For ten minutes anyone nearby can read this name next to a temporary ID, with the app or without it. Your name is filled in; change it here if you prefer a nickname. It stops by itself, and the temporary ID you use for calls never carries it.</string>
     <string name="visible_name_hint">A nickname</string>
     <string name="visible_name_allow_anyone">Also let anyone call me for these ten minutes</string>
     <string name="visible_name_start">Show my name</string>
@@ -576,6 +567,11 @@ Signing certificate SHA-256:
     <string name="ob_full_screen_text">Allow full-screen calls so you can answer when your phone is locked.</string>
     <string name="ob_full_screen_settings">Open settings</string>
     <string name="status_full_screen_off">Calls won\'t ring full screen</string>
+    <string name="status_calls_unavailable">Calls unavailable</string>
+    <string name="status_value_calls_stalled">Unavailable. Bluetooth stopped responding. Turn Bluetooth off and on. If that doesn\'t help, restart your phone.</string>
+    <string name="status_value_calls_exhausted">Unavailable. Bluetooth has no free connections for calls. Turn Bluetooth off and on.</string>
+    <string name="status_value_calls_failed">Unavailable. Calls couldn\'t start over Bluetooth. Turn Bluetooth off and on.</string>
+    <string name="action_bluetooth_settings">Bluetooth settings</string>
     <string name="recent_answered">Answered</string>
     <string name="recent_missed">Missed</string>
     <string name="recent_declined">Declined</string>
@@ -592,4 +588,18 @@ Signing certificate SHA-256:
     <string name="nearby_search_hint">Search people</string>
     <string name="nearby_action_call">Call</string>
     <string name="nearby_action_block">Block</string>
+    <!-- A call that needs the camera or the microphone after the user refused it (UI audit 2026-11-10, UI-01).
+         %1$s: what is missing, from the permission_name_* strings ("the camera", "the camera and the microphone"). -->
+    <string name="call_media_needed_answer">MeshLive needs access to %1$s to answer this call.</string>
+    <string name="call_media_needed_place">MeshLive needs access to %1$s to make this call.</string>
+    <string name="call_media_needed_camera_on">MeshLive needs access to %1$s to turn your video on.</string>
+    <string name="call_answered_voice_camera_off">Answered with voice: camera access is off</string>
+    <string name="call_placed_voice_camera_off">Calling with voice: camera access is off</string>
+    <!-- The 2.4 GHz advice while any Wi-Fi switch is on (UI audit 2026-11-10, UI-03): it never says to turn Wi-Fi off.
+         The other variant is wifi_advice_title / wifi_advice in strings_status.xml. -->
+    <string name="wifi_advice_keep_wifi_on_title">Your Wi-Fi network slows Bluetooth</string>
+    <string name="wifi_advice_keep_wifi_on">This Wi-Fi network uses 2.4 GHz, which slows Bluetooth video. Switch to a 5 GHz network or disconnect from this network. Keep Wi-Fi on so calls can use it.</string>
+    <!-- The call's transient line when its media moves between carriers (UI audit 2026-11-10, UI-04). -->
+    <string name="call_now_on_wifi">Now on Wi-Fi</string>
+    <string name="call_back_on_bluetooth">Back on Bluetooth</string>
 </resources>

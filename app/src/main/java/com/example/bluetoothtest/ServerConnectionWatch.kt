@@ -87,6 +87,19 @@ internal class ServerConnectionWatch(
 }
 
 /**
+ * AP7 F1 (`test_gatt_first_write_counts_control`): a well-formed `GR1` `Hello` or `High` is a control write the peer
+ * actually delivered to this server. A data chunk, an empty value, a malformed type-2 value, a `Nack` and a `Gone` are
+ * not. `Gr1.decode` rejects anything else, so a malformed value cannot silence the watch.
+ */
+internal fun recoveryControlDelivered(value: ByteArray): Boolean =
+    value.isNotEmpty() && value[0] == Gr1.TYPE &&
+        Gr1.decode(value).let { it is Gr1.Message.Hello || it is Gr1.Message.High }
+
+/** AP7 F1: [recoveryControlDelivered] behind the Experimental switch; false while the switch is off. */
+internal fun controlCountsAsFirstWrite(enabled: Boolean, value: ByteArray): Boolean =
+    enabled && recoveryControlDelivered(value)
+
+/**
  * Keep-address part of the same entry ([GattServerReregisterKeepsAddress]): what a re-registration does with the call
  * listener's advertising set. Re-registering only replaces the GATT server; the set is a separate stack object, so a set
  * that is still running keeps advertising (same set, same address) and the client's retry finds it at once instead of

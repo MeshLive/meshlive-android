@@ -36,11 +36,48 @@ Nothing here is a promise or a schedule. Contributions are welcome on any item; 
 | 11 | Bluetooth headsets | Deliberately excluded; open question | No |
 | 12 | Distribution and field reports | In progress | No |
 | 13 | iPhone interoperability | Built: compact discovery ("Find iPhones") on by default since 0.3.0-beta | Yes |
-| 14 | Wi-Fi Direct / Aware bearer | Designed and reviewed (Design WF, 2026-10-27); implementation next | Yes |
+| 14 | Wi-Fi Direct / Aware bearer | Coded, Experimental (off by default); quality ladder and Aware proof open | Yes |
 | - | Video codecs: HEVC and hardware H.264 (Design HC), built-in VP9 encoder (Design VX) | Built; on since 0.4.2-beta | Yes |
 | - | Hide phone name | Built; on by default since 0.4.1-beta | No |
 | 15 | Measurement adapters still missing | Open | No |
 | 16 | Platform and product work | Open | Parts |
+
+## First-principles audit (2026-11): confirmed work
+
+A whole-system audit checked the app, the protocols and the test system against what an off-grid user needs. The items below are confirmed and unfinished; each is removed here when its fix reaches its owning document.
+
+**Before the next release**
+
+- **Evidence on the user path.** Phone tests launched the app with every unnamed feature off (fixed discovery IDs, no hidden identities or pseudonyms, no video fragments on GATT, start-up fallbacks off) and only as a debug build. The release gate and every promotion must run as a user launch, with one release-build smoke call per promotion.
+- **A result system that can say "pass".** A call can only score fail or unmeasured, the smoothness limits sit exactly on the 60 Hz display grid, a call that connected after a retry is cut and scored as failed, and missing log lines on two phones are read as failed calls. Fix the scorer and runner, then adopt a small release gate (about 120 user-launch calls on three lanes in under two hours).
+- **Wi-Fi that helps the user.** A call on Wi-Fi keeps the Bluetooth picture; Wi-Fi Aware has not yet carried a call and exists on a minority of phones; a call that leaves Wi-Fi at a Wi-Fi rate can freeze; heat is checked only when the call starts; the user is never told why Wi-Fi was not used. Work: the Wi-Fi quality ladder with delivery feedback and a clean step-down (Experimental), the Aware proof on a second pair, the Wi-Fi-off and heat cases, and plain Wi-Fi wording in Settings and in the call.
+- **Documents that match the code.** Correct the privacy and user-guide statements the code does not keep (who can see a stream participant's identity, where peer memories are stored, "media only over Bluetooth").
+- **No dead buttons.** A refused camera permission must never leave Accept doing nothing; a failed incoming link the user never saw must not move them between screens; the 2.4 GHz advice must not tell a Wi-Fi user to turn Wi-Fi off.
+
+**Privacy and robustness (design review required where marked)**
+
+- **Stream participants' identities (design review required).** Stream hops still use the older handshake, which shows each participant's long-term key to a listener. Viewers and forwarders should join with a throwaway key, and stream hops should move to the hidden-identity handshake.
+- **One connection must not silence a phone (design review required).** A single silent inbound connection takes the call listener off the air for up to 20 s; keep the advert and listener up until the hop is authenticated and hold off repeat offenders.
+- **Calls that survive the screen.** Calls and the call listener live in the screen component: closing the app makes the phone unreachable without telling the user and ends a live call without a hang-up. Move the endpoint and the call into the service; say so when reachability stops.
+- **Wi-Fi links and other apps.** A Wi-Fi link makes the other phone an IP neighbour; on stream hops that is any viewer. Measure the exposure and limit stream-hop upgrades if other apps are reachable.
+- **Name timing.** The callee's name should wait for the caller's block check, as the camera and microphone already do.
+
+**Speed and quality**
+
+- **Join time.** On a healthy pair Bluetooth setup is about 1.0-1.3 s and near its floor; the largest stage is each phone starting camera and encoder after Accept. Prepare encoder, decoder and audio while ringing (camera only at Accept); connect on LE 1M and move to 2M once the call is up; measure from an idle callee with a real scene.
+- **A video fault must not end the voice.** A decoder error or stall hangs up the whole call; keep the voice and restart video in place.
+- **Relayed calls as users make them.** The on-demand relayed path had never run on phones (the earlier relay tests used a test-only shape); measure it, including what a slow or dishonest helper does.
+- **Viewers and sources.** Bound a viewer's search for a lost stream; stop one weak viewer lowering the rate for everyone; measure join floods.
+- **Phone-family hazards.** Advertising set that stays deaf to a returning caller on one family; outgoing dials that fail until Bluetooth is toggled on another (guidance card); LE CoC stack faults keep that transport Experimental.
+- **What is never measured.** Long calls, memory growth, lip sync, picture quality, echo and loudness.
+
+**User interface**
+
+- Truthful status (location off on older Android, "Ready" while not on air), permission guidance after "don't ask again", one name for the user's ID, accessibility of the status dot and call buttons, developer rows hidden from normal Settings, translatable text.
+
+**Project hygiene**
+
+- One source line for app, documents and tools; a consistent line-ending policy; a shorter unit-test run; a phone-readiness tool for installs and permissions; a verified backup on a second disk.
 
 ## Open defects in shipped behaviour
 
@@ -53,6 +90,8 @@ Open across every phone combination that uses the affected behaviour. The benchm
 - **Relayed viewers hold seconds of media.** Viewers behind a relay held 2.7-7.5 s (direct 250-345 ms). `test_relay_pace_head` (default on) and Experimental `test_relay_pace_lead_cap` need a one-build phone A/B, and a policy for a relay link slower than the stream.
 - **Relay dual-role scheduling.** Parent and child LE links keep a fixed phase and some phases never complete on the M31. `test_relay_child_stall_guard` (default on) and Experimental `test_relay_upstream_dck` need an HCI-snoop A/B on both relay candidates.
 - **Call speech behind video writes.** Fragments with speech-led playout are on for direct GATT calls. Open: A/V offset, sender CPU and battery on the M31, a third repeat, the A15s over CoC, an HCI check of audio between fragments.
+- **One short link gap adds lasting call delay.** After a single 0.5 s gap in received media the shared call playout delay grows by about 300 ms (late audio keeps the full range; speech-led playout caps only video) and the call shrink starts 10 s later at 1 ms per 100 ms, so the conversation runs about 0.3 s later for some 40 s. Candidate, Experimental and default off: a faster call-only recovery after one isolated gap that catches up through silent audio frames and earlier video scheduling, never time-stretching speech; measure added delay, audio gaps and freezes in an A/B.
+- **A stranger dialled at their ID rotation is not found.** A dial made within a few seconds of the callee's 15-minute rotating-ID boundary waits for the old ID, and an unrecognised peer cannot be followed to its new ID by design; the callee is also silent for about 3 s while it restarts its advert. Candidates (privacy review first): shorten the restart silence, tell the caller "their ID just changed, tap them again", or a brief overlap of old and new adverts if the review finds it adds no linkage beyond the visible handover.
 - **Visible age of the last received frame.** `test_viewer_frame_age` (default off) needs a relay loss/rejoin phone test; a clock-synced end-to-end age needs a protocol design.
 - **Stream link role reversal (design review required).** A busy-peripheral relay cannot always connect out to its advertising child; the root fix is the child connecting as central. Wait for the dual-role A/B, then write the PROTOCOL design.
 - **Requested versus effective settings.** Expose every difference in encoder, allocation, geometry, rate, FPS, audio and buffer instead of substituting settings silently.
@@ -105,6 +144,10 @@ The full design texts are in [decisions](decisions/README.md), "Design records".
   top line, Your name subtitle, incoming call/Meet), settings rows with the (i) inline after wrapped text and a divider
   between every row, value rows wrapping under the title, the plain-language copy audit (no political framing), Chats
   tab structure, missed-call notification, "Couldn't reach <name>" with Call again, and the crash report prompt.
+- **Mac fixed Bluetooth address (measured 2026-10-27):** macOS app adverts and connections use the controller's
+  public address and CoreBluetooth gives apps no control, so a Mac is recognisable over time (documented in privacy.md
+  and devices.md). Optional Mac-only idea, not built: an "Advertise only while the window is open" switch (default
+  off) to shrink exposure windows.
 - **Windows Watch and Go live (Design QV rev 4, gates W1/W2 passed 2026-10-21):** implement after the weekly usage
   reset (design decision 2026-10-21: Play Store release first). Android serves PC viewers and sees PC streams behind
   Find PCs; Windows uses one announcing provider switched by mode (F1).

@@ -198,6 +198,47 @@ class PipelineTraceTest(unittest.TestCase):
         self.assertEqual("COMPLETE", result["diagnostics"]["scopes"][0]["status"])
         self.assertEqual(2, sum(row["status"] == "MEASURED" for row in result["diagnostics"]["local_spans"]))
 
+    def test_v2_batched_logcat_scores_exactly_like_the_v1_lines(self):
+        # Encoder-role rows are outgoing, decoder-role rows incoming: the reader derives direction from role/stage.
+        rows = [self.row("encode_input", 0, 0, 1, role="video_encoder"),
+                self.row("encode_output", 0, 40_000_000, 2, role="video_encoder", q_idx=87),
+                self.row("receive", 70, 45_000_000, 3, role="video_decoder", direction="incoming"),
+                self.row("decoder_input", 70, 50_000_000, 4, role="video_decoder", direction="incoming"),
+                self.row("final", 0, 100_000_000, 5, role="video_encoder")]
+
+        def v2(batch):
+            head = {key: batch[0][key] for key in ("session", "pid", "clock", "role")}
+            head["scope"] = "scope-1"
+            body = [[r["sequence"], r["stage"], r["pts_us"], r["at_ns"], r["bytes"], int(r["final"]),
+                     {"q_idx": r["q_idx"]} if "q_idx" in r else None] for r in batch]
+            return "10-04 x BENCHMARK stage v2 " + json.dumps({**head, "rows": body})
+
+        def analyze_log(text):
+            (self.folder / "trace.log").write_text(text)
+            spec = self.spec(rows)
+            spec["traces"][0].update({**self.pointer("trace.log"), "format": "logcat"})
+            spec["traces"].append({**spec["traces"][0], "direction": "incoming"})
+            spec["plans"] = []
+            return self.analyze(spec)["diagnostics"]
+
+        v1 = analyze_log("\n".join("10-04 x " + pipeline.PREFIX + json.dumps(r) for r in rows))
+        v2_text = "unrelated\n" + "\n".join(v2(batch) for batch in (rows[0:2], rows[2:4], rows[4:5]))
+        batched = analyze_log(v2_text)
+        self.assertEqual(2, sum(row["status"] == "MEASURED" for row in batched["local_spans"]))
+        self.assertEqual("COMPLETE", batched["scopes"][0]["status"])
+        self.assertEqual(v1["local_spans"], batched["local_spans"])
+        self.assertEqual(v1["scopes"], batched["scopes"])
+
+    def test_a_truncated_v2_line_is_not_scored_silently(self):
+        row = [1, "encode_input", 0, 0, 0, 0, None]
+        text = "10-04 x BENCHMARK stage v2 " + json.dumps({"session": "session-1", "scope": "scope-1", "role": "video_encoder",
+                                                           "pid": 17, "clock": "System.nanoTime", "rows": [row]})[:-8]
+        (self.folder / "trace.log").write_text(text)
+        spec = self.spec()
+        spec["traces"][0].update({**self.pointer("trace.log"), "format": "logcat"})
+        with self.assertRaises(ValueError):
+            self.analyze(spec)
+
     def lifecycle_spec(self, missing=False):
         spec = self.spec()
         names = ("fault", "command", "ack", "first_surface")

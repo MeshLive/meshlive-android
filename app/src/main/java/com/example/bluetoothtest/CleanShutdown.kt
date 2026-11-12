@@ -22,8 +22,18 @@ internal object CleanShutdown {
     const val SETTLE_MS = 2_500L
     const val POLL_MS = 100L
 
-    data class Residue(val scanners: Int, val advertisers: Int, val gattClients: Int, val gattServers: Int) {
-        val clear: Boolean get() = scanners == 0 && advertisers == 0 && gattClients == 0 && gattServers == 0
+    data class Residue(
+        val scanners: Int,
+        val advertisers: Int,
+        val gattClients: Int,
+        val gattServers: Int,
+        val awareAttach: Int = 0,
+        val awareNetworks: Int = 0,
+        val wifiSockets: Int = 0,
+        val directGroups: Int = 0,
+    ) {
+        val clear: Boolean get() = scanners == 0 && advertisers == 0 && gattClients == 0 && gattServers == 0 &&
+            awareAttach == 0 && awareNetworks == 0 && wifiSockets == 0 && directGroups == 0
     }
 
     @Volatile var requested = false
@@ -43,18 +53,24 @@ internal object CleanShutdown {
 
     fun residue(): Residue {
         val gatt = runCatching { GattResourceRegistry.shared.snapshot() }.getOrNull()
+        val wifi = runCatching { WifiRadio.residue() }.getOrNull()
         return Residue(
             scanners = runCatching { ScanRegistry.shared.size }.getOrDefault(0),
             advertisers = runCatching { AdvertisingBudget.shared.owned() }.getOrDefault(0),
             gattClients = gatt?.clients ?: 0,
             gattServers = gatt?.servers ?: 0,
+            awareAttach = wifi?.awareAttach ?: 0,
+            awareNetworks = wifi?.awareNetworks ?: 0,
+            wifiSockets = wifi?.wifiSockets ?: 0,
+            directGroups = wifi?.directGroups ?: 0,
         )
     }
 
     fun doneLine(residue: Residue, settled: Boolean, elapsedMs: Long, requestNonce: String = nonce): String =
         "BENCHMARK clean_shutdown: done | nonce=$requestNonce | settled=$settled | scanners=${residue.scanners} | " +
             "advertisers=${residue.advertisers} | gattClients=${residue.gattClients} | gattServers=${residue.gattServers} | " +
-            "elapsedMs=$elapsedMs"
+            "awareAttach=${residue.awareAttach} | awareNetworks=${residue.awareNetworks} | wifiSockets=${residue.wifiSockets} | " +
+            "directGroups=${residue.directGroups} | elapsedMs=$elapsedMs"
 
     /**
      * Polls [residue] every [POLL_MS] on [handler] until it is clear or [SETTLE_MS] passed since [begin], then logs the

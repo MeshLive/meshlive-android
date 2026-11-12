@@ -150,6 +150,12 @@ class ReceiverNodeForwardingCore(
         removedQueue?.close()
     }
 
+    /** A7: a lossy carrier fallback may have dropped records; the child resumes at the next keyframe, like after a bounded-age shed. */
+    @Synchronized
+    fun resyncChild(child: NodeId) {
+        if (audioLive == null && childNodeId == child) childQueue?.waitForKeyFrame()
+    }
+
     @Throws(InterruptedException::class)
     fun take(child: NodeId): MeshEnvelope? = synchronized(this) {
         if (childNodeId == child) childQueue else null

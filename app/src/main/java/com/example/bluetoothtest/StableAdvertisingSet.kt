@@ -444,6 +444,12 @@ internal class StableAdvertisingSet(
      * Phase 0 (rotating discovery IDs, DEBUG only): every set start/stop with its set identity, so a
      * second phone's `adv_address_seen` lines show whether each new set got a new address.
      */
+    /** JT2-P2: the owner held the set at its fast interval instead of asking for the balanced step ([CallReadyAdvertisingHold]). */
+    @Synchronized
+    fun noteBalancedHeld() {
+        current?.let { logChurn("balanced_held", it) }
+    }
+
     private fun logChurn(event: String, callback: SetCallback) {
         if (!BuildConfig.DEBUG) return
         android.util.Log.i(

@@ -33,6 +33,37 @@ internal fun privateCallLinkErrorAction(
     else -> CallLinkErrorAction.NONE
 }
 
+/**
+ * What the carrier set's end-of-session report does (package SW1, END): the last carrier ending is reported without an error when the
+ * set's own liveness or a clean EOF ended it. A call this phone ended itself (End/Cancel/Decline) always finishes as "Call ended",
+ * also then; before, a Wi-Fi EOF racing the local hang-up showed "Call link lost" to the user who pressed End.
+ */
+internal enum class EndSessionAction {
+    /** A link error was recorded: the ordinary link-error decision ([privateCallLinkErrorAction]). */
+    LINK_ERROR,
+
+    /** No error and no local end: the call failed with the carrier's loss message. */
+    FAIL,
+
+    /** This phone ended the call: finish it as the ordinary local end. */
+    FINISH_LOCAL_END,
+}
+
+internal const val CALL_ENDED_MESSAGE = "Call ended"
+
+internal fun privateCallEndSessionAction(
+    hasLossError: Boolean,
+    callRunning: Boolean,
+    phase: PrivateCallPhase?,
+    callId: UUID?,
+    localEndCallId: UUID?,
+): EndSessionAction = when {
+    privateCallLinkErrorAction(callRunning, phase, callId, localEndCallId) == CallLinkErrorAction.FINISH_LOCAL_END ->
+        EndSessionAction.FINISH_LOCAL_END
+    hasLossError -> EndSessionAction.LINK_ERROR
+    else -> EndSessionAction.FAIL
+}
+
 /** What Cancel does in each phase (review A7: the phase is re-checked under the call lock). */
 internal enum class CallCancelStep { CANCEL, HANG_UP, IGNORE }
 

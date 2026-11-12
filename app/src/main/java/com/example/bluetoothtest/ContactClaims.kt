@@ -193,7 +193,7 @@ internal class ContactClaimsStore(
             }
         }
         file.parentFile?.mkdirs()
-        atomicWrite(file, cipher.seal(bytes.toByteArray()))
+        WipeGuard.guardedWrite("contact claims") { atomicWrite(file, cipher.seal(bytes.toByteArray())) }
         cache = claims
         latched = false
     }

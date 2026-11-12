@@ -15,9 +15,15 @@ class CleanShutdownTest {
         assertTrue(CleanShutdown.Residue(0, 0, 0, 0).clear)
         assertEquals(
             "BENCHMARK clean_shutdown: done | nonce=r42 | settled=false | scanners=0 | advertisers=1 | gattClients=0 | " +
-                "gattServers=2 | elapsedMs=2500",
+                "gattServers=2 | awareAttach=0 | awareNetworks=0 | wifiSockets=0 | directGroups=0 | elapsedMs=2500",
             CleanShutdown.doneLine(residue, settled = false, elapsedMs = 2_500L, requestNonce = "r42"),
         )
+    }
+
+    @Test
+    fun aWifiResidueKeepsTheShutdownUnsettled() {
+        assertFalse(CleanShutdown.Residue(0, 0, 0, 0, awareAttach = 1).clear)
+        assertTrue(CleanShutdown.Residue(0, 0, 0, 0).clear)
     }
 
     @Test

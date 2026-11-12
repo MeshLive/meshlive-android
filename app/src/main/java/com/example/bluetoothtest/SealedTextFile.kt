@@ -53,8 +53,10 @@ internal class SealedTextFile(
     /** Seals and replaces the file; refused once an emergency wipe started (it would recreate what the wipe deletes). */
     @Synchronized
     fun write(text: String) {
-        WipeGuard.check("sealed memory ${file.name}")
-        atomicWrite(file, cipher().seal(text.toByteArray(Charsets.UTF_8)))
+        // The wipe waits for a write that passed this check (WipeGuard.awaitWriters), so it never lands after the deletion.
+        WipeGuard.guardedWrite("sealed memory ${file.name}") {
+            atomicWrite(file, cipher().seal(text.toByteArray(Charsets.UTF_8)))
+        }
         migratedText = null
     }
 

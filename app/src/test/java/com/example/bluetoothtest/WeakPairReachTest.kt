@@ -38,11 +38,42 @@ class WeakPairReachTest {
         assertTrue(AdvertisingBoost.holding(codeShown = true, on = true))
         assertFalse(AdvertisingBoost.holding(codeShown = false, on = true))
         assertFalse(AdvertisingBoost.holding(codeShown = true, on = false))
-        listOf("GattVideoTransport.kt", "BleL2capControl.kt").forEach { name ->
-            val balance = source(name).substringAfter("private fun switchToBalancedAdvertising()").substringBefore("thread(name")
-            assertTrue(name, balance.contains("if (AdvertisingBoost.holding()) {"))
+    }
+
+    @Test
+    fun theBalancedStepWaitsWhileACodeIsOnScreenForBothCallListenersEvenWithTheIdleHoldOff() {
+        // The real chain: the Add contact screen's live code (QrMeet.display) is what AdvertisingBoost.holding() reads.
+        val fingerprint = IdentityFingerprint.fromHex("ab".repeat(32))
+        QrMeet.display.leave()
+        try {
+            assertFalse(AdvertisingBoost.holding())
+            QrMeet.display.show(fingerprint, ByteArray(6) { it.toByte() })
+            assertTrue(AdvertisingBoost.holding())
+            val gatt = CallReadyAdvertisingHold.decide(
+                enabled = false, callEndpoint = true, closed = false, advertising = true, linkActive = false,
+                boostHolding = AdvertisingBoost.holding(),
+            )
+            assertEquals(CallReadyAdvertisingHold.Action.RETRY_LATER, gatt)
+            assertEquals(
+                CallReadyAdvertisingHold.Action.RETRY_LATER,
+                CallReadyAdvertisingHold.decideControlListener(closed = false, boostHolding = AdvertisingBoost.holding()),
+            )
+            QrMeet.display.leave()
+            assertFalse("leaving the screen ends the hold", AdvertisingBoost.holding())
+            assertEquals(
+                CallReadyAdvertisingHold.Action.STEP,
+                CallReadyAdvertisingHold.decideControlListener(closed = false, boostHolding = AdvertisingBoost.holding()),
+            )
+        } finally {
+            QrMeet.display.leave()
         }
-        assertTrue(source("VerifyContactActivity.kt").contains("MeetBridge.host?.codeShown()"))
+    }
+
+    @Test
+    fun theControlListenerStepsDownWhenNothingHoldsItAndIgnoresAClosedServer() {
+        assertEquals(CallReadyAdvertisingHold.Action.STEP, CallReadyAdvertisingHold.decideControlListener(closed = false, boostHolding = false))
+        assertEquals(CallReadyAdvertisingHold.Action.IGNORE, CallReadyAdvertisingHold.decideControlListener(closed = true, boostHolding = false))
+        assertEquals(CallReadyAdvertisingHold.Action.IGNORE, CallReadyAdvertisingHold.decideControlListener(closed = true, boostHolding = true))
     }
 
     @Test

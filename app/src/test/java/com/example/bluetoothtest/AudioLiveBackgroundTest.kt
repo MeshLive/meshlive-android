@@ -136,6 +136,16 @@ class AudioLiveBackgroundTest {
                 },
                 stringExtra = { if (it == "test_audio_live_link_priority") "balanced" else null },
             )
+            if (!BuildConfig.DEBUG) {
+                // A release build ignores benchmark extras: every arm keeps its shipped default.
+                assertEquals(AudioLive.PRESET_MUSIC, AudioLiveTunables.effectivePreset(AudioLive.PRESET_MUSIC))
+                assertEquals(AudioLive.DEFAULT_BATCH_FRAMES, AudioLiveTunables.batchFrames)
+                assertEquals(AudioLive.DEFAULT_MAX_CHILDREN, AudioLiveTunables.maxChildren)
+                assertEquals(1, AudioLiveTunables.relayChildren)
+                assertFalse(AudioLiveTunables.fec || AudioLiveTunables.dtx || AudioLiveTunables.balancedLinkPriority)
+                assertTrue(AudioLiveTunables.ageBound)
+                return
+            }
             assertEquals(AudioLive.PRESET_LOW_DATA, AudioLiveTunables.effectivePreset(AudioLive.PRESET_MUSIC))
             assertEquals(5, AudioLiveTunables.batchFrames)
             assertEquals(2, AudioLiveTunables.maxChildren)

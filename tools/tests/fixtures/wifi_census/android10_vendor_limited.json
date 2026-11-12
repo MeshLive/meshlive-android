@@ -1,0 +1,17 @@
+{
+  "description": "Anonymised Android 10 vendor dump: cmd wifi status refused to the shell user; state and connection come from settings and dumpsys wifi.",
+  "model": "CPH2179",
+  "sdk": 29,
+  "soc": "",
+  "features": {
+    "aware": false,
+    "direct": true,
+    "rtt": false
+  },
+  "wifi_initially_enabled": true,
+  "wifi_status_on": "",
+  "wifi_status_off": "",
+  "wifiaware": "Wi-Fi Aware Service\n  mUsageEnabled: false\n  mClients: [{}]\n  mCapabilities: [Capabilities [maxPublishes=0, maxSubscribes=0, maxNdiInterfaces=0, maxNdpSessions=0, supportedCipherSuites=0, isInstantCommunicationModeSupported=false, isNanPairingSupported=false, isSuspensionSupported=false, is6gSupported=false, isHeSupported=false]]\n",
+  "wifip2p": "WifiP2pService\nWifiP2pStateMachine:\n  currentState=InactiveState\n  mWifiP2pInfo groupFormed=true, isGroupOwner=false, groupOwnerAddress=/192.168.49.1\n  mGroups network: DIRECT-xy-ActiveNet\n   isGO: false\n   GO: Device: Owner-Three\n    deviceAddress: 33:44:55:66:77:88\n   interface: p2p0\n   networkId: -2\n   securityType: 0\n   frequency: 5180\n   vendorData: null\n\nmAutonomousGroup false\nmJoinExistingGroup false\nmDiscoveryStarted false\nmListenStarted false\nmDetailedState connected\n",
+  "wifi": "Dump of WifiService\nmWifiInfo SSID: \"Cafe-Guest\", BSSID: 44:55:66:77:88:99, MAC: 9a:11:22:33:44:55, Supplicant state: COMPLETED, Frequency: 2437MHz, Link speed: 144Mbps\n"
+}
