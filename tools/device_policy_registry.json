@@ -8791,7 +8791,7 @@
     {
       "alias": "a15s",
       "model": "CPH2179",
-      "capability_file": "benchmarks/catalog/capabilities/a15s-20261109.json",
+      "capability_file": "benchmarks/catalog/capabilities/a15s-20261112.json",
       "platform_provenance": "benchmarks/runs/a15s-opusfix-5a2d93a7/0001-4b5ecaf7784b/physical/manifest.json",
       "traits": {
         "hardware": "mt6765",
@@ -8867,7 +8867,7 @@
     {
       "alias": "m31",
       "model": "SM-M315F",
-      "capability_file": "benchmarks/catalog/capabilities/m31-20261106.json",
+      "capability_file": "benchmarks/catalog/capabilities/m31-20261112.json",
       "platform_provenance": "benchmarks/runs/20261002-204037-asus-m31-gatt900/manifest.json",
       "traits": {
         "hardware": "exynos9611",
@@ -8918,7 +8918,7 @@
     {
       "alias": "s22",
       "model": "SM-S901E",
-      "capability_file": "benchmarks/catalog/capabilities/s22-20261106.json",
+      "capability_file": "benchmarks/catalog/capabilities/s22-20261112.json",
       "platform_provenance": "benchmarks/runs/20261002-194829-samsung-classic500-parent-loss/manifest.json",
       "traits": {
         "hardware": "qcom",

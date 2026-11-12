@@ -105,8 +105,8 @@
   "retired_requirement_files": ["tools/benchmark_retired_requirements.json"],
   "capabilities": {
     "s24": "benchmarks/catalog/capabilities/s24-20261107.json",
-    "s22": "benchmarks/catalog/capabilities/s22-20261112.json",
-    "m31": "benchmarks/catalog/capabilities/m31-20261112.json",
+    "s22": "benchmarks/catalog/capabilities/s22-20261112b.json",
+    "m31": "benchmarks/catalog/capabilities/m31-20261112b.json",
     "asus": "benchmarks/catalog/capabilities/asus-20261107.json",
     "xiaomi": "benchmarks/catalog/capabilities/xiaomi.json",
     "a55": "benchmarks/catalog/capabilities/a55.json",

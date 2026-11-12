@@ -1875,7 +1875,7 @@ class MainActivity : AppCompatActivity() {
         DebugTunables.voiceCallLowDelay = intent.getBooleanExtra("test_voice_call_low_delay", false)
         DebugTunables.callAudioOwnClock = intent.getBooleanExtra("test_call_audio_own_clock", false)
         DebugTunables.callStaleAudioDrop = intent.getBooleanExtra("test_call_stale_audio_drop", false)
-        DebugTunables.callFastRecovery = intent.getBooleanExtra("test_call_fast_recovery", false)
+        DebugTunables.callFastRecovery = intent.getBooleanExtra("test_call_fast_recovery", true)
         DebugTunables.callVideoRestart = intent.getBooleanExtra("test_call_video_restart", false)
         if (BuildConfig.DEBUG) {
             Log.i(

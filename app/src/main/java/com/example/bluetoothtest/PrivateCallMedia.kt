@@ -539,7 +539,7 @@ internal class PrivateCallMediaReceiver(
     fun setHeader(value: StreamProtocol.Header) {
         require(header == null) { "The peer sent more than one call stream header" }
         header = value
-        // Experimental test_call_fast_recovery: attached to the clock audio follows, since audio does the catching up.
+        // test_call_fast_recovery (promoted 2026-11-12, default on): attached to the clock audio follows, since audio does the catching up.
         val fastRecovery = CallFastRecovery.forProfile(playbackDelayProfile, DebugTunables.callFastRecovery) { line ->
             if (BuildConfig.DEBUG) Log.i("BluetoothVideo", line)
         }

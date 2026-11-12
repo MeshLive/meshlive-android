@@ -127,7 +127,7 @@ enum class PlaybackDelayProfile(
         get() = adaptiveMaxDelayMs > delayMs
 
     /**
-     * [fastRecovery] (Experimental `test_call_fast_recovery`, [CallFastRecovery.forProfile]) is attached only to an
+     * [fastRecovery] (`test_call_fast_recovery`, promoted 2026-11-12, [CallFastRecovery.forProfile]) is attached only to an
      * adaptive call clock; fixed and stream clocks ignore it.
      */
     fun newPlayoutClock(

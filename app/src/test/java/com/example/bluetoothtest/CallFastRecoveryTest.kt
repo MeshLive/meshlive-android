@@ -145,13 +145,14 @@ class CallFastRecoveryTest {
     }
 
     @Test
-    fun theSwitchTurnsOnOnlyInDebugBuilds() {
+    fun aPersonsLaunchKeepsFastRecoveryOnAndOnlyADebugLaunchHasTheControlArm() {
         try {
-            DebugTunables.callFastRecovery = true
-            assertEquals(BuildConfig.DEBUG, DebugTunables.callFastRecovery)
-        } finally {
             DebugTunables.callFastRecovery = false
+            assertEquals("the off control arm exists only in DEBUG", !BuildConfig.DEBUG, DebugTunables.callFastRecovery)
+        } finally {
+            DebugTunables.callFastRecovery = true
         }
+        assertTrue(DebugTunables.callFastRecovery)
     }
 
     // --- The audio writer's choice of chunk ---

@@ -3,7 +3,8 @@ package com.example.bluetoothtest
 import kotlin.math.roundToInt
 
 /**
- * Experimental call fast recovery (DEBUG `test_call_fast_recovery`, runner tunable `call_fast_recovery`, default off):
+ * Call fast recovery (DEBUG `test_call_fast_recovery`, runner tunable `call_fast_recovery`; promoted on mechanism
+ * 2026-11-12, default on, `false` is the DEBUG control arm):
  * after one ISOLATED late burst, the call's added playout delay returns to its level before the burst within seconds,
  * by leaving out quiet decoded audio inside pauses instead of waiting for the calm shrink.
  *

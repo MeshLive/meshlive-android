@@ -847,14 +847,16 @@ object DebugTunables {
         }
 
     /**
-     * Experimental (off): after one isolated late burst (b12sm 2026-11-11: a 526 ms sender pause grew the S22's call delay
-     * by 303 ms for the rest of the call), the call delay returns to its level before the burst by leaving out quiet
-     * decoded audio inside pauses, never speech; video follows at the same point ([CallFastRecovery]). Sustained lateness
-     * and continuous speech keep today's slow shrink. DEBUG launch extra `test_call_fast_recovery`.
+     * Promoted on mechanism 2026-11-12 (default on, release builds keep it on): after one isolated late burst (b12sm
+     * 2026-11-11: a 526 ms sender pause grew the S22's call delay by 303 ms for the rest of the call), the call delay
+     * returns to its level before the burst by leaving out quiet decoded audio inside pauses, never speech; video follows
+     * at the same point ([CallFastRecovery]). Sustained lateness and continuous speech keep today's slow shrink. cfr3
+     * (S22 <-> M31, two 526 ms pauses per call): time 100 ms or more late fell from about 64 s to about 8 s per call.
+     * DEBUG launch extra `test_call_fast_recovery=false` is the control arm.
      */
-    @Volatile var callFastRecovery: Boolean = false
+    @Volatile var callFastRecovery: Boolean = true
         set(value) {
-            field = value && BuildConfig.DEBUG
+            field = value || !BuildConfig.DEBUG
         }
 
     /**

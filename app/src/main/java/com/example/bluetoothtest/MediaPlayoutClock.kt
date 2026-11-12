@@ -43,7 +43,7 @@ class MediaPlayoutClock(
      */
     private val timeTarget: PlayoutJitterTarget? = null,
     /**
-     * Experimental call fast recovery ([CallFastRecovery], DEBUG `test_call_fast_recovery`, null = off, calls only):
+     * Call fast recovery ([CallFastRecovery], DEBUG `test_call_fast_recovery`, promoted 2026-11-12; null = off, calls only):
      * after an isolated late burst the audio writer may lower the delay by leaving out quiet audio
      * ([consumeFastRecovery]). Without consumption this clock times media exactly as without it.
      */

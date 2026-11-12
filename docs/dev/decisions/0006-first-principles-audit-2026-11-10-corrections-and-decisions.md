@@ -90,6 +90,12 @@ Wi-Fi
   It stays Experimental (off) and is measured again per stage with the camera-first start, on a lit moving scene. Join
   A/Bs report every stage separately so a rare event in another stage cannot hide or fake a gain.
 - **Wi-Fi switch fixes SW1 promoted (measured 2026-11-11, 12 calls per arm).** Two fixes at the moment a call moves from Bluetooth to Wi-Fi (a record already sealed for Bluetooth keeps its place in that queue, and the reader marks the link as heard before it waits for the call's record lock) took the S22 and the A15s from 11 of 12 Wi-Fi Direct calls reaching Wi-Fi, with 4 failed switches and 4 freeze-gate failures, to 12 of 12 with none. On two other pairs (ASUS and A15s; S22 and ASUS) the failure did not occur in either arm and nothing got worse. Both are on by default from B17; release builds keep them on and a DEBUG launch with `=false` is the control arm. The release-build smoke call is still owed (release signing is an owner step). A fourth pair after the promotion, the M31 and the A15s (12 calls, M31 on 2.4 GHz home Wi-Fi), showed no difference: every call in both arms reached Wi-Fi and none lost its link (1 failed switch with the fixes, 0 without).
+- **Call fast recovery promoted (measured 2026-11-12).** After one short glitch (a 526 ms pause at the sender) a call
+  used to stay late for most of the rest of the call. With fast recovery the receiver leaves out quiet audio in pauses
+  (never speech) and the call clock follows: across two such pauses per call, the time a call stayed 100 ms or more late
+  fell from about 64 s to about 8 s, in both directions between the S22 and the M31. The peak delay right after a pause
+  was the same (about 330-350 ms) and the per-call picture gates were no worse. Promoted on mechanism for the next
+  release (6 calls per arm).
 - **0.5.0 ships with one known failing pair (owner, 2026-11-12).** The release gate on five phones failed on one call
   direction only: the A15s calling the ASUS (7 of 12 calls never rang, the others took 11-24 s), the same defect as in
   0.4.4. Every other measured direction passed (S22 <-> S24 26 of 26 within 4 s; the ASUS calling the A15s 12 of 12
