@@ -313,13 +313,12 @@ Short chains of low-rate video are realistic; long chains of high-rate video are
 four relays in the protocol, but the call relay is experimental and off unless you turn on Settings > Experiments >
 Relayed calls (beta).
 
-**Does it work with an iPhone or a Mac?** Only in part, and not out of the box. The iPhone and Mac app is a source
-build that you compile yourself (see the Download table in the [README](../README.md)). Android
-looks for iPhones by default ("Find iPhones" under Settings > Advanced > Connection); an iPhone whose app is in the
-background cannot be found. The Apple app as currently published has its three privacy options (rotating IDs, hidden
-identities, pseudonyms toward strangers) off, and with them off it does not see an Android phone running this version
-and neither can call the other. Turn all three on in the Apple app first. This Android version cannot turn its own
-off to meet it.
+**Does it work with an iPhone or a Mac?** Yes for the iPhone: MeshLive for iPhone is on the
+[App Store](https://apps.apple.com/app/id6834136798) (iOS 17 or later), and an Android phone and an iPhone call each
+other and watch each other's livestreams with their default settings. Android looks for iPhones by default ("Find
+iPhones" under Settings > Advanced > Connection); an iPhone whose app is in the background cannot be found. The Mac
+app is coming soon to the Mac App Store (until then it is a source build). Downloads for every platform:
+[meshlive.github.io](https://meshlive.github.io).
 
 **What about older MeshLive versions?** Update both phones when you can. A phone on 0.4.4 or older whose owner turned
 its private (rotating) Bluetooth ID switch off does not see a phone with this version at all, and nothing on that

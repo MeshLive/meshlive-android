@@ -18,7 +18,7 @@ The maintainers test on these phones, by alias:
 | ASUS | ASUS_I01WD | 11 |
 | A15s | OPPO CPH2179 | 10 |
 
-An iPhone client is being developed in a sibling repository, `MeshLive/meshlive-ios`.
+The iPhone app is on the [App Store](https://apps.apple.com/app/id6834136798) (source in `MeshLive/meshlive-apple`); it was tested on an iPhone 12 with these Android phones.
 
 ## Results
 

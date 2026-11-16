@@ -26,6 +26,8 @@ No internet, no SIM, no account.
 
 <sub>Free · open source · <a href="docs/user-guide.md#install">How to install</a></sub>
 
+<p>Also on iPhone, Windows and soon the Mac: downloads for every platform and demo videos at <a href="https://meshlive.github.io"><b>meshlive.github.io</b></a></p>
+
 <br/>
 <br/>
 
@@ -88,10 +90,15 @@ Bluetooth on its own reaches about 10 to 30 metres. MeshLive turns every phone r
 | Platform | Status |
 | --- | --- |
 | Android 10+ | Available: [Google Play](https://play.google.com/store/apps/details?id=io.github.meshlive.app), [GitHub releases](https://github.com/MeshLive/meshlive-android/releases/latest), [Obtainium](https://apps.obtainium.imranr.dev/redirect?r=obtainium://add/https://github.com/MeshLive/meshlive-android) |
-| Windows | Beta: [GitHub releases](https://github.com/MeshLive/meshlive-windows/releases/latest) (unsigned zip) |
-| iPhone and Mac | Source build: [meshlive-apple](https://github.com/MeshLive/meshlive-apple) (Mac app experimental; iPhone not yet tested on hardware) |
+| iPhone (iOS 17+) | Available: [App Store](https://apps.apple.com/app/id6834136798) ([meshlive-apple](https://github.com/MeshLive/meshlive-apple)) |
+| Windows | Beta: [GitHub releases](https://github.com/MeshLive/meshlive-windows/releases/latest) (unsigned zip); Microsoft Store coming soon |
+| Mac | Coming soon to the Mac App Store; build from source meanwhile ([meshlive-apple](https://github.com/MeshLive/meshlive-apple)) |
 
-<sub>Google Play and the Google Play logo are trademarks of Google LLC.</sub>
+<a href="https://apps.apple.com/app/id6834136798"><img alt="Download on the App Store" src="https://toolbox.marketingtools.apple.com/api/v2/badges/download-on-the-app-store/black/en-us" height="40" /></a>
+
+All downloads and demo videos: [meshlive.github.io](https://meshlive.github.io).
+
+<sub>Apple, the Apple logo and iPhone are trademarks of Apple Inc., registered in the U.S. and other countries and regions. App Store is a service mark of Apple Inc. Google Play and the Google Play logo are trademarks of Google LLC.</sub>
 
 ## Privacy
 
@@ -132,13 +139,3 @@ Bug reports, device results, translations and code are welcome. Start with [CONT
 
 GPL-3.0-or-later. See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-## Star history
-
-<div align="center">
-<a href="https://star-history.com/#MeshLive/meshlive-android&Date">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=MeshLive/meshlive-android&type=Date&theme=dark" />
-    <img alt="Star history" src="https://api.star-history.com/svg?repos=MeshLive/meshlive-android&type=Date" />
-  </picture>
-</a>
-</div>
